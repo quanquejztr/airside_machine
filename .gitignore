@@ -1,0 +1,40 @@
+# OS / editor
+.DS_Store
+.cursor/
+~$*.docx
+~$*.doc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.pem
+
+# Docs — track README + docs/; other local notes stay ignored
+*.md
+!README.md
+!docs/
+!docs/*.md
+*.docx
+*.txt
+
+# Live SQLite save + WAL (do not commit player progress / corrupt copies)
+db/*.db
+db/*.db-wal
+db/*.db-shm
+db/corrupted_backup/
+*.db-journal
+
+# Optional Node map experiment (not required for --ui)
+server/map_node/node_modules/

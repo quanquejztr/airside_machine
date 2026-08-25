@@ -1,0 +1,11 @@
+{
+  "name": "airline-sim-map",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.1"
+  }
+}
+

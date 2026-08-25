@@ -1,0 +1,4 @@
+category,slot_tier,landing_fee_per_1000,gate_fee,gate_count_min,gate_count_max,runway_min_ft,curfew_active,curfew_start,curfew_end,score_min
+small_airport,1,1.20,80,2,8,3000,0,NULL,NULL,0
+medium_airport,2,2.89,249,10,30,6000,0,NULL,NULL,100000
+large_airport,3,5.75,850,40,200,10000,1,00:00,06:00,1000000

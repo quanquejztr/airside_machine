@@ -1,0 +1,159 @@
+type_id,seats_economy,seats_premium_economy,seats_business,seats_first,eec_used
+PC12,9,0,0,0,9
+BN2P,9,0,0,0,9
+FA50,9,0,0,0,9
+BE20,10,0,0,0,10
+C750,9,0,0,0,9
+GL5T,13,0,0,0,13
+C208,14,0,0,0,14
+TRIS,17,0,0,0,17
+DHC6,19,0,0,0,19
+L410,19,0,0,0,19
+B190,19,0,0,0,19
+GL7T,19,0,0,0,19
+A140,52,0,0,0,52
+DH8C,56,0,0,0,56
+SB20,58,0,0,0,58
+F50,60,0,0,0,60
+I114,64,0,0,0,64
+ERJ170,64,0,4,0,72
+E170,88,0,0,0,88
+CRJ7,70,0,4,0,78
+AT76,78,0,0,0,78
+E175,70,0,4,0,78
+F70,71,0,4,0,79
+TU34,76,0,4,0,84
+A148,77,0,4,0,85
+DH8D,86,0,0,0,86
+E752,80,0,4,0,88
+MRJ1,80,0,4,0,88
+ARJ2,82,0,4,0,90
+CRJ9,82,0,4,0,90
+MRJ9,84,0,4,0,92
+B462,92,0,4,0,100
+E190,92,0,4,0,100
+CRJX,96,0,4,0,104
+E902,98,0,4,0,106
+SU95,100,0,4,0,108
+F100,101,0,4,0,109
+IL18,120,0,0,0,120
+YK42,120,0,0,0,120
+B731,110,0,7,0,124
+CONC,0,0,72,0,144
+A318,116,0,8,0,132
+BCS1,117,0,8,0,133
+B712,118,0,8,0,134
+B732,120,0,8,0,136
+B735,124,0,8,0,140
+B737C,124,0,8,0,140
+B737ER,149,0,0,0,149
+B737,149,0,0,0,149
+E952,130,0,8,0,146
+B733,133,0,8,0,149
+B736,133,0,8,0,149
+MD81,134,0,8,0,150
+A319,140,0,8,0,156
+MD90,144,0,8,0,160
+A19N,144,0,8,0,160
+BCS3,144,0,8,0,160
+C919,152,0,8,0,168
+TU44,154,0,8,0,170
+B37M,156,0,8,0,172
+TU54,164,0,8,0,180
+A320,164,0,8,0,180
+B738,168,0,8,0,184
+IL62,170,0,8,0,186
+B734,172,0,8,0,188
+B722,173,0,8,0,189
+B739,173,0,8,0,189
+B739ER,204,0,8,0,220
+B38M,173,0,8,0,189
+DC85,173,0,8,0,189
+A20N,179,0,8,0,195
+TU24,194,0,8,0,210
+MC21,195,0,8,0,211
+B39M,204,0,8,0,220
+B3XM,214,0,8,0,230
+A321,216,0,5,0,226
+A21N,224,0,10,0,244
+A21NL,220,0,10,0,240
+A21NXLR,216,0,10,0,236
+B752,219,0,10,0,239
+B752ER,219,0,10,0,239
+A312,180,12,14,3,238
+A313,180,12,14,3,238
+B762,185,12,14,3,243
+B762ER,185,12,14,3,243
+B788,190,12,14,3,248
+A306,206,12,14,3,264
+B763,230,12,14,3,288
+B763ER,290,12,14,3,348
+MD11,233,12,14,3,291
+B753,275,0,10,0,295
+IL96,240,12,14,3,298
+B789,240,12,14,3,298
+A342,255,12,14,3,313
+L101,270,12,14,3,328
+IL86,290,12,14,3,348
+A343,290,12,14,3,348
+B78X,300,12,14,3,358
+A345,315,12,14,3,373
+A332,320,12,14,3,378
+DC10,320,12,14,3,378
+A358,330,12,14,3,388
+B74S,340,12,14,3,398
+A333,344,12,14,3,402
+A338,346,12,14,3,404
+B764,349,12,14,3,407
+A359,380,12,14,3,438
+A339,380,12,14,3,438
+A346,380,12,14,3,438
+A35U,380,12,14,3,438
+B772,380,12,14,3,438
+B72E,380,12,14,3,438
+B77L,380,12,14,3,438
+B778,380,12,14,3,438
+A35K,415,12,14,3,473
+B741,478,16,20,2,550
+B742,478,16,20,2,550
+B773,478,16,20,2,550
+B77W,478,16,20,2,550
+B779,478,16,20,2,550
+B748,533,16,20,2,605
+B743,588,16,20,2,660
+B744,588,16,20,2,660
+A388,771,18,24,1,850
+
+
+# Template Instructions:
+# This file defines DEFAULT cabin configurations for each aircraft type.
+# When a player buys or leases an aircraft, it starts with this configuration.
+# The player can later reconfigure it using the reconfigure command.
+#
+# Column Definitions:
+# - type_id: Must match type_id in aircraft_types.csv
+# - seats_economy: Default economy seats
+# - seats_premium_economy: Default premium economy seats
+# - seats_business: Default business class seats
+# - seats_first: Default first class seats
+# - eec_used: MUST be calculated as:
+#     (seats_economy × 1.0) + (seats_premium_economy × 1.5) + (seats_business × 2.0) + (seats_first × 4.0)
+#
+# IMPORTANT: eec_used MUST be <= aircraft_types.eec for that type_id
+#
+# Configuration Strategy by Aircraft Type:
+# - TURBOPROP: All economy (9-19 seats)
+# - REGIONAL_JET: Mostly economy with small business cabin (76-88 seats)
+# - NARROW-BODY: Mixed economy/business for mainline service (150-189 seats)
+# - WIDE-BODY: Premium configurations with all 4 classes (250-550 seats)
+#
+# Example Calculations:
+# B737: (162 × 1.0) + (0 × 1.5) + (12 × 2.0) + (0 × 4.0) = 162 + 0 + 24 + 0 = 186 EEC
+# A350-900: (253 × 1.0) + (28 × 1.5) + (48 × 2.0) + (10 × 4.0) = 253 + 42 + 96 + 40 = 431 EEC
+#
+# To add a new aircraft:
+# 1. Get the eec value from aircraft_types.csv
+# 2. Design a cabin layout that uses <= eec
+# 3. Calculate eec_used using the formula above
+# 4. Verify: eec_used <= eec
+# 5. Add row here
