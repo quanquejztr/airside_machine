@@ -184,6 +184,12 @@ async function refreshHud() {
     if (debtEl) debtEl.textContent = money(f.debt);
     const loanEl = $("#hud-loan");
     if (loanEl) loanEl.textContent = money(f.weekly_loan);
+    const fuelEl = $("#hud-fuel");
+    if (fuelEl) {
+      fuelEl.textContent = (f.fuel_spot_bbl != null && Number.isFinite(Number(f.fuel_spot_bbl)))
+        ? `$${Number(f.fuel_spot_bbl).toFixed(2)}/bbl`
+        : "—";
+    }
   }
   markHudSpeed((s.clock && s.clock.speed_multiplier) || 0);
   $("#ticker-text").textContent = (s.news && s.news.length) ? s.news.slice().reverse()[0] : "News: —";
@@ -197,6 +203,7 @@ async function refreshHud() {
     unseen.forEach((n) => seenNoticeIds.add(n.notification_id));
     if (unseen[0] && unseen[0].body) toast(unseen[0].body);
   }
+  drainWeekSummaries().catch(() => {});
   if (!a && !document.getElementById("win-airline")) openAirline();
 }
 
@@ -1418,6 +1425,142 @@ function openBank() {
   render();
 }
 
+async function drainWeekSummaries() {
+  const data = await api("/api/books/pending");
+  const rows = data.summaries || [];
+  rows.forEach((s) => {
+    const wk = Number(s.game_week || 0);
+    const net = Number(s.net_income || 0);
+    toast(`Week ${wk} net ${signedMoney(net)} · open Books`);
+  });
+}
+
+function booksMoneyRow(label, value, opts = {}) {
+  const v = Number(value || 0);
+  const bold = opts.bold ? "font-weight:700" : "";
+  const neg = opts.signed && v < 0 ? " neg" : "";
+  const shown = opts.signed ? signedMoney(v) : money(v);
+  return `<div class="hud-tip-row" style="${bold}"><span>${escapeHtml(label)}</span><b class="${neg}">${shown}</b></div>`;
+}
+
+function openBooks() {
+  const el = openWindow("books", "Books", `<div class="muted">Loading…</div>`, { width: 560 });
+  const paint = () => {
+    api("/api/books").then((data) => {
+      const w = data.week || {};
+      const f = data.fuel || {};
+      if (w.skipped) {
+        el.querySelector(".win-body").innerHTML = `<p class="err">${escapeHtml(w.reason || "No airline")}</p>`;
+        return;
+      }
+      const src = w.summary_source === "ledger" ? "settled" : "live / in-progress";
+      const feesDetail = `
+        <details class="books-fees">
+          <summary class="muted">Fee breakdown</summary>
+          <table class="grid"><tbody>
+            <tr><td>Excise</td><td>${money(w.excise_tax)}</td></tr>
+            <tr><td>Segment</td><td>${money(w.segment_fees)}</td></tr>
+            <tr><td>Security</td><td>${money(w.security_fees)}</td></tr>
+            <tr><td>PFC</td><td>${money(w.pfc_fees)}</td></tr>
+            <tr><td>Landing</td><td>${money(w.landing_fees)}</td></tr>
+            <tr><td>Gate</td><td>${money(w.gate_fees)}</td></tr>
+          </tbody></table>
+        </details>`;
+      const prev = w.prev_week;
+      const prevLine = prev
+        ? `<p class="muted">Prior week — net ${money(prev.net_income)} · cash EOW ${money(prev.cash_end_of_week)} · rev ${money(prev.revenue_gross)}</p>`
+        : "";
+      const hedge = (f.hedged_bbl != null && f.hedge_weeks_remaining)
+        ? `$${Number(f.hedged_bbl).toFixed(2)}/bbl · ${f.hedge_weeks_remaining} wk left`
+        : "none";
+      const shock = f.shock_pending
+        ? `<p class="err">Fuel shock: ${escapeHtml(f.shock_message || "pending")} <button type="button" id="bk-ack">Ack</button></p>`
+        : "";
+      const netCls = Number(w.net_income || 0) < 0 ? "neg" : "";
+      el.querySelector(".win-body").innerHTML = `
+        <p><b>Week ${Number(w.game_week || 0)}</b> · ${escapeHtml(src)}
+          ${w.flights_count != null ? ` · ${Number(w.flights_count)} flights` : ""}</p>
+        <div class="books-stack">
+          ${booksMoneyRow("Revenue", w.revenue_gross)}
+          ${booksMoneyRow("Taxes & fees", w.total_taxes_and_fees)}
+          ${feesDetail}
+          ${booksMoneyRow("Fuel", w.fuel_cost)}
+          ${booksMoneyRow("Leases", w.lease_costs)}
+          ${booksMoneyRow("Loans", w.loan_payments)}
+          ${booksMoneyRow("Corp tax", w.corporate_tax)}
+          <div class="hud-tip-row" style="font-weight:700;margin-top:4px;border-top:1px solid rgba(0,0,0,.08);padding-top:6px">
+            <span>Net</span><b class="${netCls}">${signedMoney(w.net_income)}</b>
+          </div>
+          ${booksMoneyRow(w.cash_row_label || "Cash", w.cash_end_of_week)}
+        </div>
+        ${prevLine}
+        <hr class="books-rule" />
+        <p><b>Fuel</b> · spot <b>$${Number(f.spot_bbl || 0).toFixed(2)}/bbl</b>
+          · all-in ~$${Number(f.spot_gal || 0).toFixed(3)}/gal</p>
+        <p class="muted">Spark ${escapeHtml(f.sparkline || "—")} · est burn ${Number(f.est_weekly_burn_gal || 0).toLocaleString()} gal/wk</p>
+        <p>Hedge: ${escapeHtml(hedge)}</p>
+        <p>Reserve: ${Number(f.reserve_gal || 0).toLocaleString()} gal
+          ${f.reserve_avg_price != null ? `· avg $${Number(f.reserve_avg_price).toFixed(3)}/gal` : ""}</p>
+        ${shock}
+        <p class="muted">Hedge premiums ~ 2wk ${money(f.premium_2wk)} · 4wk ${money(f.premium_4wk)} · 8wk ${money(f.premium_8wk)}</p>
+        <div class="books-actions">
+          <button type="button" data-hedge="2">Hedge 2</button>
+          <button type="button" data-hedge="4">Hedge 4</button>
+          <button type="button" data-hedge="8">Hedge 8</button>
+          <button type="button" id="bk-cancel-hedge">Cancel hedge</button>
+        </div>
+        <div class="row2" style="margin-top:8px">
+          <div><label>Buy reserve (gal)</label><input id="bk-res-gal" type="number" min="1" step="1000" value="10000" /></div>
+          <div><label>&nbsp;</label><button type="button" id="bk-buy-res">Buy reserve</button></div>
+        </div>
+        <div class="row2">
+          <div><label>Dip alert ($/bbl)</label><input id="bk-dip" type="number" min="1" step="1"
+            value="${f.dip_alert_bbl != null ? Number(f.dip_alert_bbl) : ""}" placeholder="off" /></div>
+          <div><label>&nbsp;</label>
+            <button type="button" id="bk-dip-set">Set</button>
+            <button type="button" id="bk-dip-clear">Clear</button>
+          </div>
+        </div>
+        <p class="muted" style="margin-top:10px">Debt desk is under <b>Bank</b>.</p>`;
+
+      const runFuel = async (body, okMsg) => {
+        try {
+          await api("/api/fuel", { method: "POST", body: JSON.stringify(body) });
+          if (okMsg) toast(okMsg);
+          refreshHud();
+          paint();
+        } catch (err) { toast(err.message); }
+      };
+      el.querySelectorAll("[data-hedge]").forEach((btn) => {
+        btn.onclick = () => runFuel({ action: "hedge", weeks: Number(btn.dataset.hedge) }, `Hedge ${btn.dataset.hedge}wk`);
+      });
+      const cancelBtn = $("#bk-cancel-hedge", el);
+      if (cancelBtn) cancelBtn.onclick = () => runFuel({ action: "cancel_hedge" }, "Hedge cancelled");
+      const buyRes = $("#bk-buy-res", el);
+      if (buyRes) {
+        buyRes.onclick = () => runFuel(
+          { action: "buy_reserve", gallons: Number($("#bk-res-gal", el).value) },
+          "Reserve updated"
+        );
+      }
+      const dipSet = $("#bk-dip-set", el);
+      if (dipSet) {
+        dipSet.onclick = () => runFuel(
+          { action: "set_dip", price: Number($("#bk-dip", el).value) },
+          "Dip alert set"
+        );
+      }
+      const dipClear = $("#bk-dip-clear", el);
+      if (dipClear) dipClear.onclick = () => runFuel({ action: "clear_dip" }, "Dip alert cleared");
+      const ack = $("#bk-ack", el);
+      if (ack) ack.onclick = () => runFuel({ action: "ack_shock" }, "Shock acknowledged");
+    }).catch((err) => {
+      el.querySelector(".win-body").innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
+    });
+  };
+  paint();
+}
+
 function openCompetitors() {
   const existing = document.getElementById("win-competitors");
   if (existing) existing.remove();
@@ -1712,6 +1855,7 @@ const openers = {
   bids: openBids,
   slots: openSlots,
   bank: openBank,
+  books: openBooks,
   competitors: openCompetitors,
   board: openBoard,
 };

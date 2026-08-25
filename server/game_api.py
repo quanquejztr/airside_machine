@@ -97,6 +97,13 @@ def _hud_finance() -> Optional[dict]:
         weekly_loan = float(snap.get("weekly_service") or 0)
     except Exception:
         pass
+    fuel_spot = None
+    try:
+        gs_fuel = db.fetch_one("SELECT fuel_price_current FROM game_state WHERE id = 1")
+        if gs_fuel and gs_fuel["fuel_price_current"] is not None:
+            fuel_spot = float(gs_fuel["fuel_price_current"])
+    except Exception:
+        fuel_spot = None
     out = {
         "week": gw,
         "day": days[day_i],
@@ -105,6 +112,7 @@ def _hud_finance() -> Optional[dict]:
         "today_revenue": float(day_row["rev"] or 0) if day_row else 0.0,
         "debt": debt,
         "weekly_loan": weekly_loan,
+        "fuel_spot_bbl": fuel_spot,
     }
     _hud_finance_cache["t"] = now
     _hud_finance_cache["v"] = out
@@ -1574,6 +1582,123 @@ def bank_payoff(body: dict) -> dict:
     except Exception as e:
         return _err(str(e))
     return _ok(out)
+
+
+def _json_safe(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    try:
+        return float(obj)
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+def books_status() -> dict:
+    """Week P&L (live or settled) + fuel desk snapshot for the Books overlay."""
+    if not setup.airline_exists():
+        return _err("Create an airline first.")
+    from engine.settlement import build_week_summary_payload
+    from engine import fuel as fin
+    from ui.fuel_ticker import fuel_sparkline
+
+    week = _json_safe(build_week_summary_payload())
+    al = setup.get_airline() or {}
+    gs = db.fetch_one(
+        """
+        SELECT fuel_price_current, fuel_shock_pending, fuel_shock_message
+        FROM game_state WHERE id = 1
+        """
+    )
+    barrel = float(gs["fuel_price_current"] or 195.0) if gs else 195.0
+    spot_gal = float(fin.all_in_spot_from_state())
+    burn = float(fin.estimated_weekly_burn_gallons())
+    prem_rate = float(db.get_financial_constant("fuel_hedge_premium_rate") or 0.05)
+    hp = al.get("fuel_hedged_price")
+    hw = al.get("fuel_hedged_weeks_remaining")
+    dip = al.get("fuel_dip_alert_price")
+    avg = al.get("fuel_reserve_avg_price")
+    fuel = {
+        "spot_bbl": barrel,
+        "spot_gal": spot_gal,
+        "sparkline": fuel_sparkline(20),
+        "est_weekly_burn_gal": burn,
+        "reserve_gal": float(al.get("fuel_reserve_gallons") or 0),
+        "reserve_avg_price": float(avg) if avg is not None else None,
+        "hedged_bbl": float(hp) if hp is not None else None,
+        "hedge_weeks_remaining": int(hw) if hw is not None else None,
+        "dip_alert_bbl": float(dip) if dip is not None else None,
+        "shock_pending": bool(gs and int(gs["fuel_shock_pending"] or 0)),
+        "shock_message": (gs["fuel_shock_message"] if gs else None) or None,
+        "premium_2wk": burn * spot_gal * 2 * prem_rate,
+        "premium_4wk": burn * spot_gal * 4 * prem_rate,
+        "premium_8wk": burn * spot_gal * 8 * prem_rate,
+    }
+    return _ok({"week": week, "fuel": fuel})
+
+
+def fuel_action(body: dict) -> dict:
+    """Books fuel desk: hedge / cancel / reserve / dip / ack shock."""
+    from engine import fuel as fin
+
+    if not setup.airline_exists():
+        return _err("Create an airline first.")
+    action = str(body.get("action") or "").strip().lower()
+    try:
+        if action in ("hedge", "hedge_fuel"):
+            weeks = int(body.get("weeks") or 0)
+            out = fin.hedge_fuel(weeks)
+            return _ok({"action": "hedge", **out})
+        if action in ("cancel_hedge", "cancel"):
+            fin.cancel_hedge()
+            return _ok({"action": "cancel_hedge"})
+        if action in ("buy_reserve", "reserve"):
+            gallons = float(body.get("gallons") or 0)
+            out = fin.buy_reserve(gallons)
+            return _ok({"action": "buy_reserve", **out})
+        if action in ("set_dip", "dip"):
+            price = float(body.get("price") or 0)
+            fin.set_dip_alert(price)
+            return _ok({"action": "set_dip", "price": price})
+        if action in ("clear_dip",):
+            fin.set_dip_alert(None)
+            return _ok({"action": "clear_dip"})
+        if action in ("ack_shock", "ack"):
+            fin.acknowledge_fuel_shock()
+            return _ok({"action": "ack_shock"})
+    except Exception as e:
+        return _err(str(e))
+    return _err("Unknown fuel action. Use hedge, cancel_hedge, buy_reserve, set_dip, clear_dip, ack_shock.")
+
+
+def pop_week_summaries(limit: int = 4) -> dict:
+    """Drain settlement week-summary queue for overlay toasts (non-blocking)."""
+    from engine.settlement import get_week_summary_queue
+
+    q = get_week_summary_queue()
+    items: list[dict] = []
+    n = max(1, min(8, int(limit or 4)))
+    while len(items) < n:
+        try:
+            item = q.get_nowait()
+        except Exception:
+            break
+        if not isinstance(item, dict):
+            continue
+        if item.get("skipped"):
+            continue
+        items.append(
+            {
+                "game_week": int(item.get("game_week") or 0),
+                "net_income": float(item.get("net_income") or 0),
+                "revenue_gross": float(item.get("revenue_gross") or 0),
+                "summary_source": item.get("summary_source"),
+            }
+        )
+    return _ok({"summaries": items})
 
 
 def set_clock(body: dict) -> dict:

@@ -68,6 +68,7 @@ After Python or JS changes, restart `--ui` and hard-refresh the browser (`Cmd+Sh
 - **Schedule** — weekly rotations per tail; ferry reposition when needed
 - **Gates & slots** — stand auctions vs weekly runway movement quotas (separate systems)
 - **Bank** — loans and credit
+- **Books** — week P&L (revenue, fuel, leases, fees, net) and fuel desk (hedge / reserve / dip)
 - **Clock** — pause / 1× / 2× / 4× / 20×; weeks settle automatically
 
 ## Project layout
