@@ -33,6 +33,12 @@ from engine.scheduling.rotation import (
     create_chained_detailed_rotation,
     create_flight_schedule,
 )
+from engine.scheduling.flight_numbers import (
+    allocate_flight_number,
+    allocate_flight_numbers_for_legs,
+    assert_flight_number_ok,
+    propose_flight_numbers_for_routes,
+)
 from engine.scheduling.segments import (
     reset_operational_schedule_for_new_calendar_week,
     remove_superseded_scheduled_segments_for_tail,
@@ -105,4 +111,8 @@ __all__ = [
     "create_flight_schedule",
     "_day_of_week_label",
     "_plan_chained_detailed_segments",
+    "allocate_flight_number",
+    "allocate_flight_numbers_for_legs",
+    "assert_flight_number_ok",
+    "propose_flight_numbers_for_routes",
 ]

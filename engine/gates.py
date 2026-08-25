@@ -7,11 +7,9 @@ Phase 11 (revised): airport gate-use auctions.
 - Ascending auction model: bids specify (units_requested, price_per_unit). The auction's current
   price is the max bid rounded up to gate_price_step.
 - Resolution at settlement: allocate units to highest price bidders until supply, deduct cash, update allocations.
-- Utilization = gate-hours / (gate_units * 168), where gate-hours are movements * MTT. That is a
-  time-occupancy ratio, so realistic values are small: at MTT=30min a stand doing 10 flights a day
-  scores about 0.06. Thresholds are calibrated to that scale (hub 0.06, non-hub 0.02), NOT to
-  "fraction of stands used". Below threshold for grace_weeks consecutive weeks loses 1 unit, and a
-  unit is never judged in a week before it was usable (see reset_weekly_gate_counters_and_enforce).
+- Utilization = gate-hours / (gate_units * 168). Player gate-hours use per-leg turn_minutes
+  (the turnaround you set when scheduling) merged into [arr, dep + turn) windows. AI still
+  uses the global MTT default. Realistic util values are small at default MTT (hub ~0.06).
 """
 
 from __future__ import annotations
@@ -99,13 +97,23 @@ def _round_up_step(x: float, step: float) -> float:
     return float(math.ceil(float(x) / step) * step)
 
 
-def _mtt_hours() -> float:
-    """Minimum turnaround time (gate-occupancy window) in hours."""
+def _default_turn_minutes() -> float:
+    """Fallback turnaround when a segment has no stored turn_minutes."""
     try:
         v = db.get_financial_constant("mtt_minutes")
-        return float(v or 30) / 60.0
+        return float(v or 30)
     except Exception:
-        return 0.5
+        return 30.0
+
+
+def _mtt_hours() -> float:
+    """Default gate-occupancy extension in hours (legacy / AI fallback)."""
+    return _default_turn_minutes() / 60.0
+
+
+def _turn_hours(minutes: Optional[float]) -> float:
+    m = _default_turn_minutes() if minutes is None else float(minutes)
+    return max(0.0, m) / 60.0
 
 
 def _allocated_gates(iata: str, holder_id: str) -> int:
@@ -120,22 +128,30 @@ def _allocated_gates(iata: str, holder_id: str) -> int:
     return int(row["gate_units"] or 0) if row else 0
 
 
-def _visit_intervals_for_tail(mtt: float, events: list[tuple[float, str]]) -> list[tuple[float, float]]:
+def _visit_intervals_for_tail_events(
+    events: list[tuple[float, str, float]],
+) -> list[tuple[float, float]]:
     """
     One aircraft, one stand: merge arrival + departure at the same airport into a single
     occupancy window [arr, dep + MTT) instead of double-counting deplaning and boarding.
+
+    Each event is (time, 'A'|'D', mtt_hours). Departures use the scheduled leg turnaround;
+    orphan arrivals use their event mtt for a minimum hold.
     """
     if not events:
         return []
     ordered = sorted(events, key=lambda x: (float(x[0]), 0 if x[1] == "A" else 1))
     out: list[tuple[float, float]] = []
     open_arr: Optional[float] = None
-    for t, kind in ordered:
+    open_mtt = _mtt_hours()
+    for t, kind, mtt in ordered:
         t = float(t)
+        mtt = float(mtt)
         if kind == "A":
             if open_arr is not None:
-                out.append((open_arr, open_arr + mtt))
+                out.append((open_arr, open_arr + open_mtt))
             open_arr = t
+            open_mtt = mtt
         else:
             if open_arr is not None and t + 1e-9 >= open_arr:
                 out.append((open_arr, t + mtt))
@@ -143,8 +159,14 @@ def _visit_intervals_for_tail(mtt: float, events: list[tuple[float, str]]) -> li
             else:
                 out.append((t, t + mtt))
     if open_arr is not None:
-        out.append((open_arr, open_arr + mtt))
+        out.append((open_arr, open_arr + open_mtt))
     return out
+
+
+def _visit_intervals_for_tail(mtt: float, events: list[tuple[float, str]]) -> list[tuple[float, float]]:
+    """Legacy helper: uniform mtt for all events on one tail."""
+    tagged = [(float(t), str(k), float(mtt)) for t, k in events]
+    return _visit_intervals_for_tail_events(tagged)
 
 
 def visit_intervals_for_tail(
@@ -161,7 +183,8 @@ def gate_intervals_from_tail_events(
     m = _mtt_hours() if mtt is None else float(mtt)
     out: list[tuple[float, float]] = []
     for events in by_tail.values():
-        out.extend(_visit_intervals_for_tail(m, events))
+        tagged = [(float(t), str(k), m) for t, k in events]
+        out.extend(_visit_intervals_for_tail_events(tagged))
     return out
 
 
@@ -286,7 +309,7 @@ def _gate_intervals_at_airport(
     """
     ap = iata.upper().strip()
     gw = int(game_week)
-    mtt = _mtt_hours()
+    default_m = _default_turn_minutes()
     rows = db.fetch_all(
         """
         SELECT
@@ -294,7 +317,8 @@ def _gate_intervals_at_airport(
             fs.scheduled_dep_game_hour AS dep_h,
             fs.scheduled_arr_game_hour AS arr_h,
             COALESCE(fs.origin_iata, r.origin_iata) AS oi,
-            COALESCE(fs.dest_iata,   r.dest_iata)   AS di
+            COALESCE(fs.dest_iata,   r.dest_iata)   AS di,
+            fs.turn_minutes AS turn_min
         FROM flight_segments fs
         JOIN routes r ON r.route_id = fs.route_id
         WHERE fs.game_week = ?
@@ -303,13 +327,14 @@ def _gate_intervals_at_airport(
         """,
         (gw, ap, ap),
     )
-    by_tail: dict[str, list[tuple[float, str]]] = {}
+    by_tail: dict[str, list[tuple[float, str, float]]] = {}
     planned_tail = "__PLANNED__"
+    orphan_mtt = _mtt_hours()
 
-    def _touch(tail: str, t: float, kind: str) -> None:
+    def _touch(tail: str, t: float, kind: str, mtt_h: float) -> None:
         if t <= 0 and kind == "A":
             return
-        by_tail.setdefault(str(tail), []).append((float(t), kind))
+        by_tail.setdefault(str(tail), []).append((float(t), kind, float(mtt_h)))
 
     skip_tails = {str(t) for t in (exclude_tails or set()) if t}
 
@@ -321,10 +346,11 @@ def _gate_intervals_at_airport(
         arr = float(r["arr_h"] or 0.0)
         oi = str(r["oi"] or "").upper()
         di = str(r["di"] or "").upper()
+        turn_h = _turn_hours(r["turn_min"] if r["turn_min"] is not None else default_m)
         if oi == ap:
-            _touch(tail, dep, "D")
+            _touch(tail, dep, "D", turn_h)
         if di == ap:
-            _touch(tail, arr, "A")
+            _touch(tail, arr, "A", orphan_mtt)
 
     for s in extra_segments or []:
         tail = str(s.get("tail_number") or planned_tail)
@@ -332,14 +358,15 @@ def _gate_intervals_at_airport(
         arr = float(s.get("arr_abs") or 0.0)
         oi = str(s.get("origin_iata") or "").upper().strip()
         di = str(s.get("dest_iata") or "").upper().strip()
+        turn_h = _turn_hours(s.get("turn_minutes"))
         if oi == ap:
-            _touch(tail, dep, "D")
+            _touch(tail, dep, "D", turn_h)
         if di == ap:
-            _touch(tail, arr, "A")
+            _touch(tail, arr, "A", orphan_mtt)
 
     out: list[tuple[float, float]] = []
     for _tail, events in by_tail.items():
-        out.extend(_visit_intervals_for_tail(mtt, events))
+        out.extend(_visit_intervals_for_tail_events(events))
     return out
 
 
@@ -951,7 +978,10 @@ def reset_weekly_gate_counters_and_enforce(settled_game_week: int) -> None:
                 thr = float(thr_legacy)
 
             touches = 0
+            busy_hours = 0.0
             if holder == "PLAYER":
+                intervals = _player_intervals_for_airport(airport_iata, int(settled_game_week))
+                busy_hours = sum(max(0.0, float(e) - float(s)) for s, e in intervals)
                 cnt = db.fetch_one(
                     """
                     SELECT
@@ -979,7 +1009,7 @@ def reset_weekly_gate_counters_and_enforce(settled_game_week: int) -> None:
                     (airport_iata, airport_iata, int(settled_game_week), holder),
                 )
                 touches = int(cnt["n"] or 0) if cnt else 0
-            busy_hours = float(touches) * float(mtt)
+                busy_hours = float(touches) * float(mtt)
             util = busy_hours / float(max(1, units) * 168.0)
             if util < thr:
                 below += 1

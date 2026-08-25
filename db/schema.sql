@@ -217,6 +217,13 @@ CREATE TABLE IF NOT EXISTS airport_gate_bids (
     FOREIGN KEY (auction_id) REFERENCES airport_gate_auctions(auction_id)
 );
 
+-- Sticky product flight numbers by directed route (e.g. ONT-TPA → ALL1992)
+CREATE TABLE IF NOT EXISTS route_flight_numbers (
+    route_id TEXT PRIMARY KEY,
+    flight_number TEXT NOT NULL,
+    updated_week INTEGER NOT NULL DEFAULT 1
+);
+
 -- Flight Schedules: weekly recurring flight schedules
 CREATE TABLE IF NOT EXISTS flight_schedules (
     schedule_id TEXT PRIMARY KEY,
@@ -282,6 +289,7 @@ CREATE TABLE IF NOT EXISTS flight_segments (
     revenue_business_cabin REAL NOT NULL DEFAULT 0,
     revenue_first REAL NOT NULL DEFAULT 0,
     delay_minutes INTEGER NOT NULL DEFAULT 0,
+    turn_minutes INTEGER,
     divert_airport_iata TEXT,
     divert_surcharge REAL NOT NULL DEFAULT 0,
     is_ferry INTEGER NOT NULL DEFAULT 0,

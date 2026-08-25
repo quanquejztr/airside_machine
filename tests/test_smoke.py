@@ -61,6 +61,7 @@ DATA = ROOT / "data"
 # Shared fixtures own the DB redirection: they also reset db.py's cached per-thread
 # connection, without which every test after the first reads the previous world.
 from helpers import live_copy as TempSave  # noqa: E402
+from helpers import fresh_game, near_airports, pick_type  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +602,233 @@ class TestFerry(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Settlement catch-up. Saves that advanced calendar weeks without week_ledger
+# must heal on boot / Books open.
+# ---------------------------------------------------------------------------
+class TestSettlementCatchUp(unittest.TestCase):
+    def _stub_ledger(self, db, week: int) -> None:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO week_ledger (
+                game_week, revenue_gross, excise_tax, segment_fees, security_fees,
+                pfc_fees, landing_fees, gate_fees, fuel_cost, lease_costs,
+                maintenance_costs, loan_payments, corporate_tax, net_income,
+                cash_end_of_week
+            ) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            """,
+            (week,),
+        )
+
+    def test_catch_up_fills_missing_ledger_and_moves_reputation(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation
+            from engine.settlement import (
+                catch_up_missing_settlements,
+                last_settled_week,
+                missing_settlement_weeks,
+            )
+            from engine.reputation import preview_reputation
+
+            tid = pick_type(g.db, "NARROW", min_range=600, max_seats=220)
+            if not tid:
+                self.skipTest("no usable narrowbody")
+            rr = g.db.fetch_one(
+                "SELECT runway_req_ft FROM aircraft_types WHERE type_id = ?", (tid,)
+            )
+            dests = near_airports(
+                g.db, "TPA", 250, 900, limit=4,
+                require_runway_ft=int(rr["runway_req_ft"] or 0),
+            )
+            if not dests:
+                self.skipTest("no runway-adequate spoke near TPA")
+            other = dests[0]
+            out_id, in_id = g.open_round_trip(other)
+            tail = g.lease(tid)
+            assign_rotation(tail, [out_id, in_id])
+            g.fly_all(week=1)
+
+            # Advance calendar without settling (simulates missed on_week).
+            g.set_hour(168 * 2 + 10)  # week 3
+            g.db.execute("UPDATE airline SET reputation_score = 50 WHERE id = 1")
+            self.assertEqual([1, 2], missing_settlement_weeks())
+            self.assertEqual(0, last_settled_week())
+
+            out = catch_up_missing_settlements()
+            self.assertEqual([1, 2], out["settled"])
+            self.assertEqual([1, 2], out["missing_before"])
+            self.assertEqual([], out["errors"])
+            self.assertEqual(2, last_settled_week())
+            self.assertEqual([], missing_settlement_weeks())
+            led1 = g.db.fetch_one("SELECT game_week, net_income FROM week_ledger WHERE game_week = 1")
+            self.assertIsNotNone(led1)
+            # Week 1 on-time → +2; week 2 empty → 0 (no OTP inflate).
+            rep = preview_reputation(3)
+            self.assertAlmostEqual(52.0, float(rep["reputation_score"]), places=5)
+
+    def test_catch_up_is_idempotent(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.settlement import catch_up_missing_settlements, last_settled_week
+
+            g.set_hour(168 + 5)  # week 2
+            a = catch_up_missing_settlements()
+            self.assertEqual([1], a["settled"])
+            n = last_settled_week()
+            cash1 = g.cash()
+            led = g.db.fetch_one("SELECT game_week FROM week_ledger WHERE game_week = 1")
+            self.assertIsNotNone(led)
+            b = catch_up_missing_settlements()
+            self.assertEqual([], b["settled"])
+            self.assertEqual(n, last_settled_week())
+            self.assertAlmostEqual(cash1, g.cash(), places=2)
+
+    def test_missing_weeks_detects_gaps(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.settlement import missing_settlement_weeks, last_settled_week
+
+            g.set_hour(168 * 4 + 1)  # week 5
+            self._stub_ledger(g.db, 1)
+            self._stub_ledger(g.db, 3)
+            self.assertEqual([2, 4], missing_settlement_weeks())
+            self.assertEqual(3, last_settled_week())  # MAX, even with a gap
+
+    def test_catch_up_respects_limit(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.settlement import (
+                catch_up_missing_settlements,
+                missing_settlement_weeks,
+                last_settled_week,
+            )
+
+            g.set_hour(168 * 3 + 1)  # week 4 → missing 1,2,3
+            out = catch_up_missing_settlements(limit=2)
+            self.assertEqual([1, 2, 3], out["missing_before"])
+            self.assertEqual([1, 2], out["attempted"])
+            self.assertEqual([1, 2], out["settled"])
+            self.assertEqual([3], missing_settlement_weeks())
+            self.assertEqual(2, last_settled_week())
+
+    def test_books_status_includes_settlement_and_reputation(self):
+        with fresh_game(hub="TPA") as g:
+            from server import game_api as api
+
+            g.set_hour(10)
+            out = api.books_status()
+            self.assertTrue(out.get("ok"), out.get("error"))
+            self.assertIn("week", out)
+            self.assertIn("fuel", out)
+            self.assertIn("settlement", out)
+            self.assertIn("reputation", out)
+            st = out["settlement"]
+            self.assertEqual(1, int(st["calendar_week"]))
+            self.assertEqual([], st["missing_weeks"])
+            rep = out["reputation"]
+            self.assertIn("reputation_score", rep)
+            self.assertIn("brand_power", rep)
+            self.assertIn("projected_delta", rep)
+
+
+# ---------------------------------------------------------------------------
+# Reputation OTP math (settlement + Books preview share _week_otp_stats).
+# ---------------------------------------------------------------------------
+class TestReputationOtp(unittest.TestCase):
+    def _insert_landed(self, g, *, week, delay, seg_id, route_id, tail):
+        g.db.execute(
+            """
+            INSERT INTO flight_segments (
+                segment_id, game_week, day_of_week, tail_number, route_id,
+                origin_iata, dest_iata, flight_number,
+                scheduled_dep_time, scheduled_dep_game_hour,
+                scheduled_arr_time, scheduled_arr_game_hour,
+                baseline_dep_game_hour, baseline_arr_game_hour,
+                status, delay_minutes, pax_business, pax_leisure, revenue_gross,
+                excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee, is_ferry
+            ) VALUES (?, ?, 'MON', ?, ?, 'TPA', 'MCO', 'X',
+                      '08:00', 8.0, '09:00', 9.0, 8.0, 9.0,
+                      'LANDED', ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            """,
+            (seg_id, week, tail, route_id, delay),
+        )
+
+    def test_empty_week_does_not_boost_reputation(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.reputation import update_reputation, preview_reputation
+
+            g.db.execute("UPDATE airline SET reputation_score = 50 WHERE id = 1")
+            delta, score = update_reputation(1)
+            self.assertEqual(0.0, delta)
+            self.assertEqual(50.0, score)
+            prev = preview_reputation(1)
+            self.assertEqual(0, int(prev["flights_counted"]))
+            self.assertEqual(0.0, float(prev["projected_delta"]))
+
+    def test_empty_week_still_applies_aog(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.reputation import update_reputation
+
+            g.db.execute("UPDATE airline SET reputation_score = 50 WHERE id = 1")
+            g.db.execute(
+                """
+                INSERT INTO event_log (
+                    event_id, game_week, game_time_hours, event_type,
+                    affected_iata, affected_tail, description, financial_impact, resolved
+                ) VALUES ('aog-empty', 1, 10.0, 'AOG', NULL, NULL, 'Grounded', 0, 0)
+                """
+            )
+            delta, score = update_reputation(1)
+            self.assertAlmostEqual(-0.5, delta, places=5)
+            self.assertAlmostEqual(49.5, score, places=5)
+
+    def test_high_otp_and_aog_penalty(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.reputation import update_reputation, apply_brand_power_from_reputation
+            from engine.reputation import reputation_to_brand_power
+
+            tid = pick_type(g.db, "NARROW", min_range=200, max_seats=220)
+            if not tid:
+                self.skipTest("no usable narrowbody")
+            out_id, _ = g.open_round_trip("MCO")
+            tail = g.lease(tid)
+            g.db.execute("UPDATE airline SET reputation_score = 50, marketing_brand_bonus = 0.05 WHERE id = 1")
+            for i, delay in enumerate((0, 0)):
+                self._insert_landed(
+                    g, week=1, delay=delay, seg_id=f"otp-{i}", route_id=out_id, tail=tail,
+                )
+            g.db.execute(
+                """
+                INSERT INTO event_log (
+                    event_id, game_week, game_time_hours, event_type,
+                    affected_iata, affected_tail, description, financial_impact, resolved
+                ) VALUES ('aog-1', 1, 10.0, 'AOG', NULL, ?, 'Engine', 0, 0)
+                """,
+                (tail,),
+            )
+            delta, score = update_reputation(1)
+            # +2 OTP, -0.5 AOG
+            self.assertAlmostEqual(1.5, delta, places=5)
+            self.assertAlmostEqual(51.5, score, places=5)
+            bp = apply_brand_power_from_reputation()
+            self.assertAlmostEqual(reputation_to_brand_power(51.5) + 0.05, bp, places=5)
+
+    def test_poor_otp_drops_reputation(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.reputation import update_reputation
+
+            tid = pick_type(g.db, "NARROW", min_range=200, max_seats=220)
+            if not tid:
+                self.skipTest("no usable narrowbody")
+            out_id, _ = g.open_round_trip("MCO")
+            tail = g.lease(tid)
+            g.db.execute("UPDATE airline SET reputation_score = 50 WHERE id = 1")
+            for i, delay in enumerate((30, 40, 50, 60)):  # 0% on-time
+                self._insert_landed(
+                    g, week=1, delay=delay, seg_id=f"late-{i}", route_id=out_id, tail=tail,
+                )
+            delta, score = update_reputation(1)
+            self.assertEqual(-5.0, delta)
+            self.assertEqual(45.0, score)
+
+
+# ---------------------------------------------------------------------------
 # 7. Overlay API. Every dock the UI can open must return a payload.
 # ---------------------------------------------------------------------------
 class TestOverlayAPI(unittest.TestCase):
@@ -611,6 +839,21 @@ class TestOverlayAPI(unittest.TestCase):
             rt = db.fetch_one("SELECT route_id, origin_iata, dest_iata FROM routes LIMIT 1")
             tail = db.fetch_one("SELECT tail_number FROM fleet LIMIT 1")
             comp = db.fetch_one("SELECT competitor_id FROM competitors LIMIT 1")
+            # Avoid a multi-week settlement catch-up during endpoint smoke (slow AI turns).
+            gw_row = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+            gw = int(gw_row["game_week"] or 1) if gw_row else 1
+            for w in range(1, max(1, gw)):
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO week_ledger (
+                        game_week, revenue_gross, excise_tax, segment_fees, security_fees,
+                        pfc_fees, landing_fees, gate_fees, fuel_cost, lease_costs,
+                        maintenance_costs, loan_payments, corporate_tax, net_income,
+                        cash_end_of_week
+                    ) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    """,
+                    (w,),
+                )
             # route_detail is player-scoped: the routes table also holds AI-only markets.
             prow = db.fetch_one(
                 "SELECT r.route_id, r.origin_iata, r.dest_iata FROM routes r "
@@ -778,32 +1021,106 @@ class TestGateRetention(unittest.TestCase):
         """One aircraft arriving then departing should not double-count as 2 concurrent gates."""
         from engine.gates import _gate_intervals_at_airport, _mtt_hours, _peak_concurrency
 
-        mtt = _mtt_hours()
-        arr = 100.0
-        dep_tight = arr + (20.0 / 60.0)  # 20 min turn — shorter than default MTT
-        peak_old_style = _peak_concurrency([(arr, arr + mtt), (dep_tight, dep_tight + mtt)])
-        self.assertEqual(2, peak_old_style, "sanity: overlapping arr/dep windows double-count")
-        peak = _peak_concurrency(
-            _gate_intervals_at_airport(
-                "SFO",
-                1,
-                extra_segments=[
-                    {
-                        "origin_iata": "ATL",
-                        "dest_iata": "SFO",
-                        "dep_abs": arr - 4.0,
-                        "arr_abs": arr,
-                    },
-                    {
-                        "origin_iata": "SFO",
-                        "dest_iata": "ATL",
-                        "dep_abs": dep_tight,
-                        "arr_abs": dep_tight + 4.0,
-                    },
-                ],
+        with fresh_game():
+            mtt = _mtt_hours()
+            arr = 100.0
+            dep_tight = arr + (20.0 / 60.0)  # 20 min turn — shorter than default MTT
+            peak_old_style = _peak_concurrency([(arr, arr + mtt), (dep_tight, dep_tight + mtt)])
+            self.assertEqual(2, peak_old_style, "sanity: overlapping arr/dep windows double-count")
+            peak = _peak_concurrency(
+                _gate_intervals_at_airport(
+                    "SFO",
+                    1,
+                    extra_segments=[
+                        {
+                            "origin_iata": "ATL",
+                            "dest_iata": "SFO",
+                            "dep_abs": arr - 4.0,
+                            "arr_abs": arr,
+                        },
+                        {
+                            "origin_iata": "SFO",
+                            "dest_iata": "ATL",
+                            "dep_abs": dep_tight,
+                            "arr_abs": dep_tight + 4.0,
+                        },
+                    ],
+                )
             )
-        )
-        self.assertEqual(1, peak, "one tail turn at SFO should need only one stand")
+            self.assertEqual(1, peak, "one tail turn at SFO should need only one stand")
+
+    def test_scheduled_turn_minutes_drive_gate_occupancy(self):
+        """Per-leg turnaround from scheduling is gate MTT, not the global 30 min default."""
+        from engine.gates import _gate_intervals_at_airport
+
+        with fresh_game():
+            arr = 200.0
+            turn_h = 180.0 / 60.0
+            dep = arr + turn_h
+            inbound = {
+                "tail_number": "N900",
+                "origin_iata": "ONT",
+                "dest_iata": "ICN",
+                "dep_abs": arr - 11.0,
+                "arr_abs": arr,
+            }
+            outbound = {
+                "tail_number": "N900",
+                "origin_iata": "ICN",
+                "dest_iata": "ONT",
+                "dep_abs": dep,
+                "arr_abs": dep + 11.0,
+            }
+            busy_default = sum(
+                e - s
+                for s, e in _gate_intervals_at_airport("ICN", 2, extra_segments=[inbound, outbound])
+            )
+            busy_long = sum(
+                e - s
+                for s, e in _gate_intervals_at_airport(
+                    "ICN",
+                    2,
+                    extra_segments=[inbound, {**outbound, "turn_minutes": 180}],
+                )
+            )
+            self.assertGreater(busy_long, busy_default + 1.0)
+            # [arr, dep + turn): dep = arr + turn, so occupancy = 2 × turn
+            self.assertAlmostEqual(busy_long, turn_h * 2.0, places=2)
+
+    def test_airport_board_coalesces_route_endpoints(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from ui.airport_board import get_airport_board_rows
+
+            rt = db.fetch_one(
+                "SELECT route_id, origin_iata, dest_iata FROM routes LIMIT 1"
+            )
+            if not rt:
+                self.skipTest("need a route in save")
+            db.execute(
+                """
+                INSERT INTO flight_segments (
+                    segment_id, game_week, day_of_week, tail_number, route_id,
+                    flight_number, scheduled_dep_time, scheduled_dep_game_hour,
+                    scheduled_arr_time, scheduled_arr_game_hour,
+                    baseline_dep_game_hour, baseline_arr_game_hour,
+                    status, pax_business, pax_leisure, revenue_gross,
+                    excise_tax, segment_fee, security_fee, pfc_fee,
+                    landing_fee, gate_fee
+                ) VALUES (
+                    'seg-null-od', 1, 'MON', 'N777', ?, 'TST001',
+                    '08:00', 8.0, '16:00', 16.0, 8.0, 16.0, 'SCHEDULED',
+                    0, 0, 0, 0, 0, 0, 0, 0, 0
+                )
+                """,
+                (str(rt["route_id"]),),
+            )
+            deps = [
+                r
+                for r in get_airport_board_rows(str(rt["origin_iata"]), 1)
+                if r.get("direction") == "DEP"
+            ]
+            self.assertTrue(any(r.get("origin_iata") == rt["origin_iata"] for r in deps))
 
     def test_list_open_resolves_overdue_instead_of_cancelling_bids(self):
         """
@@ -856,6 +1173,13 @@ class TestGateRetention(unittest.TestCase):
 
 class TestConcurrentGates(unittest.TestCase):
     """Player + AI peak-concurrency at auctioned airports (HNL, LAX, SFO, etc.)."""
+
+    def setUp(self):
+        self._world = fresh_game()
+        self._world.__enter__()
+
+    def tearDown(self):
+        self._world.__exit__(None, None, None)
 
     def _mtt(self):
         from engine.gates import _mtt_hours
@@ -1122,3 +1446,122 @@ class TestConcurrentGates(unittest.TestCase):
                     f"{ap} week {gw}: peak {peak} > cap {cap}",
                 )
             assert_player_gate_capacity_for_week(gw)
+
+# ---------------------------------------------------------------------------
+# Flight numbers: sticky-by-route, random (not 001), overlap rules, spawn persist
+# ---------------------------------------------------------------------------
+class TestFlightNumbers(unittest.TestCase):
+    def _rt_setup(self, g):
+        tid = pick_type(g.db, "NARROW", min_range=200, max_seats=220)
+        if not tid:
+            self.skipTest("no usable narrowbody")
+        dests = near_airports(g.db, "TPA", 150, 800, limit=4)
+        if not dests:
+            self.skipTest("no nearby spoke")
+        other = dests[0]
+        out_id, in_id = g.open_round_trip(other)
+        return tid, other, out_id, in_id
+
+    def test_auto_assign_is_not_sequential_001(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation
+
+            tid, _other, out_id, in_id = self._rt_setup(g)
+            t1 = g.lease(tid)
+            assign_rotation(t1, [out_id, in_id])
+            rows = g.db.fetch_all(
+                "SELECT flight_number FROM flight_segments WHERE tail_number = ? ORDER BY scheduled_dep_game_hour",
+                (t1,),
+            )
+            fns = [str(r["flight_number"]) for r in rows]
+            self.assertEqual(2, len(fns))
+            self.assertNotEqual(fns[0], fns[1])  # round-trip pair differs
+            for fn in fns:
+                self.assertFalse(fn.endswith("001"), f"got sequential-style {fn}")
+                self.assertFalse(fn.endswith("002"), f"got sequential-style {fn}")
+                # 4-digit product numbers
+                self.assertRegex(fn, r"^[A-Z]{2,3}\d{4}$")
+
+    def test_sticky_reuses_number_for_same_route(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation, cancel_rotation
+            from engine.scheduling.flight_numbers import get_sticky_flight_number
+
+            tid, _other, out_id, in_id = self._rt_setup(g)
+            t1 = g.lease(tid)
+            assign_rotation(t1, [out_id, in_id])
+            first = g.db.fetch_one(
+                "SELECT flight_number FROM flight_segments WHERE route_id = ? LIMIT 1",
+                (out_id,),
+            )
+            sticky = get_sticky_flight_number(out_id)
+            self.assertEqual(str(first["flight_number"]), sticky)
+            cancel_rotation(t1, wipe_completed_this_week=True)
+            t2 = g.lease(tid)
+            assign_rotation(t2, [out_id, in_id])
+            second = g.db.fetch_one(
+                "SELECT flight_number FROM flight_segments WHERE route_id = ? AND tail_number = ? LIMIT 1",
+                (out_id, t2),
+            )
+            self.assertEqual(sticky, str(second["flight_number"]))
+
+    def test_overlap_same_number_is_rejected(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation
+            from engine.scheduling.flight_numbers import assert_flight_number_ok
+
+            tid, _other, out_id, in_id = self._rt_setup(g)
+            t1 = g.lease(tid)
+            assign_rotation(t1, [out_id, in_id], flight_numbers=["TST1992", "TST1993"])
+            seg = g.db.fetch_one(
+                "SELECT scheduled_dep_game_hour d, scheduled_arr_game_hour a FROM flight_segments "
+                "WHERE flight_number = 'TST1992' LIMIT 1"
+            )
+            with self.assertRaises(ValueError):
+                assert_flight_number_ok(
+                    "TST1992",
+                    [(float(seg["d"]), float(seg["a"]))],
+                    1,
+                )
+            # Non-overlapping window with same number is OK
+            assert_flight_number_ok(
+                "TST1992",
+                [(float(seg["a"]) + 2.0, float(seg["a"]) + 4.0)],
+                1,
+            )
+
+    def test_manual_override_persists_in_quick_template(self):
+        with fresh_game(hub="TPA") as g:
+            import json
+            from engine.scheduling import assign_rotation
+
+            tid, _other, out_id, in_id = self._rt_setup(g)
+            tail = g.lease(tid)
+            assign_rotation(tail, [out_id, in_id], flight_numbers=["ABC4242", "ABC4243"])
+            row = g.db.fetch_one(
+                "SELECT legs_json FROM weekly_rotations WHERE tail_number = ?", (tail,)
+            )
+            blob = json.loads(row["legs_json"])
+            legs = blob if isinstance(blob, list) else blob.get("legs") or []
+            self.assertEqual("ABC4242", legs[0].get("flight_number"))
+            self.assertEqual("ABC4243", legs[1].get("flight_number"))
+
+    def test_week_spawn_keeps_template_flight_numbers(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation, spawn_rotation_segments_for_week
+
+            tid, _other, out_id, in_id = self._rt_setup(g)
+            tail = g.lease(tid)
+            assign_rotation(tail, [out_id, in_id], flight_numbers=["ZZZ7777", "ZZZ7778"])
+            g.db.execute("DELETE FROM flight_segments WHERE game_week = 1")
+            g.set_hour(168 + 10)  # week 2
+            out = spawn_rotation_segments_for_week(2)
+            self.assertGreater(int(out.get("inserted") or 0), 0)
+            fns = {
+                str(r["flight_number"])
+                for r in g.db.fetch_all(
+                    "SELECT flight_number FROM flight_segments WHERE game_week = 2 AND tail_number = ?",
+                    (tail,),
+                )
+            }
+            self.assertEqual({"ZZZ7777", "ZZZ7778"}, fns)

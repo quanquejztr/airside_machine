@@ -128,6 +128,12 @@ def ensure_game_clock():
     
     existing = get_global_clock()
     if existing is not None and existing.is_alive():
+        try:
+            from engine.settlement import catch_up_missing_settlements
+
+            catch_up_missing_settlements()
+        except Exception:
+            pass
         return existing
     
     def on_week_roll(new_week):
@@ -149,7 +155,7 @@ def ensure_game_clock():
         except Exception:
             pass
 
-    return start_game_clock(
+    clock = start_game_clock(
         on_week=on_week_roll,
         on_tick=on_fuel_tick,
         on_departure=on_departure,
@@ -157,6 +163,13 @@ def ensure_game_clock():
         on_ai_departure=ai_on_departure_cb,
         on_ai_arrival=ai_on_arrival_cb,
     )
+    try:
+        from engine.settlement import catch_up_missing_settlements
+
+        catch_up_missing_settlements()
+    except Exception:
+        pass
+    return clock
 
 
 def show_stats():

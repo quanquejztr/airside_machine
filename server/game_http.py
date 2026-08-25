@@ -124,6 +124,18 @@ def ensure_runtime_clock():
             on_ai_arrival=ai_on_arrival_cb,
         )
 
+    try:
+        from engine.settlement import catch_up_missing_settlements
+
+        catch_up_missing_settlements()
+    except Exception as e:
+        try:
+            from engine.news_feed import push_news
+
+            push_news(f"⚠ Settlement catch-up failed: {e}")
+        except Exception:
+            pass
+
     global _ops_seeded, _ai_boot_started
     if not _ops_seeded:
         _ops_seeded = True

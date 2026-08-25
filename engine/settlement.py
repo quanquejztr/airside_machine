@@ -366,11 +366,133 @@ def build_week_summary_payload(for_game_week: Optional[int] = None) -> Dict[str,
 
 _settlement_lock = threading.Lock()
 _week_summary_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=16)
+_catch_up_lock = threading.Lock()
+_catch_up_running = False
 
 
 def get_week_summary_queue() -> "queue.Queue[Dict[str, Any]]":
     """UI polls this for completed week summaries (non-blocking)."""
     return _week_summary_queue
+
+
+def calendar_week_from_state() -> int:
+    """Current 1-based calendar week from game_state (fallback to hours)."""
+    gs = db.fetch_one("SELECT game_week, game_hours_elapsed FROM game_state WHERE id = 1")
+    if not gs:
+        return 1
+    try:
+        from engine.clock import get_display_game_hours
+
+        ghe = float(get_display_game_hours())
+    except Exception:
+        ghe = float(gs["game_hours_elapsed"] or 0)
+    by_hours = int(ghe // 168) + 1
+    by_col = int(gs["game_week"] or 1)
+    return max(1, by_hours, by_col)
+
+
+def last_settled_week() -> int:
+    row = db.fetch_one("SELECT COALESCE(MAX(game_week), 0) AS m FROM week_ledger")
+    return int(row["m"] or 0) if row else 0
+
+
+def missing_settlement_weeks(up_to_week: Optional[int] = None) -> List[int]:
+    """
+    Completed weeks (1 .. current-1) that have no week_ledger row.
+
+    up_to_week defaults to the live calendar week; only weeks strictly before it are due.
+    """
+    cur = int(up_to_week) if up_to_week is not None else calendar_week_from_state()
+    if cur <= 1:
+        return []
+    settled = {
+        int(r["game_week"])
+        for r in (db.fetch_all("SELECT game_week FROM week_ledger") or [])
+        if r and r["game_week"] is not None
+    }
+    return [w for w in range(1, cur) if w not in settled]
+
+
+def catch_up_missing_settlements(*, limit: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Settle any completed weeks missing from week_ledger (idempotent via run_settlement).
+
+    Applies full economics (cash, leases, reputation, AI turn, …) for each missing week.
+    Concurrent callers share one run (boot + Books open).
+    """
+    global _catch_up_running
+    with _catch_up_lock:
+        if _catch_up_running:
+            return {
+                "missing_before": missing_settlement_weeks(),
+                "attempted": [],
+                "settled": [],
+                "errors": [],
+                "results": [],
+                "last_settled_week": last_settled_week(),
+                "calendar_week": calendar_week_from_state(),
+                "still_missing": missing_settlement_weeks(),
+                "skipped_busy": True,
+            }
+        _catch_up_running = True
+    try:
+        return _catch_up_missing_settlements_body(limit=limit)
+    finally:
+        with _catch_up_lock:
+            _catch_up_running = False
+
+
+def _catch_up_missing_settlements_body(*, limit: Optional[int] = None) -> Dict[str, Any]:
+    all_missing = missing_settlement_weeks()
+    missing = list(all_missing)
+    if limit is not None:
+        missing = missing[: max(0, int(limit))]
+    settled: List[int] = []
+    errors: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    for w in missing:
+        try:
+            out = run_settlement(w)
+            if out.get("skipped") and out.get("reason") == "already settled":
+                # Concurrent catch-up / race: treat as done, not newly settled.
+                continue
+            if out.get("skipped"):
+                errors.append({"game_week": w, "error": out.get("reason") or "skipped"})
+                # No airline / invalid week — stop so we do not keep failing.
+                if out.get("reason") in ("no airline", "invalid week"):
+                    break
+                continue
+            settled.append(w)
+            results.append(out)
+        except Exception as e:
+            errors.append({"game_week": w, "error": str(e)})
+            try:
+                from engine.news_feed import push_news
+
+                push_news(f"⚠ Settlement catch-up failed for week {w}: {e}")
+            except Exception:
+                pass
+            break
+    if settled:
+        try:
+            from engine.news_feed import push_news
+
+            if len(settled) == 1:
+                push_news(f"Settled backlog: week {settled[0]}")
+            else:
+                push_news(f"Settled backlog: weeks {settled[0]}–{settled[-1]}")
+        except Exception:
+            pass
+    return {
+        "missing_before": all_missing,
+        "attempted": missing,
+        "settled": settled,
+        "errors": errors,
+        "results": results,
+        "last_settled_week": last_settled_week(),
+        "calendar_week": calendar_week_from_state(),
+        "still_missing": missing_settlement_weeks(),
+    }
 
 
 def enqueue_settlement_after_week_boundary(new_calendar_week: int) -> None:
@@ -410,6 +532,12 @@ def enqueue_settlement_after_week_boundary(new_calendar_week: int) -> None:
         except queue.Full:
             pass
         except Exception as e:
+            try:
+                from engine.news_feed import push_news
+
+                push_news(f"⚠ Week {new_calendar_week} settlement failed: {e}")
+            except Exception:
+                pass
             try:
                 _week_summary_queue.put(
                     {"skipped": True, "error": str(e), "new_calendar_week": new_calendar_week},

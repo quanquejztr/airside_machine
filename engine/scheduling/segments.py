@@ -95,7 +95,7 @@ def remove_superseded_scheduled_segments_for_tail(tail_number: str) -> None:
 
 def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
     """Spawn quick-rotation template (list of leg dicts). Returns (inserted_count, touched_tails)."""
-    from engine.scheduling.shared import _assert_new_segment_airport_limits
+    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
     from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour, week_base_hours
     inserted = 0
     tails_touched = set()
@@ -127,6 +127,7 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
     if planned:
         _assert_new_segment_airport_limits(int(target_game_week), planned)
 
+    template_dirty = False
     for i, leg in enumerate(legs):
         route_id = leg.get("route_id")
         if not route_id or not get_route(route_id):
@@ -144,7 +145,36 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
         if db.fetch_one("SELECT 1 FROM flight_segments WHERE segment_id = ?", (segment_id,)):
             continue
 
-        flight_number = f"{callsign}{i + 1:03d}"
+        from engine.scheduling.flight_numbers import allocate_flight_number, normalize_flight_number
+
+        pref = normalize_flight_number(str(leg.get("flight_number") or ""))
+        leg_turn = int(round(float(leg.get("turn_minutes") or get_financial_constant("mtt_minutes", 30))))
+        try:
+            flight_number = allocate_flight_number(
+                route_id,
+                [(dep_abs, arr_abs)],
+                target_game_week,
+                preferred=pref or None,
+                callsign=callsign,
+                remember=True,
+            )
+        except ValueError:
+            # Prefer keeping template FN when spawn collides (e.g. concurrent same FN);
+            # fall back to a fresh allocation without preferred.
+            flight_number = allocate_flight_number(
+                route_id,
+                [(dep_abs, arr_abs)],
+                target_game_week,
+                preferred=None,
+                callsign=callsign,
+                remember=True,
+            )
+        if not pref or pref != flight_number:
+            leg["flight_number"] = flight_number
+            template_dirty = True
+        else:
+            leg["flight_number"] = flight_number
+
         dep_time_str = hhmm_from_absolute_game_hour(dep_abs)
         arr_time_str = hhmm_from_absolute_game_hour(arr_abs)
         day_of_week = "MON"
@@ -159,10 +189,11 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
                 scheduled_dep_time, scheduled_dep_game_hour,
                 scheduled_arr_time, scheduled_arr_game_hour,
                 baseline_dep_game_hour, baseline_arr_game_hour,
+                turn_minutes,
                 status, pax_business, pax_leisure, revenue_gross,
                 excise_tax, segment_fee, security_fee, pfc_fee,
                 landing_fee, gate_fee
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
             """,
             (
                 segment_id,
@@ -179,10 +210,39 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
                 arr_abs,
                 dep_abs,
                 arr_abs,
+                leg_turn,
             ),
         )
         inserted += 1
         tails_touched.add(tail_number)
+
+    if template_dirty:
+        try:
+            import json as _json
+
+            row = db.fetch_one(
+                "SELECT legs_json FROM weekly_rotations WHERE tail_number = ?",
+                (tail_number,),
+            )
+            if row and row["legs_json"]:
+                raw = _json.loads(row["legs_json"])
+                if isinstance(raw, list):
+                    db.execute(
+                        """
+                        UPDATE weekly_rotations SET legs_json = ? WHERE tail_number = ?
+                        """,
+                        (_json.dumps(legs), tail_number),
+                    )
+                elif isinstance(raw, dict) and raw.get("mode") == "quick":
+                    raw["legs"] = legs
+                    db.execute(
+                        """
+                        UPDATE weekly_rotations SET legs_json = ? WHERE tail_number = ?
+                        """,
+                        (_json.dumps(raw), tail_number),
+                    )
+        except Exception:
+            pass
 
     return inserted, tails_touched
 
@@ -267,6 +327,7 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
                 operating_days = ["MON"]
 
         flight_number = item.get("flight_number") or "FL001"
+        leg_turn = int(round(float(item.get("turn_minutes") or get_financial_constant("mtt_minutes", 30))))
 
         for day in operating_days:
             if day not in DAY_START_HOURS:
@@ -299,10 +360,11 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
                     scheduled_dep_time, scheduled_dep_game_hour,
                     scheduled_arr_time, scheduled_arr_game_hour,
                     baseline_dep_game_hour, baseline_arr_game_hour,
+                    turn_minutes,
                     status, pax_business, pax_leisure, revenue_gross,
                     excise_tax, segment_fee, security_fee, pfc_fee,
                     landing_fee, gate_fee
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
                 """,
                 (
                     segment_id,
@@ -319,6 +381,7 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
                     arr_abs,
                     dep_abs,
                     arr_abs,
+                    leg_turn,
                 ),
             )
             inserted += 1
@@ -399,6 +462,16 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
         ],
     )
 
+    turn_by_route: dict[str, int] = {}
+    default_turn = int(round(float(get_financial_constant("mtt_minutes", 30))))
+    for leg in legs_conf:
+        rid = leg.get("route_id")
+        if not rid:
+            continue
+        tm = leg.get("turn_minutes")
+        if tm is not None and str(tm).strip() != "":
+            turn_by_route[str(rid)] = int(round(float(tm)))
+
     for p in planned:
         dup = db.fetch_one(
             """
@@ -411,6 +484,8 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
         if dup:
             continue
 
+        leg_turn = turn_by_route.get(str(p["route_id"]), default_turn)
+
         dep_time_str = hhmm_from_absolute_game_hour(p["dep_abs"])
         arr_time_str = hhmm_from_absolute_game_hour(p["arr_abs"])
         segment_id = f"{tail_number}-{p['route_id']}-W{target_game_week}-{p['day']}-{uuid.uuid4().hex[:8]}"
@@ -418,14 +493,16 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
         db.execute(
             """
             INSERT INTO flight_segments (
-                segment_id, game_week, day_of_week, tail_number, route_id, flight_number,
+                segment_id, game_week, day_of_week, tail_number, route_id,
+                origin_iata, dest_iata, flight_number,
                 scheduled_dep_time, scheduled_dep_game_hour,
                 scheduled_arr_time, scheduled_arr_game_hour,
                 baseline_dep_game_hour, baseline_arr_game_hour,
+                turn_minutes,
                 status, pax_business, pax_leisure, revenue_gross,
                 excise_tax, segment_fee, security_fee, pfc_fee,
                 landing_fee, gate_fee
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
             """,
             (
                 segment_id,
@@ -433,6 +510,8 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
                 p["day"],
                 tail_number,
                 p["route_id"],
+                p.get("origin_iata"),
+                p.get("dest_iata"),
                 p["flight_number"],
                 dep_time_str,
                 p["dep_abs"],
@@ -440,6 +519,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
                 p["arr_abs"],
                 p["dep_abs"],
                 p["arr_abs"],
+                leg_turn,
             ),
         )
         inserted += 1

@@ -813,11 +813,8 @@ def assign_flight_rotation():
                 flight_numbers = []
                 for i, route_id in enumerate(route_ids, 1):
                     console.print(f"\n[bold]Leg {i}/{len(route_ids)}: {route_id}[/bold]")
-                    default_flight_num = f"{airline_info['callsign']}{i:03d}" if airline_info else f"FL{i:03d}"
-                    console.print(f"[dim]Flight number (Enter for {default_flight_num})[/dim]")
+                    console.print("[dim]Flight number (Enter for auto: sticky/random, overlap-checked)[/dim]")
                     fn = input("Flight number: ").strip().upper()
-                    if not fn:
-                        fn = default_flight_num
                     flight_numbers.append(fn)
                 
                 try:
@@ -850,13 +847,8 @@ def assign_flight_rotation():
                 for i, route_id in enumerate(route_ids, 1):
                     console.print(f"\n[bold]Flight {i}/{len(route_ids)}: {route_id}[/bold]")
                     
-                    airline_info = db.fetch_one("SELECT callsign FROM airline WHERE id = 1")
-                    default_flight_num = f"{airline_info['callsign']}{i:03d}" if airline_info else f"FL{i:03d}"
-                    
-                    console.print(f"[dim]Flight number (press Enter for auto: {default_flight_num})[/dim]")
+                    console.print("[dim]Flight number (press Enter for auto: sticky/random)[/dim]")
                     flight_number = input("Flight number: ").strip().upper()
-                    if not flight_number:
-                        flight_number = default_flight_num
                     
                     console.print("\n[bold]Operating Days:[/bold]")
                     console.print("  [cyan]1.[/cyan] Daily (7 days/week)")
