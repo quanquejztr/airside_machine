@@ -181,6 +181,32 @@ html, body {
 .hud-tip-row span { color: var(--lg-muted); font-weight: 500; }
 .hud-tip-row b { font-weight: 700; }
 .hud-tip-row b.neg { color: #9b2c2c; }
+.books-stack .hud-tip-row {
+  position: static;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 2px 0;
+  font-size: 13px;
+}
+.books-rule {
+  border: 0;
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  margin: 14px 0;
+}
+.books-fees {
+  margin: 2px 0 8px;
+}
+.books-fees summary {
+  cursor: pointer;
+  user-select: none;
+}
+.books-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
 
 .hud-speeds {
   margin-left: auto;

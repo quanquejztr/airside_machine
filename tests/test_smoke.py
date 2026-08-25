@@ -645,6 +645,8 @@ class TestOverlayAPI(unittest.TestCase):
                 "competitors_overview": lambda: api.competitors_overview(),
                 "contested_markets": lambda: api.contested_markets(),
                 "bank_status": lambda: api.bank_status("1000000"),
+                "books_status": lambda: api.books_status(),
+                "pop_week_summaries": lambda: api.pop_week_summaries(),
             })
             if comp:
                 cases["competitor_routes"] = lambda: api.competitor_routes(comp["competitor_id"])

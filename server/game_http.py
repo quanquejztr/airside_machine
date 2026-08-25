@@ -292,6 +292,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/bank":
             self._send_json(api.bank_status(q.get("amount", "")))
             return
+        if path == "/api/books":
+            self._send_json(api.books_status())
+            return
+        if path == "/api/books/pending":
+            self._send_json(api.pop_week_summaries())
+            return
         if path.startswith("/api/"):
             self._send_json({"ok": False, "error": "Not found"}, 404)
             return
@@ -354,6 +360,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/bank/payoff":
             self._send_json(api.bank_payoff(body))
+            return
+        if path == "/api/fuel":
+            self._send_json(api.fuel_action(body))
             return
         self._send_json({"ok": False, "error": "Not found"}, 404)
 
