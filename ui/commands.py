@@ -798,7 +798,7 @@ def assign_flight_rotation():
                     days_input = input("Days: ").strip()
                     day_map = {'1': 'MON', '2': 'TUE', '3': 'WED', '4': 'THU', '5': 'FRI', '6': 'SAT', '7': 'SUN'}
                     selected_days = [day_map[d.strip()] for d in days_input.split(',') if d.strip() in day_map]
-                    days_of_week = f'[{",".join([f"\"{d}\"" for d in selected_days])}]'
+                    days_of_week = "[" + ",".join(f'"{d}"' for d in selected_days) + "]"
                 else:
                     console.print("[red]✗ Invalid choice, using Daily[/red]")
                     days_of_week = "DAILY"
@@ -870,7 +870,7 @@ def assign_flight_rotation():
                         days_input = input("Days: ").strip()
                         day_map = {'1': 'MON', '2': 'TUE', '3': 'WED', '4': 'THU', '5': 'FRI', '6': 'SAT', '7': 'SUN'}
                         selected_days = [day_map[d.strip()] for d in days_input.split(',') if d.strip() in day_map]
-                        days_of_week = f'[{",".join([f"\"{d}\"" for d in selected_days])}]'
+                        days_of_week = "[" + ",".join(f'"{d}"' for d in selected_days) + "]"
                     else:
                         console.print("[red]✗ Invalid choice, using Daily[/red]")
                         days_of_week = "DAILY"
