@@ -10,12 +10,12 @@
     "2023.csv"
   ],
   "method": "grid_search_log_mse",
-  "k": 0.00050176,
+  "k": 0.00036968,
   "alpha": 0.8,
-  "beta": 1.2,
-  "small_small_damp": 0.7234,
-  "fit_points": 10163,
-  "small_small_pairs": 2075,
-  "log_sse": 30221.21,
+  "beta": 1.15,
+  "small_small_damp": 0.7597,
+  "fit_points": 10893,
+  "small_small_pairs": 2110,
+  "log_sse": 31271.69,
   "min_weekly_for_fit": 10.0
 }

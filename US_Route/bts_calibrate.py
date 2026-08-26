@@ -37,7 +37,11 @@ REF_YEAR = 2019
 GROWTH_RATE = 0.02
 DECAY_LAMBDA = 0.85
 EXCLUDE_YEARS = frozenset({2020, 2021})
-METHOD_TAG = "bts_trend_weighted_median_v1"
+# Recent-market blend: median of trend-adjusted years in this window, then
+# annual = max(weighted_median, recent_median). Lifts growth OD pairs (e.g. TPA-SAN)
+# without flattening long-run structure on stable trunks.
+RECENT_YEAR_MIN = 2019
+METHOD_TAG = "bts_trend_wm_max_recent_v2"
 
 # Gravity grid search bounds (weekly pax units; fit on anchor_weekly >= MIN_WK_GRAVITY).
 GRAVITY_MIN_WEEKLY = 10.0
@@ -203,18 +207,28 @@ def build_anchors(
         adjusted: list[float] = []
         weights: list[float] = []
         years_present: list[int] = []
+        recent_adjusted: list[float] = []
         for year, pax in sorted(year_map.items()):
             weight = year_weight(year, ref_year=ref_year, decay=decay)
             if weight <= 0:
                 continue
-            adjusted.append(trend_adjust(pax, year, ref_year=ref_year, growth=growth))
+            adj = trend_adjust(pax, year, ref_year=ref_year, growth=growth)
+            adjusted.append(adj)
             weights.append(weight)
             years_present.append(year)
+            if year >= RECENT_YEAR_MIN:
+                recent_adjusted.append(adj)
         if not adjusted:
             continue
         annual = weighted_median(adjusted, weights)
         if annual is None or annual <= 0:
             continue
+        if recent_adjusted:
+            recent_med = weighted_median(
+                recent_adjusted, [1.0] * len(recent_adjusted)
+            )
+            if recent_med is not None and recent_med > annual:
+                annual = recent_med
         rows.append(
             {
                 "origin_iata": origin,
@@ -381,10 +395,10 @@ def print_report(
     for key in ("k", "alpha", "beta", "small_small_damp", "fit_points", "log_sse"):
         print(f"  {key}: {gravity.get(key)}")
 
-    # Claude calibration preview (target_share=0.30, pdm=9, seg 2/3.5)
+    # Mode B calibration preview (target_share from CSV default 0.90, pdm=9, seg 2/3.5)
     eff = 0.30 * 9.0 * 2.0 + 0.70 * 9.0 * 3.5
-    cal_k = 0.30 / eff
-    print(f"\nCalibration preview (base_total = anchor_weekly × {cal_k:.4f}):")
+    cal_k = 0.90 / eff
+    print(f"\nCalibration preview (base_total = anchor_weekly × {cal_k:.4f}, share=0.90):")
     for od in checks:
         hit = by_od.get(od)
         if hit:

@@ -169,13 +169,15 @@ def preview_weekly_demand_before_open(origin_airport, dest_airport, distance_nm,
     """
     Weekly market demand for a route not yet in the DB (route-opening preview).
 
-    Uses the same pipeline as compute_demand: estimate_base_demand, default fares
+    Uses the same pipeline as compute_demand: BTS/gravity/legacy base demand, default fares
     (match open_route: $0.20/nm business, $0.10/nm leisure), seasonality, brand,
     noise, passenger_demand_multiplier, and business/leisure segment multipliers.
     """
-    from engine.routes import estimate_base_demand
+    from engine.route_demand import compute_base_demand
 
-    base_business, base_leisure = estimate_base_demand(distance_nm, origin_airport, dest_airport)
+    demand_info = compute_base_demand(distance_nm, origin_airport, dest_airport)
+    base_business = int(demand_info["base_demand_business"])
+    base_leisure = int(demand_info["base_demand_leisure"])
     price_business = round(float(distance_nm) * 0.20, 2)
     price_leisure = round(float(distance_nm) * 0.10, 2)
 
@@ -231,6 +233,7 @@ def preview_weekly_demand_before_open(origin_airport, dest_airport, distance_nm,
         **csplit,
         "base_demand_business": base_business,
         "base_demand_leisure": base_leisure,
+        "demand_source": demand_info.get("demand_source"),
         "price_business_default": price_business,
         "price_leisure_default": price_leisure,
         "game_week": game_week,

@@ -119,47 +119,15 @@ def get_player_routes() -> list[dict]:
 
 def estimate_base_demand(distance_nm, origin_airport, dest_airport):
     """
-    Estimate base demand for a route based on airport categories and distance.
-    This is a simplified estimation for Phase 1.
-    
-    Args:
-        distance_nm: Route distance in nautical miles
-        origin_airport: Origin airport dict with category
-        dest_airport: Destination airport dict with category
-    
-    Returns:
-        tuple: (business_demand, leisure_demand)
+    Base weekly business/leisure demand for a new route.
+
+    Prefers BTS market anchors (US), then gravity, then legacy category buckets.
+    See engine.route_demand.compute_base_demand for details.
     """
-    # Base demand factors by category
-    category_factors = {
-        'small_airport': 50,
-        'medium_airport': 150,
-        'large_airport': 300
-    }
-    
-    origin_factor = category_factors.get(origin_airport['category'], 100)
-    dest_factor = category_factors.get(dest_airport['category'], 100)
-    
-    # Average the two airports
-    base_factor = (origin_factor + dest_factor) / 2
-    
-    # Distance modifier (shorter routes have higher frequency potential)
-    if distance_nm < 500:
-        distance_mod = 1.3
-    elif distance_nm < 1500:
-        distance_mod = 1.0
-    elif distance_nm < 3000:
-        distance_mod = 0.8
-    else:
-        distance_mod = 0.6
-    
-    # Business vs leisure split
-    # Business: 30% of total, Leisure: 70% of total
-    total_demand = base_factor * distance_mod
-    business_demand = int(total_demand * 0.3)
-    leisure_demand = int(total_demand * 0.7)
-    
-    return business_demand, leisure_demand
+    from engine.route_demand import compute_base_demand
+
+    out = compute_base_demand(distance_nm, origin_airport, dest_airport)
+    return int(out["base_demand_business"]), int(out["base_demand_leisure"])
 
 
 def calculate_route_acquisition_cost(origin, dest, distance_nm):
@@ -472,6 +440,7 @@ def open_route(origin_iata, dest_iata, price_business=None, price_leisure=None, 
             "distance_nm": distance_nm,
             "base_demand_business": er.get("base_demand_business"),
             "base_demand_leisure": er.get("base_demand_leisure"),
+            "demand_source": er.get("demand_source"),
             "price_business": er.get("price_business"),
             "price_leisure": er.get("price_leisure"),
             "price_premium_economy": er.get("price_premium_economy"),
@@ -514,10 +483,13 @@ def open_route(origin_iata, dest_iata, price_business=None, price_leisure=None, 
     else:
         acquisition_paid = 0.0
     
-    # Estimate base demand
-    base_demand_business, base_demand_leisure = estimate_base_demand(
-        distance_nm, origin, dest
-    )
+    # Estimate base demand (BTS / gravity / legacy)
+    from engine.route_demand import compute_base_demand
+
+    demand_info = compute_base_demand(distance_nm, origin, dest)
+    base_demand_business = int(demand_info["base_demand_business"])
+    base_demand_leisure = int(demand_info["base_demand_leisure"])
+    demand_source = str(demand_info.get("demand_source") or "LEGACY")
     
     # Set default prices if not provided
     # Simple pricing: $0.15-0.25 per mile for business, $0.08-0.12 for leisure
@@ -535,12 +507,14 @@ def open_route(origin_iata, dest_iata, price_business=None, price_leisure=None, 
         INSERT INTO routes (
             route_id, origin_iata, dest_iata, distance_nm,
             base_demand_business, base_demand_leisure,
-            price_business, price_leisure, price_premium_economy, price_first, is_active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            price_business, price_leisure, price_premium_economy, price_first, is_active,
+            demand_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         route_id, origin_iata, dest_iata, distance_nm,
         base_demand_business, base_demand_leisure,
         price_business, price_leisure, price_premium_economy, price_first, is_active,
+        demand_source,
     ))
 
     # Mark as a PLAYER-opened route for UI / ownership filtering.
@@ -569,6 +543,7 @@ def open_route(origin_iata, dest_iata, price_business=None, price_leisure=None, 
         'distance_nm': distance_nm,
         'base_demand_business': base_demand_business,
         'base_demand_leisure': base_demand_leisure,
+        'demand_source': demand_source,
         'price_business': price_business,
         'price_leisure': price_leisure,
         'price_premium_economy': price_premium_economy,
@@ -585,7 +560,7 @@ def open_route(origin_iata, dest_iata, price_business=None, price_leisure=None, 
         print(f"\n✓ Route Opened: {route_id}")
         print(f"  {origin['city']} ({origin_iata}) → {dest['city']} ({dest_iata})")
         print(f"  Distance: {distance_nm:,.0f} nm")
-        print(f"  Base Demand: {base_demand_business} business, {base_demand_leisure} leisure")
+        print(f"  Base Demand: {base_demand_business} business, {base_demand_leisure} leisure ({demand_source})")
         print(
             f"  Default Fares: ${price_leisure:.2f} leisure (Y base), ${price_premium_economy:.2f} premium (W), "
             f"${price_business:.2f} business (J base), ${price_first:.2f} first (F)\n"

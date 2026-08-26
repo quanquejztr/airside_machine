@@ -147,10 +147,13 @@ def _ensure_catalog_route(origin_iata: str, dest_iata: str):
     if not ao or not ad:
         return None
     from engine.cabin import default_premium_first_ticket_fares
-    from engine.routes import estimate_base_demand
+    from engine.route_demand import compute_base_demand
 
     dist = haversine_distance(float(ao["lat"]), float(ao["lon"]), float(ad["lat"]), float(ad["lon"]))
-    bd_b, bd_l = estimate_base_demand(dist, dict(ao), dict(ad))
+    demand_info = compute_base_demand(dist, dict(ao), dict(ad))
+    bd_b = int(demand_info["base_demand_business"])
+    bd_l = int(demand_info["base_demand_leisure"])
+    demand_source = str(demand_info.get("demand_source") or "LEGACY")
     pb = round(dist * 0.20, 2)
     pl = round(dist * 0.10, 2)
     pp, pf = default_premium_first_ticket_fares(float(pl), float(pb))
@@ -160,10 +163,10 @@ def _ensure_catalog_route(origin_iata: str, dest_iata: str):
             route_id, origin_iata, dest_iata, distance_nm,
             base_demand_business, base_demand_leisure,
             price_business, price_leisure, price_premium_economy, price_first,
-            competitor_share_this_week, is_active
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 1)
+            competitor_share_this_week, is_active, demand_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 1, ?)
         """,
-        (rid, o, d, dist, int(bd_b), int(bd_l), float(pb), float(pl), float(pp), float(pf)),
+        (rid, o, d, dist, bd_b, bd_l, float(pb), float(pl), float(pp), float(pf), demand_source),
     )
     return get_route(rid)
 

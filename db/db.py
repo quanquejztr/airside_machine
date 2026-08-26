@@ -336,15 +336,24 @@ def sync_bts_gravity_constants_from_json() -> None:
 
 def load_bts_demand_anchors_if_empty() -> int:
     """
-    Bulk-load data/bts_demand_anchors.csv when the reference table is empty.
+    Bulk-load data/bts_demand_anchors.csv when the reference table is empty
+    or still on an older calibration method tag.
+
     Returns number of rows inserted (0 if skipped or file missing).
     """
     import csv
 
     _ensure_bts_demand_anchors_table()
+    expected_method = "bts_trend_wm_max_recent_v2"
     row = fetch_one("SELECT COUNT(*) AS n FROM bts_demand_anchors")
-    if row and int(row["n"] or 0) > 0:
-        return 0
+    n = int(row["n"] or 0) if row else 0
+    if n > 0:
+        sample = fetch_one("SELECT method FROM bts_demand_anchors LIMIT 1")
+        method = str(sample["method"] or "") if sample else ""
+        if expected_method in method:
+            return 0
+        # Stale calibration — replace with regenerated CSV.
+        execute("DELETE FROM bts_demand_anchors")
 
     csv_path = Path(__file__).resolve().parent.parent / "data" / "bts_demand_anchors.csv"
     if not csv_path.is_file():
