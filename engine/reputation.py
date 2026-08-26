@@ -4,6 +4,8 @@ Reputation and brand power — Phase 9 (on-time performance + AOG penalties).
 
 from __future__ import annotations
 
+from typing import Optional
+
 from db import db
 
 
@@ -16,21 +18,42 @@ def update_reputation(game_week: int) -> tuple[float, float]:
     """
     airline = db.fetch_one("SELECT reputation_score FROM airline WHERE id = 1")
     prev = float(airline["reputation_score"] or 50.0) if airline else 50.0
+    otp, flights, aog_n, base_delta = _week_otp_stats(game_week)
+    delta = base_delta - 0.5 * float(aog_n)
+    new_score = max(0.0, min(100.0, prev + delta))
+    db.execute("UPDATE airline SET reputation_score = ? WHERE id = 1", (new_score,))
+    return (delta, new_score)
 
+
+def _week_otp_stats(game_week: int) -> tuple[float, int, int, float]:
+    """Returns (on_time_rate, landed_count, aog_count, base_delta)."""
     landed = db.fetch_all(
         """
         SELECT delay_minutes
         FROM flight_segments
         WHERE game_week = ? AND status IN ('LANDED', 'DIVERTED')
         """,
-        (game_week,),
+        (int(game_week),),
     )
-    n = len(landed)
+    n = len(landed or [])
+    aog_row = db.fetch_one(
+        """
+        SELECT COUNT(*) AS c FROM event_log
+        WHERE game_week = ? AND event_type = 'AOG'
+          AND (description IS NULL OR description NOT LIKE '%Resolved maintenance%')
+        """,
+        (int(game_week),),
+    )
+    aog_n = int(aog_row["c"] or 0) if aog_row else 0
+
+    # No flown legs → no OTP signal (do not treat empty weeks as perfect OTP).
+    # Otherwise catch-up of skipped empty weeks would inflate reputation by +2 each.
+    # AOG still applies so grounded weeks are not reputation-neutral.
     if n <= 0:
-        on_time_rate = 1.0
-    else:
-        on_time = sum(1 for r in landed if int(r["delay_minutes"] or 0) == 0)
-        on_time_rate = on_time / float(n)
+        return 1.0, 0, aog_n, 0.0
+
+    on_time = sum(1 for r in landed if int(r["delay_minutes"] or 0) == 0)
+    on_time_rate = on_time / float(n)
 
     if on_time_rate >= 0.90:
         base_delta = 2.0
@@ -41,20 +64,33 @@ def update_reputation(game_week: int) -> tuple[float, float]:
     else:
         base_delta = -5.0
 
-    aog_row = db.fetch_one(
-        """
-        SELECT COUNT(*) AS c FROM event_log
-        WHERE game_week = ? AND event_type = 'AOG'
-          AND (description IS NULL OR description NOT LIKE '%Resolved maintenance%')
-        """,
-        (game_week,),
-    )
-    aog_n = int(aog_row["c"] or 0) if aog_row else 0
-    delta = base_delta - 0.5 * float(aog_n)
+    return on_time_rate, n, aog_n, base_delta
 
-    new_score = max(0.0, min(100.0, prev + delta))
-    db.execute("UPDATE airline SET reputation_score = ? WHERE id = 1", (new_score,))
-    return (delta, new_score)
+
+def preview_reputation(game_week: Optional[int] = None) -> dict:
+    """Read-only OTP / projected Δ for Books (does not write)."""
+    gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    gw = int(game_week) if game_week is not None else (int(gs["game_week"] or 1) if gs else 1)
+    airline = db.fetch_one(
+        """
+        SELECT reputation_score, brand_power,
+               COALESCE(marketing_brand_bonus, 0) AS marketing_brand_bonus
+        FROM airline WHERE id = 1
+        """
+    )
+    score = float(airline["reputation_score"] or 50.0) if airline else 50.0
+    otp, flights, aog_n, base_delta = _week_otp_stats(gw)
+    projected_delta = base_delta - 0.5 * float(aog_n)
+    return {
+        "game_week": gw,
+        "reputation_score": score,
+        "brand_power": float(airline["brand_power"] or 1.0) if airline else 1.0,
+        "marketing_brand_bonus": float(airline["marketing_brand_bonus"] or 0.0) if airline else 0.0,
+        "on_time_rate": otp,
+        "flights_counted": flights,
+        "aog_events": aog_n,
+        "projected_delta": projected_delta,
+    }
 
 
 def reputation_to_brand_power(score: float) -> float:

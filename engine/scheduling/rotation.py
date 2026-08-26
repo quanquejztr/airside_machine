@@ -600,23 +600,32 @@ def assign_rotation(tail_number, route_ids, departure_times=None, flight_numbers
 
     rotation_id = str(uuid.uuid4())
     segment_ids = []
-    seq0 = _flight_number_suffix_for_tail_week(tail_number, game_week)
-    airline = db.fetch_one("SELECT callsign FROM airline WHERE id = 1")
-    callsign = airline["callsign"] if airline else "FL"
-    
+    from engine.scheduling.flight_numbers import allocate_flight_numbers_for_legs
+
+    fn_legs = []
+    for i, (route_id, dep_abs, fh) in enumerate(zip(route_ids, departure_times, flight_duration_hours)):
+        pref = ""
+        if flight_numbers:
+            try:
+                pref = str(flight_numbers[i] or "").strip()
+            except (IndexError, TypeError):
+                pref = ""
+        fn_legs.append(
+            {
+                "route_id": route_id,
+                "intervals": [(float(dep_abs), float(dep_abs) + float(fh))],
+                "preferred": pref or None,
+            }
+        )
+    resolved_fns = allocate_flight_numbers_for_legs(fn_legs, game_week)
+    turn_mins = normalize_turn_minutes(route_ids, turn_minutes)
+
     for i, (route_id, dep_abs, fh) in enumerate(zip(route_ids, departure_times, flight_duration_hours)):
         segment_id = f"{tail_number}-{route_id}-W{game_week}-{uuid.uuid4().hex[:12]}"
         arr_abs = dep_abs + fh
-        
-        flight_number = f"{callsign}{seq0 + i:03d}"
-        if flight_numbers:
-            try:
-                override = str(flight_numbers[i] or "").strip().upper()
-            except (IndexError, TypeError):
-                override = ""
-            if override:
-                flight_number = override
-        
+        flight_number = resolved_fns[i]
+        leg_turn = int(round(turn_mins[i]))
+
         dep_time_str = hhmm_from_absolute_game_hour(dep_abs)
         arr_time_str = hhmm_from_absolute_game_hour(arr_abs)
         day_of_week = 'MON'
@@ -630,16 +639,18 @@ def assign_rotation(tail_number, route_ids, departure_times=None, flight_numbers
                 scheduled_dep_time, scheduled_dep_game_hour,
                 scheduled_arr_time, scheduled_arr_game_hour,
                 baseline_dep_game_hour, baseline_arr_game_hour,
+                turn_minutes,
                 status, pax_business, pax_leisure, revenue_gross,
                 excise_tax, segment_fee, security_fee, pfc_fee,
                 landing_fee, gate_fee
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
         """, (
             segment_id, game_week, day_of_week, tail_number, route_id, oi, di, flight_number,
             dep_time_str, dep_abs,
             arr_time_str, arr_abs,
             dep_abs,
             arr_abs,
+            leg_turn,
         ))
         
         segment_ids.append(segment_id)
@@ -673,6 +684,8 @@ def assign_rotation(tail_number, route_ids, departure_times=None, flight_numbers
                 "route_id": route_id,
                 "dep_offset_hours": dep_off,
                 "flight_duration_hours": flight_duration_hours[i],
+                "flight_number": resolved_fns[i],
+                "turn_minutes": int(round(turn_mins[i])),
             }
         )
     merge_quick_weekly_template(tail_number, legs_payload, game_week)
@@ -909,16 +922,40 @@ def create_chained_detailed_rotation(
     operating_days = _operating_days_list(days_of_week)
     turn_mins = normalize_turn_minutes(route_ids, turn_minutes)
     turn_hours = [m / 60.0 for m in turn_mins]
+    prefs = [str(x or "").strip().upper() for x in flight_numbers]
+    placeholder_fns = [p if p else f"__TMP{i}" for i, p in enumerate(prefs)]
     planned, fh_list, _ = _plan_chained_detailed_segments(
         game_week,
         operating_days,
         first_departure_time,
         routes_ordered,
-        flight_numbers,
+        placeholder_fns,
         cruise_speed_kts,
         mtt_hours,
         turn_hours=turn_hours,
     )
+
+    from engine.scheduling.flight_numbers import allocate_flight_numbers_for_legs
+
+    n_routes = len(routes_ordered)
+    fn_legs = []
+    for i in range(n_routes):
+        intervals = [
+            (float(p["dep_abs"]), float(p["arr_abs"]))
+            for idx, p in enumerate(planned)
+            if idx % n_routes == i
+        ]
+        fn_legs.append(
+            {
+                "route_id": routes_ordered[i]["route_id"],
+                "intervals": intervals,
+                "preferred": prefs[i] or None,
+            }
+        )
+    resolved_fns = allocate_flight_numbers_for_legs(fn_legs, game_week)
+    for idx, p in enumerate(planned):
+        p["flight_number"] = resolved_fns[idx % n_routes]
+    flight_numbers = list(resolved_fns)
 
     # Concurrent-gates capacity check (auctioned airports only) using finalized dep/arr times.
     # Must run BEFORE any INSERTs so the schedule cannot "succeed" and then be fixed later.
@@ -991,6 +1028,8 @@ def create_chained_detailed_rotation(
         arr_time_str = hhmm_from_absolute_game_hour(p["arr_abs"])
         segment_id = f"{tail_number}-{p['route_id']}-W{game_week}-{p['day']}-{uuid.uuid4().hex[:8]}"
 
+        leg_turn = int(round(turn_mins[route_idx]))
+
         db.execute(
             """
             INSERT INTO flight_segments (
@@ -999,10 +1038,11 @@ def create_chained_detailed_rotation(
                 scheduled_dep_time, scheduled_dep_game_hour,
                 scheduled_arr_time, scheduled_arr_game_hour,
                 baseline_dep_game_hour, baseline_arr_game_hour,
+                turn_minutes,
                 status, pax_business, pax_leisure, revenue_gross,
                 excise_tax, segment_fee, security_fee, pfc_fee,
                 landing_fee, gate_fee
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
             """,
             (
                 segment_id,
@@ -1020,6 +1060,7 @@ def create_chained_detailed_rotation(
                 p["arr_abs"],
                 p["dep_abs"],
                 p["arr_abs"],
+                leg_turn,
             ),
         )
 
@@ -1193,6 +1234,16 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
     planned_intervals = [(p[1], p[2]) for p in planned]
     assert_tail_schedule_accepts_new_intervals(tail_number, game_week, planned_intervals, mtt_hours)
 
+    from engine.scheduling.flight_numbers import allocate_flight_number, normalize_flight_number
+
+    intervals = [(float(d), float(a)) for _day, d, a in planned]
+    flight_number = allocate_flight_number(
+        route_id,
+        intervals,
+        game_week,
+        preferred=normalize_flight_number(flight_number) or None,
+    )
+
     # Concurrent-gates capacity check (auctioned airports only).
     try:
         _assert_new_segment_airport_limits(
@@ -1231,6 +1282,10 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
         ),
     )
 
+    mtt_min = int(round(float(get_financial_constant("mtt_minutes", 30))))
+    oi = str(route["origin_iata"]).upper()
+    di = str(route["dest_iata"]).upper()
+
     for day, dep_abs, arr_abs in planned:
         dep_time_str = hhmm_from_absolute_game_hour(dep_abs)
         arr_time_str = hhmm_from_absolute_game_hour(arr_abs)
@@ -1240,14 +1295,15 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
             """
             INSERT INTO flight_segments (
                 segment_id, schedule_id, game_week, day_of_week,
-                tail_number, route_id, flight_number,
+                tail_number, route_id, origin_iata, dest_iata, flight_number,
                 scheduled_dep_time, scheduled_dep_game_hour,
                 scheduled_arr_time, scheduled_arr_game_hour,
                 baseline_dep_game_hour, baseline_arr_game_hour,
+                turn_minutes,
                 status, pax_business, pax_leisure, revenue_gross,
                 excise_tax, segment_fee, security_fee, pfc_fee,
                 landing_fee, gate_fee
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
             """,
             (
                 segment_id,
@@ -1256,6 +1312,8 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
                 day,
                 tail_number,
                 route_id,
+                oi,
+                di,
                 flight_number,
                 dep_time_str,
                 dep_abs,
@@ -1263,6 +1321,7 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
                 arr_abs,
                 dep_abs,
                 arr_abs,
+                mtt_min,
             ),
         )
         inserted_segment_ids.append(segment_id)

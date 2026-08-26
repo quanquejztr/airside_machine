@@ -31,12 +31,14 @@ def get_airport_board_rows(airport_iata: str, game_week: int) -> list[dict]:
         """
         SELECT segment_id, 'PLAYER' AS operator_id, fs.flight_number AS flight_number,
                fs.tail_number AS tail_number,
-               fs.origin_iata AS origin_iata, fs.dest_iata AS dest_iata,
+               COALESCE(fs.origin_iata, r.origin_iata) AS origin_iata,
+               COALESCE(fs.dest_iata, r.dest_iata) AS dest_iata,
                fs.scheduled_dep_game_hour AS game_hour,
                'DEP' AS direction, fs.status AS status,
                (COALESCE(fs.revenue_economy,0)+COALESCE(fs.revenue_premium_economy,0)+COALESCE(fs.revenue_business_cabin,0)+COALESCE(fs.revenue_first,0)) AS revenue
         FROM flight_segments fs
-        WHERE fs.origin_iata = ? AND fs.game_week = ?
+        JOIN routes r ON r.route_id = fs.route_id
+        WHERE COALESCE(fs.origin_iata, r.origin_iata) = ? AND fs.game_week = ?
         """,
         (iata, gw),
     )
@@ -48,12 +50,14 @@ def get_airport_board_rows(airport_iata: str, game_week: int) -> list[dict]:
         """
         SELECT segment_id, 'PLAYER' AS operator_id, fs.flight_number AS flight_number,
                fs.tail_number AS tail_number,
-               fs.origin_iata AS origin_iata, fs.dest_iata AS dest_iata,
+               COALESCE(fs.origin_iata, r.origin_iata) AS origin_iata,
+               COALESCE(fs.dest_iata, r.dest_iata) AS dest_iata,
                fs.scheduled_arr_game_hour AS game_hour,
                'ARR' AS direction, fs.status AS status,
                (COALESCE(fs.revenue_economy,0)+COALESCE(fs.revenue_premium_economy,0)+COALESCE(fs.revenue_business_cabin,0)+COALESCE(fs.revenue_first,0)) AS revenue
         FROM flight_segments fs
-        WHERE fs.dest_iata = ? AND fs.game_week = ?
+        JOIN routes r ON r.route_id = fs.route_id
+        WHERE COALESCE(fs.dest_iata, r.dest_iata) = ? AND fs.game_week = ?
         """,
         (iata, gw),
     )

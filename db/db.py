@@ -453,6 +453,71 @@ def ensure_schema_migrations():
         )
     except Exception:
         pass
+    # Per-leg turnaround (minutes) used for gate MTT and schedule spacing.
+    _add_column_if_missing("flight_segments", "turn_minutes", "INTEGER")
+    try:
+        default_mtt = int(float(get_financial_constant("mtt_minutes") or 30))
+    except Exception:
+        default_mtt = 30
+    execute(
+        "UPDATE flight_segments SET turn_minutes = ? WHERE turn_minutes IS NULL",
+        (default_mtt,),
+    )
+    # Prefer turnaround stored on weekly rotation templates over the generic default.
+    try:
+        import json as _json
+
+        for wr in fetch_all(
+            "SELECT tail_number, legs_json FROM weekly_rotations WHERE legs_json IS NOT NULL"
+        ):
+            try:
+                blob = _json.loads(wr["legs_json"] or "null")
+            except Exception:
+                continue
+            legs = blob if isinstance(blob, list) else (blob or {}).get("legs") or []
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    continue
+                rid = leg.get("route_id")
+                tm = leg.get("turn_minutes")
+                if not rid or tm is None or str(tm).strip() == "":
+                    continue
+                execute(
+                    """
+                    UPDATE flight_segments
+                    SET turn_minutes = ?
+                    WHERE tail_number = ?
+                      AND route_id = ?
+                      AND turn_minutes = ?
+                    """,
+                    (int(round(float(tm))), str(wr["tail_number"]), str(rid), default_mtt),
+                )
+            if isinstance(blob, dict):
+                for chain in blob.get("chains") or []:
+                    for leg in (chain or {}).get("legs") or []:
+                        if not isinstance(leg, dict):
+                            continue
+                        rid = leg.get("route_id")
+                        tm = leg.get("turn_minutes")
+                        if not rid or tm is None or str(tm).strip() == "":
+                            continue
+                        execute(
+                            """
+                            UPDATE flight_segments
+                            SET turn_minutes = ?
+                            WHERE tail_number = ?
+                              AND route_id = ?
+                              AND turn_minutes = ?
+                            """,
+                            (
+                                int(round(float(tm))),
+                                str(wr["tail_number"]),
+                                str(rid),
+                                default_mtt,
+                            ),
+                        )
+    except Exception:
+        pass
     # Phase 4: game_state preferences + demand noise
     _add_column_if_missing("game_state", "demand_noise_seed", "INTEGER NOT NULL DEFAULT 1")
     _add_column_if_missing("game_state", "pause_on_week_summary", "INTEGER NOT NULL DEFAULT 0")
@@ -997,6 +1062,15 @@ def ensure_schema_migrations():
     )
     execute("CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status)")
     execute("CREATE INDEX IF NOT EXISTS idx_credit_events_week ON credit_events(game_week)")
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS route_flight_numbers (
+            route_id TEXT PRIMARY KEY,
+            flight_number TEXT NOT NULL,
+            updated_week INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
     sync_financial_constants_from_csv()
 
     # Ensure static reference data exists (some flows create schema but never seed).

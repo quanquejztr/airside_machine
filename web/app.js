@@ -228,10 +228,12 @@ function resetClientWorld() {
 function openAirline() {
   const existing = lastState && lastState.airline;
   const el = openWindow("airline", "Airline", existing
-    ? `<p>${existing.name} (${existing.callsign})</p>
-       <p>Hub ${existing.home_hub_iata}</p>
+    ? `<p><b>${escapeHtml(existing.name)}</b> (${escapeHtml(existing.callsign)})</p>
+       <p>Hub ${escapeHtml(existing.home_hub_iata)}</p>
        <p>Cash ${money(existing.cash)}</p>
-       <p class="muted">Debt ${money(existing.total_debt)} · reputation ${Number(existing.reputation_score).toFixed(0)} · credit ${existing.credit_score}</p>
+       <p>Reputation <b>${Number(existing.reputation_score).toFixed(0)}</b> / 100
+         · brand <b>${Number(existing.brand_power || 1).toFixed(2)}×</b></p>
+       <p class="muted">Debt ${money(existing.total_debt)} · credit ${existing.credit_score}</p>
        <p class="muted">Reset keeps this name, callsign, and hub. Week, cash, fleet, and routes go back to a new-game start. Delete removes the airline so you can found another.</p>
        <button type="button" id="al-reset">Reset airline</button>
        <button type="button" id="al-delete" class="danger">Delete airline</button>`
@@ -688,14 +690,16 @@ function legEditorRows(preview) {
       <td class="muted">${i + 1}</td>
       <td><b>${escapeHtml(leg.route_id || "")}</b></td>
       <td><input class="leg-fn" data-i="${i}" type="text" value="${escapeHtml(leg.flight_number || "")}"
-                 placeholder="auto" size="8" /></td>
+                 placeholder="auto" size="10" /></td>
       <td><input class="leg-turn" data-i="${i}" type="number" value="${Number(leg.turn_minutes || minTurn)}"
                  min="${minTurn}" max="1440" step="5" size="5" /> <span class="muted">min</span></td>
     </tr>`).join("");
   return `
     <p><b>Legs — flight number and turnaround</b></p>
     <p class="muted">Turnaround is ground time after that leg lands, before the next departs.
-       Minimum is ${minTurn} min (MTT). Leave a flight number blank for auto.</p>
+       Minimum is ${minTurn} min (global MTT floor). Turnaround is gate hold time for that leg
+       and spacing before the next departure. Flight numbers are sticky per route (random 4-digit);
+       same number may repeat the same day only if times do not overlap. Clear a field to re-auto.</p>
     <table class="leg-editor">
       <thead><tr><th>#</th><th>Leg</th><th>Flight no.</th><th>Turnaround</th></tr></thead>
       <tbody>${rows}</tbody>
@@ -1449,10 +1453,33 @@ function openBooks() {
     api("/api/books").then((data) => {
       const w = data.week || {};
       const f = data.fuel || {};
+      const st = data.settlement || {};
+      const rep = data.reputation || {};
       if (w.skipped) {
         el.querySelector(".win-body").innerHTML = `<p class="err">${escapeHtml(w.reason || "No airline")}</p>`;
         return;
       }
+      const caught = st.catchup_settled || [];
+      if (caught.length) {
+        toast(caught.length === 1
+          ? `Settled backlog: week ${caught[0]}`
+          : `Settled backlog: weeks ${caught[0]}–${caught[caught.length - 1]}`);
+        refreshHud();
+      }
+      const missing = st.missing_weeks || [];
+      const settleLine = missing.length
+        ? `<p class="err">Settlement backlog: weeks ${missing.join(", ")}</p>`
+        : (st.last_settled_week
+          ? `<p class="muted">Last settled week <b>${Number(st.last_settled_week)}</b> · calendar week ${Number(st.calendar_week || 0)}</p>`
+          : `<p class="muted">No weeks settled yet · calendar week ${Number(st.calendar_week || 0)}</p>`);
+      const otpPct = (Number(rep.on_time_rate || 0) * 100).toFixed(0);
+      const dProj = Number(rep.projected_delta || 0);
+      const repBlock = `
+        <p><b>Reputation</b> ${Number(rep.reputation_score || 0).toFixed(0)} / 100
+          · brand ${Number(rep.brand_power || 1).toFixed(2)}×</p>
+        <p class="muted">This week OTP ${otpPct}% (${Number(rep.flights_counted || 0)} flights)
+          · projected Δ ${dProj >= 0 ? "+" : ""}${dProj.toFixed(1)}
+          ${Number(rep.aog_events || 0) ? ` · AOG ${Number(rep.aog_events)}` : ""}</p>`;
       const src = w.summary_source === "ledger" ? "settled" : "live / in-progress";
       const feesDetail = `
         <details class="books-fees">
@@ -1478,6 +1505,9 @@ function openBooks() {
         : "";
       const netCls = Number(w.net_income || 0) < 0 ? "neg" : "";
       el.querySelector(".win-body").innerHTML = `
+        ${settleLine}
+        ${repBlock}
+        <hr class="books-rule" />
         <p><b>Week ${Number(w.game_week || 0)}</b> · ${escapeHtml(src)}
           ${w.flights_count != null ? ` · ${Number(w.flights_count)} flights` : ""}</p>
         <div class="books-stack">

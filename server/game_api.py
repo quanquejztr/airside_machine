@@ -169,6 +169,7 @@ def get_state() -> dict:
             "cash": float(al.get("cash") or 0),
             "total_debt": float(al.get("total_debt") or 0),
             "reputation_score": float(al.get("reputation_score") or 0),
+            "brand_power": float(al.get("brand_power") or 1.0),
             "credit_score": int(al.get("credit_score") or 0),
         }
     finance = None
@@ -896,10 +897,13 @@ def preview_schedule(body: dict) -> dict:
         mtt_min = float(db.get_financial_constant("mtt_minutes") or 30)
     except Exception:
         mtt_min = 30.0
+    from engine.scheduling.flight_numbers import propose_flight_numbers_for_routes
+
+    proposed = propose_flight_numbers_for_routes(rids, callsign=cs)
     legs = [
         {
             "route_id": rid,
-            "flight_number": f"{cs}{i + 1:03d}",
+            "flight_number": proposed[i] if i < len(proposed) else "",
             "turn_minutes": mtt_min,
         }
         for i, rid in enumerate(rids)
@@ -974,8 +978,9 @@ def assign_schedule(body: dict) -> dict:
             dep = _departure_time_from_body(body)
             al = setup.get_airline() or {}
             cs = str(al.get("callsign") or "FL")
+            # Blank → engine allocates sticky/random; non-blank → override (overlap-checked).
             fns = [
-                (fn_override[i] if fn_override and fn_override[i] else f"{cs}{i + 1:03d}")
+                (fn_override[i] if fn_override and fn_override[i] else "")
                 for i in range(len(rids))
             ]
             if len(rids) >= 2:
@@ -1601,9 +1606,24 @@ def books_status() -> dict:
     """Week P&L (live or settled) + fuel desk snapshot for the Books overlay."""
     if not setup.airline_exists():
         return _err("Create an airline first.")
-    from engine.settlement import build_week_summary_payload
+    from engine.settlement import (
+        build_week_summary_payload,
+        calendar_week_from_state,
+        catch_up_missing_settlements,
+        last_settled_week,
+        missing_settlement_weeks,
+    )
+    from engine.reputation import preview_reputation
     from engine import fuel as fin
     from ui.fuel_ticker import fuel_sparkline
+
+    catchup = None
+    backlog_before = missing_settlement_weeks()
+    if backlog_before:
+        try:
+            catchup = catch_up_missing_settlements()
+        except Exception as e:
+            catchup = {"errors": [{"error": str(e)}], "settled": []}
 
     week = _json_safe(build_week_summary_payload())
     al = setup.get_airline() or {}
@@ -1637,7 +1657,23 @@ def books_status() -> dict:
         "premium_4wk": burn * spot_gal * 4 * prem_rate,
         "premium_8wk": burn * spot_gal * 8 * prem_rate,
     }
-    return _ok({"week": week, "fuel": fuel})
+    cal = calendar_week_from_state()
+    last = last_settled_week()
+    still = missing_settlement_weeks(cal)
+    settlement = {
+        "calendar_week": cal,
+        "last_settled_week": last,
+        "missing_weeks": still,
+        "catchup_settled": (catchup or {}).get("settled") or [],
+        "catchup_errors": (catchup or {}).get("errors") or [],
+    }
+    reputation = preview_reputation(cal)
+    return _ok({
+        "week": week,
+        "fuel": fuel,
+        "settlement": settlement,
+        "reputation": reputation,
+    })
 
 
 def fuel_action(body: dict) -> dict:
