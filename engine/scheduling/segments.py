@@ -249,7 +249,7 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
 
 def _spawn_detailed_template_week(tail_number, target_game_week, items):
     """Spawn detailed template segments for a week. Returns (inserted_count, touched_tails)."""
-    from engine.scheduling.shared import _assert_new_segment_airport_limits
+    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
     from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour, week_base_hours
     inserted = 0
     tails_touched = set()
@@ -753,7 +753,12 @@ def route_weekly_passenger_accounting(
         st = str(r["status"] or "")
         if st not in ("SCHEDULED", "DELAYED"):
             continue
-        cabin = get_cabin_config(r["tail_number"]) or dict(_DEFAULT_CABIN_CONFIG)
+        cabin = get_cabin_config(r["tail_number"]) or {
+            "seats_economy": 0,
+            "seats_premium_economy": 0,
+            "seats_business": 0,
+            "seats_first": 0,
+        }
         cap_y = int(cabin.get("seats_economy") or 0)
         cap_w = int(cabin.get("seats_premium_economy") or 0)
         cap_j = int(cabin.get("seats_business") or 0)
