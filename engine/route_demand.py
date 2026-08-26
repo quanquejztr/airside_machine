@@ -268,14 +268,19 @@ def compute_base_demand(
             "demand_source": "LEGACY",
             "anchor_weekly": float(anchor) if anchor is not None else None,
             "base_total": legacy_total,
+            "market_floor_applied": False,
         }
 
     base_total = max(floor, base_total)
     # Soft weekly pool floor (pax/week after eff_mult, before seasonality/logit).
     min_pool = _fc("bts_min_weekly_pool", 500.0)
     eff = effective_demand_multiplier()
+    market_floor_applied = False
     if min_pool > 0 and eff > 0:
-        base_total = max(base_total, min_pool / eff)
+        lifted = min_pool / eff
+        if base_total + 1e-9 < lifted:
+            market_floor_applied = True
+            base_total = lifted
 
     biz_pct, lei_pct = biz_lei_split(origin_airport, dest_airport, distance_nm)
     business = int(round(base_total * biz_pct))
@@ -290,4 +295,5 @@ def compute_base_demand(
         "demand_source": source,
         "anchor_weekly": float(anchor) if anchor is not None else None,
         "base_total": float(base_total),
+        "market_floor_applied": bool(market_floor_applied),
     }

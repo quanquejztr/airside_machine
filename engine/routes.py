@@ -560,7 +560,9 @@ def open_route(origin_iata, dest_iata, price_business=None, price_leisure=None, 
         print(f"\n✓ Route Opened: {route_id}")
         print(f"  {origin['city']} ({origin_iata}) → {dest['city']} ({dest_iata})")
         print(f"  Distance: {distance_nm:,.0f} nm")
-        print(f"  Base Demand: {base_demand_business} business, {base_demand_leisure} leisure ({demand_source})")
+        print(f"  Base Demand: {base_demand_business} business, {base_demand_leisure} leisure "
+              f"(template · {demand_source}"
+              f"{' · min market' if demand_info.get('market_floor_applied') else ''})")
         print(
             f"  Default Fares: ${price_leisure:.2f} leisure (Y base), ${price_premium_economy:.2f} premium (W), "
             f"${price_business:.2f} business (J base), ${price_first:.2f} first (F)\n"

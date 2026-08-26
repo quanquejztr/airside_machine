@@ -382,11 +382,12 @@ def open_new_route():
                 continue
 
             from engine.demand import preview_weekly_demand_before_open
+            from engine.demand_display import format_cli_block, summary_from_preview
 
             print("\n  --- Estimated weekly market demand (default fares) ---")
             print(
-                "  Uses the same model as scheduled flights: bases, seasonality, brand, "
-                "variation, and global demand scale.\n"
+                "  Hero number = this week's market total. Cabin letters are a split of that "
+                "market. Template base is internal.\n"
             )
             for spec in preview["opens"]:
                 oa = get_airport(spec["origin"])
@@ -395,21 +396,16 @@ def open_new_route():
                     continue
                 dem = preview_weekly_demand_before_open(oa, da, distance_nm)
                 rid = f"{spec['origin']}-{spec['dest']}"
+                summary = summary_from_preview(dem)
+                print(f"  {rid}")
+                for line in format_cli_block(summary):
+                    print(f"    {line}")
                 print(
-                    f"  {rid}: ~{dem['total_pax']:,} pax/week total "
-                    f"({dem['business_pax']:,} business + {dem['leisure_pax']:,} leisure)"
+                    f"    Default fares: ${dem['price_business_default']:,.2f} business, "
+                    f"${dem['price_leisure_default']:,.2f} leisure"
                 )
                 print(
-                    "         Cabin demand split: "
-                    f"E{int(dem.get('economy_pax', 0)):,} / "
-                    f"W{int(dem.get('premium_economy_pax', 0)):,} / "
-                    f"J{int(dem.get('business_cabin_pax', 0)):,} / "
-                    f"F{int(dem.get('first_pax', 0)):,}"
-                )
-                print(
-                    f"         Default fares: ${dem['price_business_default']:,.2f} business, "
-                    f"${dem['price_leisure_default']:,.2f} leisure · "
-                    f"game week {dem['game_week']}, month {dem['current_month']}"
+                    "    AI competition can reduce your share of this market once rivals fly the OD."
                 )
 
             total_new = float(preview["total_new_cost"] or 0.0)

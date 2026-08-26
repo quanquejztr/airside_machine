@@ -225,15 +225,18 @@ def preview_weekly_demand_before_open(origin_airport, dest_airport, distance_nm,
 
     # Cabin split (for UI previews): same model as _cabin_market_split_from_pools
     csplit = _cabin_market_split_from_pools(demand_business, demand_leisure)
+    market_total = max(0, demand_business + demand_leisure)
 
     return {
         "business_pax": max(0, demand_business),
         "leisure_pax": max(0, demand_leisure),
-        "total_pax": max(0, demand_business + demand_leisure),
+        "total_pax": market_total,
+        "weekly_market_total": market_total,
         **csplit,
         "base_demand_business": base_business,
         "base_demand_leisure": base_leisure,
         "demand_source": demand_info.get("demand_source"),
+        "market_floor_applied": bool(demand_info.get("market_floor_applied")),
         "price_business_default": price_business,
         "price_leisure_default": price_leisure,
         "game_week": game_week,
@@ -604,11 +607,13 @@ def compute_demand(route_id, game_week=1, current_month=1, competitor_factor=Non
     demand_business = int(float(demand_business) * float(share_b))
     demand_leisure = int(float(demand_leisure) * float(share_l))
     csplit = _cabin_market_split_from_pools(demand_business, demand_leisure)
+    market_total = max(0, demand_business + demand_leisure)
 
     return {
         "business_pax": max(0, demand_business),
         "leisure_pax": max(0, demand_leisure),
-        "total_pax": max(0, demand_business + demand_leisure),
+        "total_pax": market_total,
+        "weekly_market_total": market_total,
         **csplit,
         "business_base": base_business,
         "leisure_base": base_leisure,
@@ -905,7 +910,11 @@ def estimate_route_performance(route_id, cabin_config=None, game_week=None, curr
     cm = cm_def if current_month is None else int(current_month)
 
     demand = compute_demand(route_id, gw, cm)
-    
+    weekly_market_total = int(
+        demand.get("weekly_market_total")
+        or (int(demand.get("business_pax") or 0) + int(demand.get("leisure_pax") or 0))
+    )
+
     # If no cabin config provided, create default all-economy config
     if cabin_config is None:
         # Get route to estimate seats (simplified for now)
@@ -920,7 +929,7 @@ def estimate_route_performance(route_id, cabin_config=None, game_week=None, curr
             }
         else:
             raise ValueError(f"Route '{route_id}' not found.")
-    
+
     # Calculate cabin-aware revenue
     revenue = compute_revenue(
         route_id,
@@ -928,10 +937,13 @@ def estimate_route_performance(route_id, cabin_config=None, game_week=None, curr
         demand['leisure_pax'],
         demand['business_pax']
     )
-    
+
+    # revenue.total_pax is one-aircraft seat fill — do not overwrite weekly market.
     return {
         **demand,
-        **revenue
+        **revenue,
+        "weekly_market_total": weekly_market_total,
+        "aircraft_fill_pax": int(revenue.get("total_pax") or 0),
     }
 
 
