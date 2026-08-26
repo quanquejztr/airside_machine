@@ -51,12 +51,3 @@ gate_utilization_threshold_nonhub,0.02
 gate_utilization_grace_weeks,3
 gate_min_price_per_unit,5000
 gate_price_step,1000
-bts_target_market_share,0.30
-bts_ref_year,2019
-bts_growth_rate,0.02
-bts_decay_lambda,0.85
-bts_base_demand_floor,5
-bts_gravity_k,0.00050176
-bts_gravity_alpha,0.80
-bts_gravity_beta,1.20
-bts_small_small_damp,0.7234

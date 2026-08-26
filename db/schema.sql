@@ -80,20 +80,6 @@ CREATE TABLE IF NOT EXISTS financial_constants (
     value REAL NOT NULL
 );
 
--- US BTS market anchors (precomputed from US_Route/bts_calibrate.py → data/bts_demand_anchors.csv).
-CREATE TABLE IF NOT EXISTS bts_demand_anchors (
-    origin_iata TEXT NOT NULL,
-    dest_iata TEXT NOT NULL,
-    anchor_annual REAL NOT NULL,
-    anchor_weekly REAL NOT NULL,
-    years_used INTEGER,
-    first_year INTEGER,
-    last_year INTEGER,
-    method TEXT,
-    PRIMARY KEY (origin_iata, dest_iata)
-);
-CREATE INDEX IF NOT EXISTS idx_bts_anchors_dest ON bts_demand_anchors(dest_iata);
-
 -- ============================================================================
 -- DYNAMIC GAME STATE TABLES (read/write during play)
 -- ============================================================================
@@ -181,7 +167,6 @@ CREATE TABLE IF NOT EXISTS routes (
     price_first REAL NOT NULL,
     competitor_share_this_week REAL NOT NULL DEFAULT 0.0,
     is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0, 1)),
-    demand_source TEXT,
     FOREIGN KEY (origin_iata) REFERENCES airports(iata),
     FOREIGN KEY (dest_iata) REFERENCES airports(iata)
 );

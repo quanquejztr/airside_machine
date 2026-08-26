@@ -8,16 +8,11 @@ on the CLI renderer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from engine.scheduling import (
     calendar_game_week_from_state,
     get_tail_flight_segments_for_week,
     week_base_hours,
 )
-
-if TYPE_CHECKING:
-    from rich.console import Console
 
 DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
