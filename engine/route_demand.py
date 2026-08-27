@@ -16,6 +16,9 @@ Do not raise bts_base_demand_floor for this — that fights Mode B scaling.
 
 from __future__ import annotations
 
+import json
+import math
+from pathlib import Path
 from typing import Any, Optional
 
 from db import db
@@ -46,8 +49,38 @@ TOURISM_AIRPORTS = frozenset(
 # Coarse region buckets for international gravity dampening / boost.
 _COUNTRY_REGION = {
     "US": "US",
+    # US territories behave like domestic markets for demand purposes.
+    "PR": "US",
+    "VI": "US",
+    "GU": "US",
+    "MP": "US",
     "CA": "NA",
     "MX": "LA",
+    # Caribbean / Central America. Previously unmapped, so they fell into the
+    # generic "OT" bucket and shared a prior with unrelated regions.
+    "DO": "LA",
+    "BS": "LA",
+    "JM": "LA",
+    "CR": "LA",
+    "HN": "LA",
+    "CU": "LA",
+    "PA": "LA",
+    "GT": "LA",
+    "SV": "LA",
+    "AW": "LA",
+    "KY": "LA",
+    "BZ": "LA",
+    "TC": "LA",
+    "HT": "LA",
+    "BQ": "LA",
+    "NI": "LA",
+    "TT": "LA",
+    "BB": "LA",
+    "EC": "LA",
+    "UY": "LA",
+    "PY": "LA",
+    "BO": "LA",
+    "VE": "LA",
     "GB": "EU",
     "IE": "EU",
     "FR": "EU",
@@ -64,6 +97,11 @@ _COUNTRY_REGION = {
     "DK": "EU",
     "FI": "EU",
     "PL": "EU",
+    "IS": "EU",
+    "GR": "EU",
+    "CZ": "EU",
+    "HU": "EU",
+    "RO": "EU",
     "CN": "AS",
     "JP": "AS",
     "KR": "AS",
@@ -78,6 +116,15 @@ _COUNTRY_REGION = {
     "IN": "AS",
     "AU": "OC",
     "NZ": "OC",
+    "FJ": "OC",
+    "PG": "OC",
+    "BD": "AS",
+    "PK": "AS",
+    "LK": "AS",
+    "NP": "AS",
+    "KH": "AS",
+    "MM": "AS",
+    "BN": "AS",
     "BR": "LA",
     "AR": "LA",
     "CL": "LA",
@@ -88,6 +135,27 @@ _COUNTRY_REGION = {
     "SA": "ME",
     "IL": "ME",
     "TR": "ME",
+    "JO": "ME",
+    "KW": "ME",
+    "OM": "ME",
+    "BH": "ME",
+    # Russia's traffic in this dataset is via SVO/LED, both European.
+    "RU": "EU",
+    "AF": "AF",
+    "EG": "AF",
+    "ZA": "AF",
+    "NG": "AF",
+    "KE": "AF",
+    "ET": "AF",
+    "MA": "AF",
+    "TN": "AF",
+    "DZ": "AF",
+    "GH": "AF",
+    "SN": "AF",
+    "TZ": "AF",
+    "UG": "AF",
+    "MU": "AF",
+    "SC": "AF",
 }
 
 REGIONAL_PRIORS = {
@@ -156,15 +224,63 @@ def _region(country: Optional[str]) -> str:
     return _COUNTRY_REGION.get(c, "OT")
 
 
+_BAND_PARAMS: dict[str, Any] | None = None
+
+
+def gravity_band_params() -> dict[str, Any]:
+    """
+    Fitted banded-gravity parameters from data/gravity_bands.json.
+
+    Region priors are a matrix, so unlike the scalar knobs they can't live in
+    financial_constants; the JSON is the source of truth and individual scalars
+    can still be overridden by a matching financial_constants row.
+    """
+    global _BAND_PARAMS
+    if _BAND_PARAMS is not None:
+        return _BAND_PARAMS
+    path = Path(__file__).resolve().parent.parent / "data" / "gravity_bands.json"
+    try:
+        _BAND_PARAMS = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        _BAND_PARAMS = {}
+    return _BAND_PARAMS
+
+
+def reset_gravity_band_cache() -> None:
+    """Drop the cached JSON so tests can swap calibrations mid-process."""
+    global _BAND_PARAMS
+    _BAND_PARAMS = None
+
+
 def regional_prior(origin_ap: dict, dest_ap: dict) -> float:
+    """
+    Region-pair multiplier, measured rather than hand-tuned.
+
+    Priors are fitted jointly with the gravity coefficients (US-US is the held-out
+    baseline, pinned to 1.0). REGIONAL_PRIORS below is the pre-Phase-6 fallback for
+    when the fitted JSON is unavailable.
+    """
     ro = _region(origin_ap.get("country"))
     rd = _region(dest_ap.get("country"))
+
+    fitted = gravity_band_params().get("region_priors") or {}
+    if fitted:
+        key = "|".join(sorted((ro, rd)))
+        val = fitted.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+        # Region pairs too sparse to fit fold into the baseline.
+        return 1.0
+
     if ro == rd:
         return 1.0
     # Symmetric key order: put US first when present.
     if ro == "US" or rd == "US":
-        key = ("US", rd if ro == "US" else ro)
-        return float(REGIONAL_PRIORS.get(key, 0.75))
+        key_t = ("US", rd if ro == "US" else ro)
+        return float(REGIONAL_PRIORS.get(key_t, 0.75))
     return 0.85
 
 
@@ -190,17 +306,39 @@ def legacy_base_demand(distance_nm: float, origin_airport: dict, dest_airport: d
     return int(total_demand * 0.3), int(total_demand * 0.7)
 
 
+def _band_decay(dist: float, params: dict) -> float:
+    """
+    Piecewise-power distance decay, continuous at the band edges.
+
+    A single exponent fitted on US domestic distances badly mis-extrapolates to
+    intercontinental range — it under-predicted real long-haul markets by ~6x.
+    Three regimes fix that; building D() to be continuous means a route at 799nm
+    and one at 801nm can't produce a visible jump in demand.
+    """
+    d1 = _fc("bts_gravity_band1_nm", float(params.get("band1_nm", 800.0)))
+    d2 = _fc("bts_gravity_band2_nm", float(params.get("band2_nm", 3000.0)))
+    b1 = _fc("bts_gravity_beta_short", float(params.get("beta_short", 0.5632)))
+    b2 = _fc("bts_gravity_beta_medium", float(params.get("beta_medium", 0.7314)))
+    b3 = _fc("bts_gravity_beta_long", float(params.get("beta_long", 0.8936)))
+
+    if dist <= d1:
+        return dist**b1
+    if dist <= d2:
+        return (d1 ** (b1 - b2)) * (dist**b2)
+    return (d1 ** (b1 - b2)) * (d2 ** (b2 - b3)) * (dist**b3)
+
+
 def gravity_weekly(origin_ap: dict, dest_ap: dict, distance_nm: float) -> float:
-    k = _fc("bts_gravity_k", 0.00050176)
-    alpha = _fc("bts_gravity_alpha", 0.80)
-    beta = _fc("bts_gravity_beta", 1.20)
-    damp = _fc("bts_small_small_damp", 0.7234)
+    params = gravity_band_params()
+    k = _fc("bts_gravity_k", float(params.get("k", 0.0000079)))
+    alpha = _fc("bts_gravity_alpha", float(params.get("alpha", 0.84)))
+    damp = _fc("bts_small_small_damp", float(params.get("small_small_damp", 1.0)))
 
     score_o = max(1.0, float(origin_ap.get("score") or 1))
     score_d = max(1.0, float(dest_ap.get("score") or 1))
     dist = max(50.0, float(distance_nm))
 
-    weekly = k * ((score_o * score_d) ** alpha) / (dist ** beta)
+    weekly = k * ((score_o * score_d) ** alpha) / _band_decay(dist, params)
 
     if (
         str(origin_ap.get("category") or "") == "small_airport"
@@ -209,7 +347,97 @@ def gravity_weekly(origin_ap: dict, dest_ap: dict, distance_nm: float) -> float:
         weekly *= damp
 
     weekly *= regional_prior(origin_ap, dest_ap)
+
+    # Correct the model's too-narrow spread before capping.
+    weekly = apply_quantile_mapping(weekly, params)
+
+    # Never let a modelled market outrank the real ones. Without this, two
+    # high-scoring foreign airports at short range can invent a market larger
+    # than the measured JFK-LHR, which is immediately obvious to a player.
+    cap = gravity_cap_weekly(dist, params)
+    if cap > 0:
+        weekly = min(weekly, cap)
+
     return max(0.0, float(weekly))
+
+
+def apply_quantile_mapping(weekly: float, params: dict | None = None) -> float:
+    """
+    Pull a modelled market toward the real-world demand distribution.
+
+    Raw gravity is far too compressed: across the anchored pairs its p10->p99 span
+    is ~32x where the measured span is ~779x, so it over-states thin routes and
+    badly under-states trunks (HND-FUK came out ~150x low). The calibration stores
+    paired quantiles of model output and real anchors; a prediction is looked up by
+    rank and translated to the real market at the same rank.
+
+    The mapping is monotonic, so route ordering is preserved -- it corrects spread,
+    not ranking. Results are blended geometrically with the raw value so the
+    correction can be dialled back via ``bts_gravity_quantile_blend``.
+    """
+    params = params if params is not None else gravity_band_params()
+    if weekly <= 0:
+        return 0.0
+
+    model_q = params.get("quantile_model") or []
+    real_q = params.get("quantile_real") or []
+    if len(model_q) < 2 or len(model_q) != len(real_q):
+        return float(weekly)
+
+    blend = _fc("bts_gravity_quantile_blend", float(params.get("quantile_blend", 0.5)))
+    blend = min(1.0, max(0.0, blend))
+    if blend <= 0:
+        return float(weekly)
+
+    mapped = _interp_quantile(float(weekly), model_q, real_q)
+    if mapped <= 0:
+        return float(weekly)
+
+    # Geometric blend: equivalent to averaging in log space, which keeps the
+    # result positive and treats the two estimates as multiplicative.
+    return float(weekly) ** (1.0 - blend) * mapped**blend
+
+
+def _interp_quantile(value: float, model_q: list, real_q: list) -> float:
+    """Log-linear interpolation of value through the model->real quantile curve."""
+    lo, hi = float(model_q[0]), float(model_q[-1])
+    # Outside the fitted range, hold the edge ratio so the curve stays monotonic.
+    if value <= lo:
+        return value * (float(real_q[0]) / lo) if lo > 0 else value
+    if value >= hi:
+        return value * (float(real_q[-1]) / hi) if hi > 0 else value
+
+    for i in range(1, len(model_q)):
+        left, right = float(model_q[i - 1]), float(model_q[i])
+        if value > right:
+            continue
+        if right <= left:
+            return float(real_q[i])
+        t = (math.log(value) - math.log(max(1e-9, left))) / (
+            math.log(max(1e-9, right)) - math.log(max(1e-9, left))
+        )
+        a, b = float(real_q[i - 1]), float(real_q[i])
+        if a <= 0 or b <= 0:
+            return a + t * (b - a)
+        return math.exp(math.log(a) + t * (math.log(b) - math.log(a)))
+    return float(real_q[-1])
+
+
+def gravity_cap_weekly(distance_nm: float, params: dict | None = None) -> float:
+    """p90 of real anchors in the matching distance band; 0 disables capping."""
+    params = params if params is not None else gravity_band_params()
+    caps = params.get("caps_weekly") or {}
+    dist = max(50.0, float(distance_nm))
+    if dist <= float(params.get("band1_nm", 800.0)):
+        band = "short"
+    elif dist <= float(params.get("band2_nm", 3000.0)):
+        band = "medium"
+    else:
+        band = "long"
+    try:
+        return float(caps.get(band) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def compute_base_demand(
@@ -220,10 +448,10 @@ def compute_base_demand(
     """
     Returns base_demand_business / leisure plus demand_source for route creation.
 
-    Gravity is fitted to BTS weekly markets, then scaled by Mode B ``calibration_k``.
-    On many non-BTS pairs (especially long-haul international) that product sits at
-    the floor while LEGACY is far larger — prefer LEGACY whenever gravity loses so
-    new routes stay playable until better non-US anchors exist.
+    Phase 6: anchors now cover US domestic (DB1B) and US-international (T-100), and
+    gravity is fitted with banded distance decay plus measured region priors, so it
+    no longer collapses on long-haul. LEGACY is therefore a last-resort path for
+    pairs with no usable airport score, not a routine fallback.
     """
     o = str(origin_airport.get("iata") or "").strip().upper()
     d = str(dest_airport.get("iata") or "").strip().upper()
@@ -246,18 +474,14 @@ def compute_base_demand(
         source = "BTS"
     else:
         try:
-            g = gravity_weekly(origin_airport, dest_airport, distance_nm)
             scores_ok = (
                 origin_airport.get("score") is not None
                 and dest_airport.get("score") is not None
             )
+            g = gravity_weekly(origin_airport, dest_airport, distance_nm)
             if g > 0 and scores_ok:
-                calibrated = float(g) * k
-                # Only keep gravity when it is meaningfully above the floor AND
-                # at least as large as the old category formula.
-                if calibrated > floor and calibrated >= legacy_total:
-                    base_total = calibrated
-                    source = "GRAVITY"
+                base_total = float(g) * k
+                source = "GRAVITY"
         except Exception:
             source = "LEGACY"
 

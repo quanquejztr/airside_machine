@@ -301,18 +301,33 @@ def _ensure_bts_demand_anchors_table() -> None:
 
 def sync_bts_gravity_constants_from_json() -> None:
     """
-    Overlay fitted gravity parameters from data/bts_gravity_params.json into
-    financial_constants (runtime reads the DB, not the JSON file).
+    Overlay fitted gravity parameters into financial_constants (runtime reads the
+    DB, not the JSON files).
+
+    Two files feed this. bts_gravity_params.json holds the ingest settings and the
+    legacy single-beta fit; gravity_bands.json holds the Phase 6 banded fit and
+    wins on any key they share, since it is fitted on both anchor sets. The banded
+    region-prior matrix cannot be expressed as scalar constants and is read
+    directly from JSON by engine.route_demand.
     """
     import json
 
-    path = Path(__file__).resolve().parent.parent / "data" / "bts_gravity_params.json"
-    if not path.is_file():
+    base = Path(__file__).resolve().parent.parent / "data"
+
+    def _read(name: str) -> dict:
+        path = base / name
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
+
+    raw = _read("bts_gravity_params.json")
+    bands = _read("gravity_bands.json")
+    if not raw and not bands:
         return
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return
+
     mapping = {
         "bts_gravity_k": raw.get("k"),
         "bts_gravity_alpha": raw.get("alpha"),
@@ -322,6 +337,20 @@ def sync_bts_gravity_constants_from_json() -> None:
         "bts_growth_rate": raw.get("growth_rate"),
         "bts_decay_lambda": raw.get("decay_lambda"),
     }
+    if bands:
+        mapping.update(
+            {
+                "bts_gravity_k": bands.get("k"),
+                "bts_gravity_alpha": bands.get("alpha"),
+                "bts_small_small_damp": bands.get("small_small_damp"),
+                "bts_gravity_beta_short": bands.get("beta_short"),
+                "bts_gravity_beta_medium": bands.get("beta_medium"),
+                "bts_gravity_beta_long": bands.get("beta_long"),
+                "bts_gravity_band1_nm": bands.get("band1_nm"),
+                "bts_gravity_band2_nm": bands.get("band2_nm"),
+            }
+        )
+
     for key, val in mapping.items():
         if val is None:
             continue
@@ -344,13 +373,21 @@ def load_bts_demand_anchors_if_empty() -> int:
     import csv
 
     _ensure_bts_demand_anchors_table()
-    expected_method = "bts_trend_wm_max_recent_v2"
+    # Phase 6: the table now holds two calibrations (US domestic from DB1B and
+    # international from T-100). Both tags must be present, otherwise the table
+    # predates the merge and needs a full reload.
+    expected_methods = {
+        "bts_trend_wm_max_recent_v2",
+        "t100i_trend_wm_max_recent_v2",
+    }
     row = fetch_one("SELECT COUNT(*) AS n FROM bts_demand_anchors")
     n = int(row["n"] or 0) if row else 0
     if n > 0:
-        sample = fetch_one("SELECT method FROM bts_demand_anchors LIMIT 1")
-        method = str(sample["method"] or "") if sample else ""
-        if expected_method in method:
+        present = {
+            str(r["method"] or "")
+            for r in fetch_all("SELECT DISTINCT method FROM bts_demand_anchors")
+        }
+        if expected_methods <= present:
             return 0
         # Stale calibration — replace with regenerated CSV.
         execute("DELETE FROM bts_demand_anchors")

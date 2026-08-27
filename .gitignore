@@ -42,3 +42,4 @@ server/map_node/node_modules/
 # Raw BTS extracts (regenerate anchors with bts_calibrate.py)
 US_Route/[0-9][0-9][0-9][0-9].csv
 US_Route/US_CARRIER_MARKET.csv
+Intl_Route/[0-9][0-9][0-9][0-9].csv

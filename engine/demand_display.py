@@ -18,9 +18,9 @@ SOURCE_SHORT = {
 }
 
 SOURCE_BLURB = {
-    "BTS": "US market traffic (BTS)",
+    "BTS": "Real market traffic (US DOT)",
     "LEGACY": "Category × distance estimate",
-    "GRAVITY": "Score × distance estimate",
+    "GRAVITY": "Modelled from airport size & distance",
 }
 
 

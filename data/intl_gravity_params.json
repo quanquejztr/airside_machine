@@ -6,16 +6,14 @@
     2020,
     2021
   ],
-  "skipped_duplicate_files": [
-    "2023.csv"
-  ],
+  "skipped_duplicate_files": [],
   "method": "grid_search_log_mse",
-  "k": 0.00036969,
+  "k": 0.0001564,
   "alpha": 0.8,
-  "beta": 1.15,
-  "small_small_damp": 0.7597,
-  "fit_points": 10899,
-  "small_small_pairs": 2110,
-  "log_sse": 31295.4,
+  "beta": 0.95,
+  "small_small_damp": 0.854,
+  "fit_points": 4492,
+  "small_small_pairs": 83,
+  "log_sse": 13846.68,
   "min_weekly_for_fit": 10.0
 }

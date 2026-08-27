@@ -95,7 +95,6 @@ class TestBtsDbLoad(unittest.TestCase):
             from engine.route_demand import (
                 compute_base_demand,
                 effective_demand_multiplier,
-                legacy_base_demand,
             )
             from engine.routes import haversine_distance, open_route
             from engine.demand import preview_weekly_demand_before_open
@@ -106,9 +105,13 @@ class TestBtsDbLoad(unittest.TestCase):
                 0.90,
                 places=2,
             )
-            self.assertGreaterEqual(
-                float(db.get_financial_constant("bts_min_weekly_pool") or 0), 1000
-            )
+            # The floor keeps ultra-thin OD pairs flyable without inventing markets.
+            # It has to stay well clear of both failure modes: too low and a thin
+            # route cannot fill anything, too high and it overrides the real market
+            # it is supposed to be protecting (at 1500 TPA-SAN got 240% of actual).
+            min_pool = float(db.get_financial_constant("bts_min_weekly_pool") or 0)
+            self.assertGreaterEqual(min_pool, 500)
+            self.assertLessEqual(min_pool, 1000)
 
             atl = get_airport("ATL")
             lax = get_airport("LAX")
@@ -120,20 +123,37 @@ class TestBtsDbLoad(unittest.TestCase):
             self.assertEqual(info["demand_source"], "BTS")
             self.assertGreater(info["base_demand_business"] + info["base_demand_leisure"], 100)
 
-            # Long-haul international: gravity after Mode B often floors; must not
-            # ship base≈5 — fall back to LEGACY category buckets.
+            # Phase 6: T-100 International anchors cover US<->foreign pairs, so the
+            # busiest transatlantic market resolves from real data instead of the
+            # LEGACY category buckets it used to fall through to.
             jfk = get_airport("JFK")
             lhr = get_airport("LHR")
             self.assertIsNotNone(jfk)
             self.assertIsNotNone(lhr)
             d_intl = haversine_distance(jfk["lat"], jfk["lon"], lhr["lat"], lhr["lon"])
             intl = compute_base_demand(d_intl, jfk, lhr)
-            self.assertNotEqual(intl["demand_source"], "BTS")
+            self.assertEqual(intl["demand_source"], "BTS")
             tot = intl["base_demand_business"] + intl["base_demand_leisure"]
             self.assertGreater(tot, 50)
-            if intl["demand_source"] == "LEGACY":
-                lb, ll = legacy_base_demand(d_intl, jfk, lhr)
-                self.assertEqual(tot, int(lb) + int(ll))
+            # It must also outrank a mid-size long-haul, which LEGACY could not do:
+            # its distance buckets gave every 3000nm+ pair the same answer.
+            gru = get_airport("GRU")
+            self.assertIsNotNone(gru)
+            d_gru = haversine_distance(jfk["lat"], jfk["lon"], gru["lat"], gru["lon"])
+            gru_info = compute_base_demand(d_gru, jfk, gru)
+            self.assertGreater(float(intl["base_total"]), float(gru_info["base_total"]))
+
+            # Foreign<->foreign has no anchor and must come from banded gravity,
+            # never LEGACY, and must not out-market a real anchored trunk route.
+            cdg = get_airport("CDG")
+            self.assertIsNotNone(cdg)
+            d_ff = haversine_distance(lhr["lat"], lhr["lon"], cdg["lat"], cdg["lon"])
+            ff = compute_base_demand(d_ff, lhr, cdg)
+            self.assertEqual(ff["demand_source"], "GRAVITY")
+            self.assertGreater(
+                ff["base_demand_business"] + ff["base_demand_leisure"], 0
+            )
+            self.assertLess(float(ff["base_total"]), float(intl["base_total"]))
 
             # Thin US pair: soft weekly pool keeps week-1 market playable.
             tpa = get_airport("TPA")
@@ -145,9 +165,14 @@ class TestBtsDbLoad(unittest.TestCase):
             self.assertEqual(thin["demand_source"], "BTS")
             eff = effective_demand_multiplier()
             pool = float(thin["base_total"]) * eff
-            self.assertGreaterEqual(pool, 1500.0 * 0.99)
-            dem = preview_weekly_demand_before_open(tpa, san, d_thin)
-            self.assertGreaterEqual(int(dem["total_pax"]), 1000)
+            self.assertGreaterEqual(pool, min_pool * 0.99)
+            # Playable (fills a narrowbody daily) without running far past the real
+            # market -- TPA-SAN carries ~540 pax/wk for real.
+            week1 = int(preview_weekly_demand_before_open(tpa, san, d_thin)["total_pax"])
+            self.assertGreaterEqual(week1, 500)
+            anchor = db.lookup_bts_anchor_weekly("TPA", "SAN")
+            self.assertTrue(anchor)
+            self.assertLess(week1 / anchor, 1.6)
 
             route = open_route("ATL", "LAX", silent=True)
             self.assertEqual(route.get("demand_source"), "BTS")
@@ -166,11 +191,115 @@ class TestBtsDbLoad(unittest.TestCase):
                 "FROM routes WHERE route_id='JFK-LHR'"
             )
             self.assertIsNotNone(intl_row)
-            self.assertEqual(str(intl_row["demand_source"]), "LEGACY")
+            self.assertEqual(str(intl_row["demand_source"]), "BTS")
             self.assertGreater(
                 int(intl_row["base_demand_business"]) + int(intl_row["base_demand_leisure"]),
                 50,
             )
+
+    def test_banded_gravity_is_continuous_and_capped(self):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import FreshGame
+
+        with FreshGame() as world:
+            from engine.route_demand import (
+                _band_decay,
+                gravity_band_params,
+                gravity_cap_weekly,
+                gravity_weekly,
+            )
+
+            params = gravity_band_params()
+            self.assertTrue(params, "data/gravity_bands.json should be present")
+            d1 = float(params["band1_nm"])
+            d2 = float(params["band2_nm"])
+
+            # Decay must not jump across a band edge, otherwise two near-identical
+            # routes would show materially different demand. Step either side by a
+            # hair so any remaining gap is a discontinuity, not ordinary decay.
+            eps = 1e-6
+            for edge in (d1, d2):
+                below = _band_decay(edge - eps, params)
+                above = _band_decay(edge + eps, params)
+                self.assertAlmostEqual(below / above, 1.0, places=8)
+
+            # Decay is monotonic: further is never worth more.
+            prev = 0.0
+            for nm in (100, 400, 799, 801, 1500, 2999, 3001, 5000, 7000):
+                cur = _band_decay(float(nm), params)
+                self.assertGreater(cur, prev)
+                prev = cur
+
+            # Betas rise with distance, which is what the joint fit measured.
+            self.assertLess(float(params["beta_short"]), float(params["beta_medium"]))
+            self.assertLess(float(params["beta_medium"]), float(params["beta_long"]))
+
+            # No modelled market may exceed the per-band plausibility cap.
+            def get(iata):
+                row = world.fetch_one("SELECT * FROM airports WHERE iata=?", (iata,))
+                return dict(row) if row else None
+
+            for o, d, nm in (("LHR", "CDG", 187.0), ("NRT", "ICN", 679.0), ("SYD", "SIN", 3399.0)):
+                a, b = get(o), get(d)
+                self.assertIsNotNone(a, f"{o} missing")
+                self.assertIsNotNone(b, f"{d} missing")
+                weekly = gravity_weekly(a, b, nm)
+                self.assertGreater(weekly, 0.0)
+                self.assertLessEqual(weekly, gravity_cap_weekly(nm) + 1e-6)
+
+    def test_quantile_mapping_widens_spread_without_reordering(self):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import FreshGame
+
+        with FreshGame():
+            from engine.route_demand import apply_quantile_mapping, gravity_band_params
+
+            params = gravity_band_params()
+            self.assertTrue(params.get("quantile_model"))
+            self.assertEqual(
+                len(params["quantile_model"]), len(params["quantile_real"])
+            )
+
+            # Monotonic: a busier raw prediction can never map below a quieter one.
+            samples = [1.0, 10.0, 50.0, 200.0, 537.0, 900.0, 2_500.0, 10_000.0, 1e6]
+            mapped = [apply_quantile_mapping(v, params) for v in samples]
+            for prev, cur in zip(mapped, mapped[1:]):
+                self.assertGreater(cur, prev)
+            for m in mapped:
+                self.assertGreater(m, 0.0)
+
+            # The point of the correction: trunk-scale predictions get lifted and
+            # thin ones pulled down, widening a span that was far too narrow.
+            low_in, high_in = 50.0, 2_500.0
+            low_out = apply_quantile_mapping(low_in, params)
+            high_out = apply_quantile_mapping(high_in, params)
+            self.assertLess(low_out, low_in)
+            self.assertGreater(high_out, high_in)
+            self.assertGreater(high_out / low_out, high_in / low_in)
+
+    def test_backfilled_international_airports_present(self):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import FreshGame
+
+        with FreshGame() as world:
+            # These carry ~22% of T-100 international traffic; without them the
+            # busiest intercontinental routes silently drop to gravity or LEGACY.
+            for iata in ("FRA", "MAD", "IST", "MUC", "GRU", "FCO", "DOH", "DEL"):
+                row = world.fetch_one(
+                    "SELECT score, category, lat, lon FROM airports WHERE iata=?", (iata,)
+                )
+                self.assertIsNotNone(row, f"{iata} missing from airports.csv")
+                self.assertGreater(float(row["score"]), 0)
+                self.assertNotEqual(float(row["lat"]), 0.0)
 
 
 if __name__ == "__main__":

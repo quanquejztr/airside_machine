@@ -42,6 +42,9 @@ EXCLUDE_YEARS = frozenset({2020, 2021})
 # without flattening long-run structure on stable trunks.
 RECENT_YEAR_MIN = 2019
 METHOD_TAG = "bts_trend_wm_max_recent_v2"
+# Phase 6: the same pipeline runs over Intl_Route/ (DOT T-100 International), so
+# anchors carry a source-specific tag and land in a separate file before merging.
+METHOD_TAG_INTL = "t100i_trend_wm_max_recent_v2"
 
 # Gravity grid search bounds (weekly pax units; fit on anchor_weekly >= MIN_WK_GRAVITY).
 GRAVITY_MIN_WEEKLY = 10.0
@@ -201,6 +204,7 @@ def build_anchors(
     ref_year: int,
     growth: float,
     decay: float,
+    method: str = METHOD_TAG,
 ) -> list[dict]:
     rows: list[dict] = []
     for (origin, dest), year_map in per_od_year.items():
@@ -238,7 +242,7 @@ def build_anchors(
                 "years_used": len(years_present),
                 "first_year": min(years_present),
                 "last_year": max(years_present),
-                "method": METHOD_TAG,
+                "method": method,
             }
         )
     rows.sort(key=lambda r: (-float(r["anchor_weekly"]), r["origin_iata"], r["dest_iata"]))
@@ -346,6 +350,7 @@ def print_report(
     ingest_stats: dict[str, int],
     skip_names: set[str],
     gravity: dict,
+    checks: list[tuple[str, str]] | None = None,
 ) -> None:
     weeklies = sorted(float(r["anchor_weekly"]) for r in rows)
     n = len(weeklies)
@@ -378,7 +383,7 @@ def print_report(
             f"{row['years_used']} yrs)"
         )
 
-    checks = [("ATL", "LAX"), ("LAX", "SFO"), ("ATL", "MCO")]
+    checks = checks or [("ATL", "LAX"), ("LAX", "SFO"), ("ATL", "MCO")]
     print("\nSanity routes:")
     by_od = {(r["origin_iata"], r["dest_iata"]): r for r in rows}
     for od in checks:
@@ -419,6 +424,23 @@ def main(argv: list[str] | None = None) -> int:
         default=US_ROUTE_DIR,
         help="Directory containing YYYY.csv files",
     )
+    parser.add_argument(
+        "--out-anchors",
+        type=Path,
+        default=OUT_ANCHORS,
+        help="Anchor CSV to write",
+    )
+    parser.add_argument(
+        "--out-gravity",
+        type=Path,
+        default=OUT_GRAVITY,
+        help="Gravity params JSON to write",
+    )
+    parser.add_argument(
+        "--method-tag",
+        default=METHOD_TAG,
+        help="Value written to the anchors' method column",
+    )
     args = parser.parse_args(argv)
 
     if not AIRPORTS_CSV.is_file():
@@ -445,12 +467,13 @@ def main(argv: list[str] | None = None) -> int:
         ref_year=REF_YEAR,
         growth=GROWTH_RATE,
         decay=DECAY_LAMBDA,
+        method=args.method_tag,
     )
     gravity = fit_gravity(anchors, airports)
 
-    write_anchors(OUT_ANCHORS, anchors)
-    OUT_GRAVITY.parent.mkdir(parents=True, exist_ok=True)
-    OUT_GRAVITY.write_text(
+    write_anchors(args.out_anchors, anchors)
+    args.out_gravity.parent.mkdir(parents=True, exist_ok=True)
+    args.out_gravity.write_text(
         json.dumps(
             {
                 "ref_year": REF_YEAR,
@@ -458,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
                 "decay_lambda": DECAY_LAMBDA,
                 "exclude_years": sorted(EXCLUDE_YEARS),
                 "skipped_duplicate_files": sorted(skip_names),
-                "method": METHOD_TAG,
+                "method": args.method_tag,
                 **gravity,
             },
             indent=2,
@@ -467,9 +490,16 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
 
-    print_report(anchors, ingest_stats, skip_names, gravity)
-    print(f"\nWrote {OUT_ANCHORS} ({len(anchors):,} rows)")
-    print(f"Wrote {OUT_GRAVITY}")
+    is_intl = args.method_tag == METHOD_TAG_INTL
+    print_report(
+        anchors,
+        ingest_stats,
+        skip_names,
+        gravity,
+        checks=[("JFK", "LHR"), ("MIA", "GRU"), ("JFK", "FRA")] if is_intl else None,
+    )
+    print(f"\nWrote {args.out_anchors} ({len(anchors):,} rows)")
+    print(f"Wrote {args.out_gravity}")
     if clean_path is not None:
         print(f"Wrote {clean_path}")
     return 0
