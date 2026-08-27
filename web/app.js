@@ -1103,7 +1103,7 @@ function openRouteDetail(preselect) {
             <th>Cities</th>
             <th>Distance</th>
             <th>Flight time</th>
-            <th>Demand / wk</th>
+            <th>Remaining demand</th>
             <th>Source</th>
             <th>Ops</th>
             <th>Flights this week</th>
@@ -1113,14 +1113,18 @@ function openRouteDetail(preselect) {
         <tbody>
           ${rows.map((r) => {
             const est = r.flight_hours_estimated ? " · est." : "";
-            const dem = `${Number(r.base_demand_business || 0).toLocaleString()}B / ${Number(r.base_demand_leisure || 0).toLocaleString()}L template`;
+            const rc = r.remaining_cabin || null;
+            const dem = rc
+              ? `F${Number(rc.F || 0).toLocaleString()} / J${Number(rc.J || 0).toLocaleString()} / W${Number(rc.W || 0).toLocaleString()} / Y${Number(rc.Y || 0).toLocaleString()}`
+              : "—";
+            const demTitle = "Remaining cabin market this week (after carried + scheduled absorption)";
             const src = `${escapeHtml(r.demand_source_badge || r.demand_source || "—")}${r.market_floor_applied ? " · min" : ""}`;
             return `<tr data-rid="${escapeHtml(r.route_id)}">
               <td><b>${escapeHtml(r.route_id)}</b></td>
               <td>${escapeHtml(r.origin_city || r.origin_iata || "")} → ${escapeHtml(r.dest_city || r.dest_iata || "")}</td>
               <td>${Number(r.distance_nm || 0).toLocaleString()} nm</td>
               <td>${escapeHtml(formatBlockHours(r.flight_hours))}${escapeHtml(est)}</td>
-              <td title="Template base (internal) — open Fares for this week's market">${escapeHtml(dem)}</td>
+              <td title="${escapeHtml(demTitle)}">${escapeHtml(dem)}</td>
               <td>${src}</td>
               <td>${Number(r.weekly_ops || 0)}</td>
               <td class="rd-flights">${escapeHtml(r.flights_label || "—")}</td>

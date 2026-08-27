@@ -578,6 +578,21 @@ def player_routes_overview() -> dict:
             badge = source_badge(src)
         except Exception:
             badge = src or "—"
+        remaining_cabin = None
+        try:
+            from engine.scheduling import route_weekly_passenger_accounting
+
+            acct = route_weekly_passenger_accounting(rid, gw)
+            if acct:
+                rc = acct.get("remaining_cabin_demand") or {}
+                remaining_cabin = {
+                    "F": int(rc.get("F") or 0),
+                    "J": int(rc.get("J") or 0),
+                    "W": int(rc.get("W") or 0),
+                    "Y": int(rc.get("Y") or 0),
+                }
+        except Exception:
+            remaining_cabin = None
         out.append(
             {
                 "route_id": rid,
@@ -590,6 +605,7 @@ def player_routes_overview() -> dict:
                 "flight_hours_estimated": not bool(hours),
                 "base_demand_business": int(rt.get("base_demand_business") or 0),
                 "base_demand_leisure": int(rt.get("base_demand_leisure") or 0),
+                "remaining_cabin": remaining_cabin,
                 "demand_source": src,
                 "demand_source_badge": badge,
                 "market_floor_applied": bool(floored),
