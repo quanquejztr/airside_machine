@@ -423,7 +423,7 @@ def render_route_details(route_id):
         info.append(f"  Total Gross: ${performance['gross_revenue']:,.2f}\n", style="bold magenta")
         info.append(f"  Avg Fare: ${performance['avg_fare']:.2f}\n", style="magenta")
     else:
-        from engine.demand_display import source_badge, source_blurb, floor_flag_for_route
+        from engine.demand_display import source_blurb, floor_flag_for_route
 
         src = str(route.get("demand_source") or "")
         floored = False
@@ -439,7 +439,7 @@ def render_route_details(route_id):
             pass
         info.append(f"\nDemand (template only — open detail after schedule for weekly market):\n", style="bold")
         info.append(
-            f"  Source: {source_badge(src) or '—'} — {source_blurb(src)}"
+            f"  {source_blurb(src)}"
             f"{' · minimum playable market applied' if floored else ''}\n",
             style="green",
         )

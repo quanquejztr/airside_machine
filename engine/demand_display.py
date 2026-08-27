@@ -11,17 +11,18 @@ from __future__ import annotations
 from typing import Any, Optional
 
 
+# Where a market number came from is an implementation detail, not something a
+# player should have to reason about. The internal demand_source is still tracked
+# and returned for debugging; only the visible wording is deliberately plain.
+SOURCE_LABEL = "Demand"
+
 SOURCE_SHORT = {
-    "BTS": "BTS",
-    "LEGACY": "LEGACY",
-    "GRAVITY": "GRAVITY",
+    "BTS": SOURCE_LABEL,
+    "LEGACY": SOURCE_LABEL,
+    "GRAVITY": SOURCE_LABEL,
 }
 
-SOURCE_BLURB = {
-    "BTS": "Real market traffic (US DOT)",
-    "LEGACY": "Category × distance estimate",
-    "GRAVITY": "Modelled from airport size & distance",
-}
+SOURCE_BLURB = dict(SOURCE_SHORT)
 
 
 def normalize_demand_source(raw: Any) -> str:
@@ -33,12 +34,12 @@ def normalize_demand_source(raw: Any) -> str:
 
 def source_badge(raw: Any) -> str:
     s = normalize_demand_source(raw)
-    return SOURCE_SHORT.get(s, "—")
+    return SOURCE_SHORT.get(s, SOURCE_LABEL)
 
 
 def source_blurb(raw: Any) -> str:
     s = normalize_demand_source(raw)
-    return SOURCE_BLURB.get(s, "Unknown source")
+    return SOURCE_BLURB.get(s, SOURCE_LABEL)
 
 
 def resolve_weekly_market_total(
@@ -120,7 +121,7 @@ def build_demand_summary(
             week_bit += f", month {int(current_month)}"
         week_bit += ")"
 
-    source_line = f"Source: {source_badge(src) or '—'} — {source_blurb(src)}"
+    source_line = source_blurb(src)
     if floored:
         source_line += " · minimum playable market applied"
 

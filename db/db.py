@@ -363,6 +363,44 @@ def sync_bts_gravity_constants_from_json() -> None:
             continue
 
 
+def add_missing_airports_from_csv() -> int:
+    """
+    Insert airports present in data/airports.csv but absent from the save.
+
+    Seeding only runs on an empty table, so a save created before an airports.csv
+    update never sees the new entries — Phase 6 added 51 international hubs that
+    existing games could not fly to at all. Insert-only by design: player-facing
+    columns (fee overrides, curfews) and any hand-edited rows are left untouched.
+    """
+    from db.seed import load_csv
+
+    rows = load_csv("airports.csv")
+    if not rows:
+        return 0
+    have = {
+        str(r["iata"]) for r in fetch_all("SELECT iata FROM airports") if r["iata"]
+    }
+    cols = [
+        "iata", "icao", "name", "city", "country", "lat", "lon",
+        "runway_length_ft", "gate_count", "timezone", "score", "category",
+    ]
+    placeholders = ",".join("?" * len(cols))
+    added = 0
+    for r in rows:
+        iata = str(r.get("iata") or "").strip()
+        if not iata or iata in have:
+            continue
+        try:
+            execute(
+                f"INSERT INTO airports ({','.join(cols)}) VALUES ({placeholders})",
+                tuple((r.get(c) or None) for c in cols),
+            )
+            added += 1
+        except sqlite3.Error:
+            continue
+    return added
+
+
 def load_bts_demand_anchors_if_empty() -> int:
     """
     Bulk-load data/bts_demand_anchors.csv when the reference table is empty
@@ -1294,6 +1332,8 @@ def ensure_schema_migrations():
         if n <= 0:
             from db.seed import run_seed
             run_seed(DB_FILE)
+        else:
+            add_missing_airports_from_csv()
     except Exception:
         # Never block startup if seeding fails; gameplay will surface missing ref data quickly.
         pass

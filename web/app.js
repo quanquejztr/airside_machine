@@ -521,7 +521,7 @@ function routePreviewCard(p) {
       ${flags ? "· " + escapeHtml(flags) : ""}</span></div>`;
   }).join("");
   const market = Number(d.weekly_market_total != null ? d.weekly_market_total : d.total_pax || 0);
-  const src = d.demand_source_badge || d.demand_source || "—";
+  const src = d.demand_source_badge || "Demand";
   const floorNote = d.market_floor_applied ? " · min market" : "";
   return `
     <div class="tip-grid">
@@ -628,7 +628,7 @@ function openRoutes() {
       const note = p.already_operated ? " · you already operate this" : "";
       const dem = p.demand || {};
       const market = Number(dem.weekly_market_total != null ? dem.weekly_market_total : dem.total_pax || 0);
-      const src = dem.demand_source_badge || dem.demand_source || "";
+      const src = dem.demand_source_badge || "Demand";
       const floorNote = dem.market_floor_applied ? " · min market" : "";
       $("#rt-prev", el).innerHTML =
         `<span class="tip">Cost ~ <b>${money(p.total_new_cost)}</b> · ${Number(p.distance_nm || 0).toLocaleString()} nm`
@@ -1048,7 +1048,7 @@ function openRouteDetail(preselect) {
         </div>
         <p class="muted">This week: ${escapeHtml(d.schedule || "no flights scheduled")}</p>
         ${p ? `<p><b>This week's market: ${(p.weekly_market_total != null ? p.weekly_market_total : (Number(p.business_pax||0)+Number(p.leisure_pax||0))).toLocaleString()} pax</b>
-          · ${escapeHtml(p.demand_source_badge || p.demand_source || "—")}${p.market_floor_applied ? " · min market" : ""}</p>
+          · ${escapeHtml(p.demand_source_badge || "Demand")}${p.market_floor_applied ? " · min market" : ""}</p>
           <p class="muted">${Number(p.business_pax||0).toLocaleString()} business · ${Number(p.leisure_pax||0).toLocaleString()} leisure
           · cabin split Y${p.economy_pax} / W${p.premium_economy_pax} / J${p.business_cabin_pax} / F${p.first_pax}</p>
           <p class="muted">Template base ${Number(r.base_demand_business||0)}B / ${Number(r.base_demand_leisure||0)}L (internal)</p>
@@ -1118,7 +1118,7 @@ function openRouteDetail(preselect) {
               ? `F${Number(rc.F || 0).toLocaleString()} / J${Number(rc.J || 0).toLocaleString()} / W${Number(rc.W || 0).toLocaleString()} / Y${Number(rc.Y || 0).toLocaleString()}`
               : "—";
             const demTitle = "Remaining cabin market this week (after carried + scheduled absorption)";
-            const src = `${escapeHtml(r.demand_source_badge || r.demand_source || "—")}${r.market_floor_applied ? " · min" : ""}`;
+            const src = `${escapeHtml(r.demand_source_badge || "Demand")}${r.market_floor_applied ? " · min" : ""}`;
             return `<tr data-rid="${escapeHtml(r.route_id)}">
               <td><b>${escapeHtml(r.route_id)}</b></td>
               <td>${escapeHtml(r.origin_city || r.origin_iata || "")} → ${escapeHtml(r.dest_city || r.dest_iata || "")}</td>
