@@ -39,7 +39,17 @@ db/corrupted_backup/
 # Optional Node map experiment (not required for --ui)
 server/map_node/node_modules/
 
-# Raw BTS extracts (regenerate anchors with bts_calibrate.py)
+# Raw traffic extracts. The game never reads these — only the calibration scripts
+# do, and each directory's fetch_*.py re-downloads them. Committed output is the
+# derived data/*_demand_anchors.csv instead.
 US_Route/[0-9][0-9][0-9][0-9].csv
 US_Route/US_CARRIER_MARKET.csv
 Intl_Route/[0-9][0-9][0-9][0-9].csv
+Korea_Route/[0-9][0-9][0-9][0-9].csv
+Japan_Route/[0-9][0-9][0-9][0-9].csv
+Europe_Route/[0-9][0-9][0-9][0-9].csv
+Australia_Route/[0-9][0-9][0-9][0-9].csv
+
+# Synthetic/unused inputs kept locally for reference only
+Intl_Route/Emirates_data.csv
+Europe_Route/missing_airports.csv

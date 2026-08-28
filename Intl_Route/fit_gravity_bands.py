@@ -19,7 +19,10 @@ solves exactly by least squares -- no grid search, no local minima:
 Region priors are then measured as residual medians per region pair, replacing the
 hand-tuned REGIONAL_PRIORS table.
 
-Reads:  data/us_demand_anchors.csv, data/intl_demand_anchors.csv, data/airports.csv
+Reads:  data/us_demand_anchors.csv, data/intl_demand_anchors.csv,
+        data/korea_demand_anchors.csv, data/japan_demand_anchors.csv,
+        data/europe_demand_anchors.csv, data/australia_demand_anchors.csv,
+        data/airports.csv
         (the per-source files, NOT the merged data/bts_demand_anchors.csv, which
         would double-count the international rows)
 Writes: data/gravity_bands.json
@@ -51,6 +54,10 @@ from bts_calibrate import (  # noqa: E402
 AIRPORTS_CSV = ROOT / "data" / "airports.csv"
 US_ANCHORS = ROOT / "data" / "us_demand_anchors.csv"
 INTL_ANCHORS = ROOT / "data" / "intl_demand_anchors.csv"
+KOREA_ANCHORS = ROOT / "data" / "korea_demand_anchors.csv"
+JAPAN_ANCHORS = ROOT / "data" / "japan_demand_anchors.csv"
+EUROPE_ANCHORS = ROOT / "data" / "europe_demand_anchors.csv"
+AUSTRALIA_ANCHORS = ROOT / "data" / "australia_demand_anchors.csv"
 OUT_JSON = ROOT / "data" / "gravity_bands.json"
 
 BAND1_NM = 800.0
@@ -62,9 +69,42 @@ MIN_REGION_PAIRS = 30
 QUANTILE_KNOTS = 101
 # How far to pull a modelled route toward the real-world demand distribution.
 # 0 = raw gravity, 1 = full quantile mapping. Blended geometrically at runtime.
-QUANTILE_BLEND = 0.5
+#
+# Fitted on a 20% holdout of anchors treated as unanchored. Median |log error| is
+# actually minimised at 0.0, but that metric is dominated by the bulk of ordinary
+# routes and is blind to the tails, which is precisely where the model fails: at
+# blend 0 the busiest 1% come out 11.6x low, at 1.0 only 5.8x. Trading 6% of
+# median accuracy for a 14% improvement on the worst-predicted group is the right
+# direction given trunk under-prediction is the known defect.
+QUANTILE_BLEND = 0.75
+
+# Caps are stratified by the smaller of the two airport scores as well as by
+# distance. A single per-distance p99 is set by whichever routes are most
+# numerous -- thin European regional ones -- so it pins hub pairs far below what
+# comparable real hub routes carry.
+SCORE_TIER_HUB = 600_000.0
+SCORE_TIER_MED = 100_000.0
+
+
+def score_tier(min_score: float) -> str:
+    if min_score > SCORE_TIER_HUB:
+        return "hub"
+    return "med" if min_score >= SCORE_TIER_MED else "thin"
 # Betas below this are implausible (demand rising with distance in-band).
 BETA_FLOOR = 0.05
+# Each anchor enters the regression with weight weekly**WEIGHT_POWER. At 0 every
+# pair counts the same, which lets the thousands of thin European regional routes
+# outvote the trunk routes and drags alpha (the size elasticity) down. Raising it
+# lets the fit describe where passengers actually are rather than where routes are.
+# 1.0 would hand a single 90k/wk pair the pull of 9,000 ten-pax pairs, so the
+# useful range is well below that.
+#
+# 0.2 is where US domestic and US<->foreign validation medians sit at 0.94 and
+# 1.00, i.e. weighting buys back the busiest decile without tipping the routes
+# most players fly into over-prediction. Pushing further keeps helping trunk
+# routes on paper but they run into caps_weekly instead, so the extra weight
+# only inflates thin pairs. See --sweep.
+WEIGHT_POWER = 0.2
 # The fit only sees pairs above GRAVITY_MIN_WEEKLY. That cutoff bites hardest on
 # small x small pairs, whose predictions are lowest, so surviving ones are the
 # unusually busy tail and the fitted coefficient comes out as a large *boost*.
@@ -127,18 +167,21 @@ def load_anchor_points(path: Path, airports: dict) -> list[dict]:
                     "weekly": weekly,
                     "dist": dist,
                     "score": max(1.0, float(ao["score"]) * float(ad["score"])),
+                    "min_score": max(1.0, min(float(ao["score"]), float(ad["score"]))),
                     "cat_o": ao["category"],
                     "cat_d": ad["category"],
                     "country_o": ao["country"],
                     "country_d": ad["country"],
+                    "lon_o": ao["lon"],
+                    "lon_d": ad["lon"],
                 }
             )
     return points
 
 
-def fit(points: list[dict], country_region: dict) -> dict:
+def fit(points: list[dict], country_region: dict, weight_power: float = WEIGHT_POWER) -> dict:
     """
-    Single joint OLS in log space:
+    Single joint weighted OLS in log space:
 
         log(w) = log(k) + alpha*log(S) - b1*c1 - b2*c2 - b3*c3
                  + log(damp)*[small x small] + sum_r log(prior_r)*[region pair r]
@@ -147,10 +190,13 @@ def fit(points: list[dict], country_region: dict) -> dict:
     post-hoc residual medians, so they can't be confounded with k. US-US is the
     held-out baseline, which pins its prior to exactly 1.0. Region pairs with
     fewer than MIN_REGION_PAIRS observations fold into that baseline.
+
+    Each row is weighted by weekly**weight_power so busy markets carry more of the
+    fit than thin ones; see WEIGHT_POWER.
     """
     for p in points:
-        ro = region_of(p["country_o"], country_region)
-        rd = region_of(p["country_d"], country_region)
+        ro = region_of(p["country_o"], country_region, p.get("lon_o"))
+        rd = region_of(p["country_d"], country_region, p.get("lon_d"))
         p["region_key"] = "|".join(sorted((ro, rd)))
         p["small_small"] = p["cat_o"] == "small_airport" and p["cat_d"] == "small_airport"
 
@@ -179,18 +225,20 @@ def fit(points: list[dict], country_region: dict) -> dict:
         idx = col_index.get(p["region_key"])
         if idx is not None:
             feats[idx] = 1.0
-        rows.append((feats, math.log(p["weekly"])))
+        wt = p["weekly"] ** weight_power if weight_power else 1.0
+        rows.append((feats, math.log(p["weekly"]), wt))
 
     xtx = [[0.0] * n_terms for _ in range(n_terms)]
     xty = [0.0] * n_terms
-    for feats, y in rows:
+    for feats, y, wt in rows:
         for i in range(n_terms):
             fi = feats[i]
             if fi == 0.0:
                 continue
+            wfi = wt * fi
             for j in range(n_terms):
-                xtx[i][j] += fi * feats[j]
-            xty[i] += fi * y
+                xtx[i][j] += wfi * feats[j]
+            xty[i] += wfi * y
     coefs = solve(xtx, xty)
     if coefs is None:
         raise SystemExit("singular design matrix")
@@ -206,10 +254,14 @@ def fit(points: list[dict], country_region: dict) -> dict:
     for key, idx in col_index.items():
         priors[key] = round(math.exp(coefs[idx]), 4)
 
-    resid = [y - sum(f * c for f, c in zip(feats, coefs)) for feats, y in rows]
-    ss_res = sum(r * r for r in resid)
-    mean_y = statistics.mean(y for _, y in rows)
-    ss_tot = sum((y - mean_y) ** 2 for _, y in rows)
+    # Weighted R^2, so the figure describes the fit the regression actually solved
+    # rather than an unweighted one it never targeted.
+    tot_w = sum(wt for _, _, wt in rows)
+    ss_res = sum(
+        wt * (y - sum(f * c for f, c in zip(feats, coefs))) ** 2 for feats, y, wt in rows
+    )
+    mean_y = sum(wt * y for _, y, wt in rows) / tot_w
+    ss_tot = sum(wt * (y - mean_y) ** 2 for _, y, wt in rows)
 
     return {
         "k": math.exp(log_k),
@@ -222,12 +274,20 @@ def fit(points: list[dict], country_region: dict) -> dict:
         "region_counts": {k: counts[k] for k in sorted(counts, key=lambda x: -counts[x])},
         "n": len(rows),
         "r2": 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0,
+        "weight_power": weight_power,
         "clamped": clamped,
     }
 
 
-def region_of(country: str, country_region: dict) -> str:
-    return country_region.get(country.upper(), "OT")
+def region_of(country: str, country_region: dict, lon: float | None = None) -> str:
+    """Mirror engine._region, including its Urals split for Russia."""
+    c = country.upper()
+    if c == "RU" and lon is not None:
+        try:
+            return "AS" if float(lon) >= 60.0 else "EU"
+        except (TypeError, ValueError):
+            pass
+    return country_region.get(c, "OT")
 
 
 def derive_missing_region_priors(fitted: dict[str, float], country_region: dict) -> dict:
@@ -294,20 +354,100 @@ def derive_missing_region_priors(fitted: dict[str, float], country_region: dict)
     return out
 
 
-def main() -> int:
-    airports = load_game_airports(AIRPORTS_CSV)
-    from engine.route_demand import _COUNTRY_REGION  # noqa: PLC0415
-
+def load_all(airports: dict) -> list[dict]:
     print("Loading anchors...")
     pts = load_anchor_points(US_ANCHORS, airports)
     print(f"  US domestic: {len(pts):,} pairs >= {GRAVITY_MIN_WEEKLY:g}/wk")
     intl = load_anchor_points(INTL_ANCHORS, airports)
     print(f"  international: {len(intl):,} pairs >= {GRAVITY_MIN_WEEKLY:g}/wk")
     pts += intl
+    korea = load_anchor_points(KOREA_ANCHORS, airports)
+    print(f"  korea: {len(korea):,} pairs >= {GRAVITY_MIN_WEEKLY:g}/wk")
+    pts += korea
+    japan = load_anchor_points(JAPAN_ANCHORS, airports)
+    print(f"  japan: {len(japan):,} pairs >= {GRAVITY_MIN_WEEKLY:g}/wk")
+    pts += japan
+    europe = load_anchor_points(EUROPE_ANCHORS, airports)
+    print(f"  europe: {len(europe):,} pairs >= {GRAVITY_MIN_WEEKLY:g}/wk")
+    pts += europe
+    australia = load_anchor_points(AUSTRALIA_ANCHORS, airports)
+    print(f"  australia: {len(australia):,} pairs >= {GRAVITY_MIN_WEEKLY:g}/wk")
+    pts += australia
     print(f"  combined: {len(pts):,}")
+    return pts
 
-    print("\nFitting banded decay + region priors + damp (single joint OLS)...")
-    f = fit(pts, _COUNTRY_REGION)
+
+def sweep(pts: list[dict], country_region: dict, powers: list[float]) -> int:
+    """Report how the fit responds to weighting, without writing anything."""
+    print("\nWeight sweep (nothing written):")
+    print(
+        f"  {'power':>7}{'alpha':>9}{'b_short':>9}{'b_med':>9}{'b_long':>9}"
+        f"{'wR^2':>8}{'top10% ratio':>14}"
+    )
+    heavy_cut = sorted(p["weekly"] for p in pts)[int(0.9 * (len(pts) - 1))]
+    heavy = [p for p in pts if p["weekly"] >= heavy_cut]
+    for power in powers:
+        f = fit(pts, country_region, power)
+        priors = derive_missing_region_priors(f["region_priors"], country_region)
+        damp = min(SMALL_SMALL_MAX, f["small_small_damp"])
+
+        def pred(p: dict, f: dict = f, priors: dict = priors, damp: float = damp) -> float:
+            v = f["k"] * (p["score"] ** f["alpha"]) / decay(
+                p["dist"], f["beta_short"], f["beta_medium"], f["beta_long"]
+            )
+            v *= priors.get(p["region_key"], 1.0)
+            return v * damp if p["small_small"] else v
+
+        corr = statistics.median([p["weekly"] / pred(p) for p in pts if pred(p) > 0])
+        top = statistics.median(
+            [p["weekly"] / (pred(p) * corr) for p in heavy if pred(p) > 0]
+        )
+        print(
+            f"  {power:>7.2f}{f['alpha']:>9.4f}{f['beta_short']:>9.4f}"
+            f"{f['beta_medium']:>9.4f}{f['beta_long']:>9.4f}{f['r2']:>8.3f}{top:>14.2f}"
+        )
+    print(
+        f"\n  top10% = pairs >= {heavy_cut:,.0f}/wk (n={len(heavy):,}); median "
+        "actual/predicted after the level correction. 1.00 means the busiest\n"
+        "  decile is predicted at its true size; below 1.00 means over-predicted."
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--weight-power",
+        type=float,
+        default=WEIGHT_POWER,
+        help=(
+            "Weight each anchor by weekly**POWER in the regression. "
+            f"0 = every route counts equally (default {WEIGHT_POWER})."
+        ),
+    )
+    parser.add_argument(
+        "--sweep",
+        default=None,
+        help="Comma-separated powers to compare. Reports only; writes nothing.",
+    )
+    args = parser.parse_args(argv)
+
+    airports = load_game_airports(AIRPORTS_CSV)
+    from engine.route_demand import _COUNTRY_REGION  # noqa: PLC0415
+
+    pts = load_all(airports)
+
+    if args.sweep:
+        powers = [float(x) for x in args.sweep.split(",") if x.strip()]
+        return sweep(pts, _COUNTRY_REGION, powers)
+
+    print(
+        f"\nFitting banded decay + region priors + damp "
+        f"(joint OLS, weight power {args.weight_power})..."
+    )
+    f = fit(pts, _COUNTRY_REGION, args.weight_power)
     print(f"  k            = {f['k']:.10f}")
     print(f"  alpha        = {f['alpha']:.4f}")
     print(f"  beta_short   = {f['beta_short']:.4f}   (< {BAND1_NM:.0f}nm)")
@@ -369,6 +509,17 @@ def main() -> int:
         check(f"  {band}", [p for p in pts if lo < p["dist"] <= hi])
     check("US domestic", [p for p in pts if p["country_o"] == "US" and p["country_d"] == "US"])
     check("US <-> foreign", [p for p in pts if (p["country_o"] == "US") != (p["country_d"] == "US")])
+    # The group alpha governs: if size elasticity is too low these read well above
+    # 1.00 while the thin majority sits below it.
+    by_traffic = sorted(p["weekly"] for p in pts)
+    for label, q in (("busiest 10%", 0.90), ("busiest 1%", 0.99), ("thinnest 50%", 0.0)):
+        cut = by_traffic[int(q * (len(by_traffic) - 1))]
+        subset = (
+            [p for p in pts if p["weekly"] >= cut]
+            if q
+            else [p for p in pts if p["weekly"] <= by_traffic[len(by_traffic) // 2]]
+        )
+        check(label, subset)
 
     # Quantile mapping. Gravity's spread is far too narrow -- across the anchored
     # pairs its p10->p99 range is ~32x where the real one is ~779x, so thin routes
@@ -395,25 +546,47 @@ def main() -> int:
     # routes badly (R^2 ~0.32), so a p90 cap would truncate legitimate large
     # modelled markets. p99 still blocks a fictional route from outranking all but
     # the very busiest measured ones.
-    print("\nPlausibility caps per band:")
-    per_band: dict[str, list[float]] = defaultdict(list)
+    print("\nPlausibility caps per score tier and band:")
+    per_band: dict[tuple[str, str], list[float]] = defaultdict(list)
     for p in pts:
         band = "short" if p["dist"] <= BAND1_NM else ("medium" if p["dist"] <= BAND2_NM else "long")
-        per_band[band].append(p["weekly"])
-    caps = {}
+        per_band[(score_tier(p["min_score"]), band)].append(p["weekly"])
+
+    caps: dict[str, dict[str, float]] = {}
+    print(f"  {'tier':<6}{'band':<8}{'n':>8}{'p90':>11}{'p99 (cap)':>12}{'max':>11}")
+    for tier in ("hub", "med", "thin"):
+        for band in ("short", "medium", "long"):
+            vals = sorted(per_band[(tier, band)])
+            if len(vals) < MIN_REGION_PAIRS:
+                # Too sparse to set a defensible ceiling; the tier above it is a
+                # safer bound than a p99 drawn from a handful of routes.
+                continue
+
+            def at(q: float, v: list[float] = vals) -> float:
+                return v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
+
+            caps.setdefault(tier, {})[band] = round(at(0.99), 1)
+            print(
+                f"  {tier:<6}{band:<8}{len(vals):>8,}{at(0.90):>11,.0f}"
+                f"{at(0.99):>12,.0f}{vals[-1]:>11,.0f}"
+            )
+
+    # A bigger pair must never face a tighter ceiling than a smaller one. Sparse
+    # cells break that on their own: med/long has only 176 routes and its p99
+    # came out above the hub tier's, which would cap two hubs below two regional
+    # airports on the same sector. Sweep upward so each tier is at least as
+    # permissive as the one below.
     for band in ("short", "medium", "long"):
-        vals = sorted(per_band[band])
-        if not vals:
-            continue
-
-        def at(q: float, v: list[float] = vals) -> float:
-            return v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
-
-        caps[band] = round(at(0.99), 1)
-        print(
-            f"  {band:<7} n={len(vals):>6}  p90={at(0.90):>10,.0f}  "
-            f"p99={at(0.99):>10,.0f} <- cap   max={vals[-1]:>10,.0f}"
-        )
+        running = 0.0
+        for tier in ("thin", "med", "hub"):
+            val = (caps.get(tier) or {}).get(band)
+            if val is None:
+                continue
+            if val < running:
+                print(f"  raised {tier}/{band} cap {val:,.0f} -> {running:,.0f} for monotonicity")
+                caps[tier][band] = running
+            else:
+                running = val
 
     payload = {
         "method": "banded_ols_v1",
@@ -433,7 +606,10 @@ def main() -> int:
         "quantile_model": q_pred,
         "quantile_real": q_act,
         "caps_weekly": caps,
+        "score_tier_hub": SCORE_TIER_HUB,
+        "score_tier_med": SCORE_TIER_MED,
         "fit_points": f["n"],
+        "weight_power": args.weight_power,
         "r2": round(f["r2"], 4),
         "min_weekly_for_fit": GRAVITY_MIN_WEEKLY,
         "min_region_pairs": MIN_REGION_PAIRS,

@@ -779,6 +779,81 @@ def slots_held(iata: str, holder_id: str, game_week: int) -> int:
     return int(row["slots_held"] or 0) if row else 0
 
 
+def ensure_min_slots_held(
+    iata: str, holder_id: str, game_week: int, minimum: int
+) -> None:
+    """Raise a holder's weekly allocation to at least ``minimum`` (never lower)."""
+    ap = str(iata).upper().strip()
+    hid = str(holder_id)
+    gw = int(game_week)
+    need = max(0, int(minimum))
+    if not ap or need <= 0 or not is_slot_controlled(ap):
+        return
+    row = db.fetch_one(
+        """
+        SELECT allocation_id, slots_held FROM slot_allocations
+        WHERE airport_iata = ? AND holder_id = ? AND game_week = ?
+        """,
+        (ap, hid, gw),
+    )
+    if row and int(row["slots_held"] or 0) >= need:
+        return
+    if row:
+        db.execute(
+            "UPDATE slot_allocations SET slots_held = ? WHERE allocation_id = ?",
+            (need, str(row["allocation_id"])),
+        )
+        return
+    db.execute(
+        """
+        INSERT INTO slot_allocations (
+            allocation_id, airport_iata, holder_id, game_week,
+            slots_held, used_this_week, below_threshold_weeks
+        ) VALUES (?, ?, ?, ?, ?, 0, 0)
+        """,
+        (str(uuid.uuid4()), ap, hid, gw, need),
+    )
+
+
+def seed_competitor_slot_capacity(
+    competitor_id: str,
+    airport_freq: Dict[str, int],
+    *,
+    start_week: int = 1,
+    weeks_ahead: int | None = None,
+) -> None:
+    """
+    Playable slot bootstrap for AI: hub + spokes get enough movements for their
+    declared weekly frequency. Auctions still matter for growth beyond this floor.
+    """
+    if weeks_ahead is None:
+        weeks_ahead = int(_const_num("ai_slot_seed_weeks", 16.0))
+    cid = str(competitor_id)
+    gw0 = max(1, int(start_week))
+    for ap, freq in airport_freq.items():
+        if not is_slot_controlled(ap):
+            continue
+        # Each weekly frequency is one round-trip cycle -> 2 movements per endpoint.
+        need = max(4, 2 * max(1, int(freq)))
+        for w in range(gw0, gw0 + max(1, int(weeks_ahead))):
+            ensure_min_slots_held(ap, cid, w, need)
+
+
+def slot_freq_cap(competitor_id: str, origin: str, dest: str, game_week: int) -> int:
+    """Max weekly frequency allowed by slot holdings on this pair (one-way cycles)."""
+    cid = str(competitor_id)
+    gw = int(game_week)
+    cap = 99
+    for ap in (str(origin).upper(), str(dest).upper()):
+        if not is_slot_controlled(ap):
+            continue
+        held = slots_held(ap, cid, gw)
+        if held <= 0:
+            return 0
+        cap = min(cap, max(0, held // 2))
+    return cap
+
+
 def _upsert_slot_held(iata: str, holder_id: str, game_week: int, delta: int) -> int:
     ap = str(iata).upper().strip()
     hid = str(holder_id)

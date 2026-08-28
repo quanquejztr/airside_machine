@@ -36,6 +36,10 @@ OUT_CLEAN = ROOT / "data" / "bts_clean.csv"
 REF_YEAR = 2019
 GROWTH_RATE = 0.02
 DECAY_LAMBDA = 0.85
+# Years dropped as unrepresentative. The default is the US recovery profile;
+# Asian international traffic lagged it by well over a year (Japan only reopened
+# to individual tourists in late 2022), so per-source overrides matter -- see
+# --exclude-years.
 EXCLUDE_YEARS = frozenset({2020, 2021})
 # Recent-market blend: median of trend-adjusted years in this window, then
 # annual = max(weighted_median, recent_median). Lifts growth OD pairs (e.g. TPA-SAN)
@@ -412,6 +416,7 @@ def print_report(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global EXCLUDE_YEARS
     parser = argparse.ArgumentParser(description="Build BTS demand anchors from US_Route/*.csv")
     parser.add_argument(
         "--write-clean",
@@ -441,7 +446,21 @@ def main(argv: list[str] | None = None) -> int:
         default=METHOD_TAG,
         help="Value written to the anchors' method column",
     )
+    parser.add_argument(
+        "--exclude-years",
+        default=None,
+        help=(
+            "Comma-separated years to treat as unrepresentative, replacing the "
+            f"default {sorted(EXCLUDE_YEARS)}. Pass an empty string to keep every year."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.exclude_years is not None:
+        EXCLUDE_YEARS = frozenset(
+            int(y.strip()) for y in args.exclude_years.split(",") if y.strip()
+        )
+        print(f"Excluding years: {sorted(EXCLUDE_YEARS) or 'none'}")
 
     if not AIRPORTS_CSV.is_file():
         print(f"Missing {AIRPORTS_CSV}", file=sys.stderr)

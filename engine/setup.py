@@ -69,9 +69,9 @@ def create_airline(name=None, callsign=None, home_hub_iata=None):
     except Exception:
         pass
     db.purge_all_player_game_data()
-    _reset_ai_seed_cache()
+    _reseed_competitors_after_purge()
     print(
-        "(Cleared any leftover flights, fleet, routes, and ledgers from this save file.)"
+        "(Cleared any leftover flights, fleet, routes, ledgers, and AI competitors from this save file.)"
     )
     
     # Get airline name
@@ -178,12 +178,13 @@ def create_airline(name=None, callsign=None, home_hub_iata=None):
         raise
 
 
-def _reset_ai_seed_cache() -> None:
-    """Competitor rows/fleet were just wiped; let the roster re-seed."""
+def _reseed_competitors_after_purge() -> None:
+    """Wipe left competitor rows in purge; rebuild roster from data/competitors.json."""
     try:
-        from engine.ai import reset_competitor_seed_cache
+        from engine.ai import ensure_competitors_seeded, reset_competitor_seed_cache
 
         reset_competitor_seed_cache()
+        ensure_competitors_seeded()
     except Exception:
         pass
 
@@ -216,7 +217,7 @@ def reset_airline():
     hub = str(al["home_hub_iata"])
     _stop_clock_and_news()
     db.purge_all_player_game_data()
-    _reset_ai_seed_cache()
+    _reseed_competitors_after_purge()
     return create_airline(name=name, callsign=callsign, home_hub_iata=hub)
 
 
@@ -226,7 +227,7 @@ def delete_airline():
         raise ValueError("No airline to delete.")
     _stop_clock_and_news()
     db.purge_all_player_game_data()
-    _reset_ai_seed_cache()
+    _reseed_competitors_after_purge()
 
 
 def get_airline():

@@ -97,7 +97,56 @@ CURATED: dict[str, dict] = {
     # Latin America
     "MDE": {"score": 940_000, "category": "large_airport", "gates": 35, "tz": "America/Bogota"},
     "UIO": {"score": 620_000, "category": "large_airport", "gates": 20, "tz": "America/Guayaquil"},
+    # --- Wave 3: airports the Korean route data flies to ---------------------
+    # airportal.go.kr references these; without them those rows are dropped and
+    # we lose intra-Asian markets that exist nowhere else in our sources.
+    "TSN": {"score": 1_080_000, "category": "large_airport", "gates": 50, "tz": "Asia/Shanghai"},
+    "VCE": {"score": 880_000, "category": "large_airport", "gates": 35, "tz": "Europe/Rome"},
+    "CMB": {"score": 830_000, "category": "large_airport", "gates": 30, "tz": "Asia/Colombo"},
+    "MFM": {"score": 800_000, "category": "large_airport", "gates": 30, "tz": "Asia/Macau"},
+    "ALA": {"score": 680_000, "category": "large_airport", "gates": 25, "tz": "Asia/Almaty"},
+    "OVB": {"score": 660_000, "category": "large_airport", "gates": 25, "tz": "Asia/Novosibirsk"},
+    "NQZ": {"score": 600_000, "category": "large_airport", "gates": 20, "tz": "Asia/Almaty"},
+    "MLE": {"score": 540_000, "category": "large_airport", "gates": 20, "tz": "Indian/Maldives"},
+    "REP": {"score": 540_000, "category": "large_airport", "gates": 20, "tz": "Asia/Phnom_Penh"},
+    "KTI": {"score": 540_000, "category": "large_airport", "gates": 20, "tz": "Asia/Phnom_Penh"},
+    "TAS": {"score": 500_000, "category": "large_airport", "gates": 20, "tz": "Asia/Tashkent"},
+    "WRO": {"score": 500_000, "category": "large_airport", "gates": 18, "tz": "Europe/Warsaw"},
+    "ZAG": {"score": 490_000, "category": "large_airport", "gates": 18, "tz": "Europe/Zagreb"},
+    "VVO": {"score": 470_000, "category": "large_airport", "gates": 15, "tz": "Asia/Vladivostok"},
+    "IKT": {"score": 445_000, "category": "large_airport", "gates": 14, "tz": "Asia/Irkutsk"},
+    "KHV": {"score": 440_000, "category": "medium_airport", "gates": 12, "tz": "Asia/Vladivostok"},
+    "KWJ": {"score": 440_000, "category": "medium_airport", "gates": 10, "tz": "Asia/Seoul"},
+    "YTY": {"score": 440_000, "category": "medium_airport", "gates": 10, "tz": "Asia/Shanghai"},
+    "ULN": {"score": 430_000, "category": "large_airport", "gates": 14, "tz": "Asia/Ulaanbaatar"},
+    "SPN": {"score": 420_000, "category": "medium_airport", "gates": 10, "tz": "Pacific/Saipan"},
+    "BSZ": {"score": 420_000, "category": "large_airport", "gates": 14, "tz": "Asia/Bishkek"},
+    "KCZ": {"score": 415_000, "category": "large_airport", "gates": 10, "tz": "Asia/Tokyo"},
+    "UUS": {"score": 405_000, "category": "large_airport", "gates": 10, "tz": "Asia/Sakhalin"},
+    "CIT": {"score": 395_000, "category": "large_airport", "gates": 10, "tz": "Asia/Almaty"},
+    "ASB": {"score": 395_000, "category": "large_airport", "gates": 12, "tz": "Asia/Ashgabat"},
+    "YKS": {"score": 380_000, "category": "large_airport", "gates": 10, "tz": "Asia/Yakutsk"},
+    "RSU": {"score": 370_000, "category": "medium_airport", "gates": 6, "tz": "Asia/Seoul"},
+    "OBO": {"score": 370_000, "category": "medium_airport", "gates": 6, "tz": "Asia/Tokyo"},
+    "UUD": {"score": 350_000, "category": "large_airport", "gates": 8, "tz": "Asia/Irkutsk"},
+    "ROR": {"score": 150_000, "category": "large_airport", "gates": 5, "tz": "Pacific/Palau"},
+    "SHI": {"score": 120_000, "category": "medium_airport", "gates": 4, "tz": "Asia/Tokyo"},
+    # --- Wave 4: Japanese domestic points from the e-Stat flow matrix --------
+    "GAJ": {"score": 370_000, "category": "medium_airport", "gates": 5, "tz": "Asia/Tokyo"},
+    "OKD": {"score": 350_000, "category": "medium_airport", "gates": 5, "tz": "Asia/Tokyo"},
+    "HAC": {"score": 200_000, "category": "medium_airport", "gates": 3, "tz": "Asia/Tokyo"},
+    "OGN": {"score": 110_000, "category": "medium_airport", "gates": 2, "tz": "Asia/Tokyo"},
+    "KKX": {"score": 90_000, "category": "medium_airport", "gates": 2, "tz": "Asia/Tokyo"},
+    "AXJ": {"score": 90_000, "category": "medium_airport", "gates": 2, "tz": "Asia/Tokyo"},
+    "RIS": {"score": 70_000, "category": "medium_airport", "gates": 2, "tz": "Asia/Tokyo"},
+    "OIM": {"score": 50_000, "category": "medium_airport", "gates": 2, "tz": "Asia/Tokyo"},
+    "MYE": {"score": 45_000, "category": "medium_airport", "gates": 2, "tz": "Asia/Tokyo"},
+    "OIR": {"score": 35_000, "category": "medium_airport", "gates": 1, "tz": "Asia/Tokyo"},
 }
+
+# Codes the Korean statistics still use for airports OurAirports lists under a
+# newer IATA code. Folded together so one physical airport isn't split in two.
+IATA_ALIASES = {"TSE": "NQZ", "FRU": "BSZ"}
 
 
 def load_ourairports(oa_dir: Path) -> tuple[dict[str, dict], dict[str, float]]:

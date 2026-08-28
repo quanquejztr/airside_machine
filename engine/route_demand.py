@@ -139,8 +139,19 @@ _COUNTRY_REGION = {
     "KW": "ME",
     "OM": "ME",
     "BH": "ME",
-    # Russia's traffic in this dataset is via SVO/LED, both European.
+    # Default for Russia; _region() overrides it by longitude when known.
     "RU": "EU",
+    # Reached via the Korean route data.
+    "MO": "AS",
+    "UZ": "AS",
+    "KZ": "AS",
+    "KG": "AS",
+    "TM": "AS",
+    "TJ": "AS",
+    "MV": "AS",
+    "MN": "AS",
+    "HR": "EU",
+    "PW": "OC",
     "AF": "AF",
     "EG": "AF",
     "ZA": "AF",
@@ -219,8 +230,19 @@ def biz_lei_split(origin_ap: dict, dest_ap: dict, distance_nm: float) -> tuple[f
     return float(biz), float(1.0 - biz)
 
 
-def _region(country: Optional[str]) -> str:
+# Russia straddles the split. Moscow and St Petersburg trade with Europe, while
+# Vladivostok and Irkutsk are intra-Asian markets flying to Seoul and Beijing --
+# calling them all European would price ICN-VVO like a long-haul Europe run.
+_URALS_LON = 60.0
+
+
+def _region(country: Optional[str], lon: Optional[float] = None) -> str:
     c = str(country or "").strip().upper()
+    if c == "RU" and lon is not None:
+        try:
+            return "AS" if float(lon) >= _URALS_LON else "EU"
+        except (TypeError, ValueError):
+            pass
     return _COUNTRY_REGION.get(c, "OT")
 
 
@@ -260,8 +282,8 @@ def regional_prior(origin_ap: dict, dest_ap: dict) -> float:
     baseline, pinned to 1.0). REGIONAL_PRIORS below is the pre-Phase-6 fallback for
     when the fitted JSON is unavailable.
     """
-    ro = _region(origin_ap.get("country"))
-    rd = _region(dest_ap.get("country"))
+    ro = _region(origin_ap.get("country"), origin_ap.get("lon"))
+    rd = _region(dest_ap.get("country"), dest_ap.get("lon"))
 
     fitted = gravity_band_params().get("region_priors") or {}
     if fitted:
@@ -354,7 +376,7 @@ def gravity_weekly(origin_ap: dict, dest_ap: dict, distance_nm: float) -> float:
     # Never let a modelled market outrank the real ones. Without this, two
     # high-scoring foreign airports at short range can invent a market larger
     # than the measured JFK-LHR, which is immediately obvious to a player.
-    cap = gravity_cap_weekly(dist, params)
+    cap = gravity_cap_weekly(dist, params, min_score=min(score_o, score_d))
     if cap > 0:
         weekly = min(weekly, cap)
 
@@ -423,8 +445,20 @@ def _interp_quantile(value: float, model_q: list, real_q: list) -> float:
     return float(real_q[-1])
 
 
-def gravity_cap_weekly(distance_nm: float, params: dict | None = None) -> float:
-    """p90 of real anchors in the matching distance band; 0 disables capping."""
+def gravity_cap_weekly(
+    distance_nm: float,
+    params: dict | None = None,
+    min_score: float | None = None,
+) -> float:
+    """
+    p99 of real anchors in the matching distance band; 0 disables capping.
+
+    Stratified by the smaller of the two airport scores when the calibration
+    provides tiered caps. A single per-distance p99 is dictated by whichever
+    routes are most numerous, which is thin regional ones, so it held hub pairs
+    far below comparable measured hub routes. Falls back to the flat layout so
+    an older gravity_bands.json keeps working.
+    """
     params = params if params is not None else gravity_band_params()
     caps = params.get("caps_weekly") or {}
     dist = max(50.0, float(distance_nm))
@@ -434,10 +468,60 @@ def gravity_cap_weekly(distance_nm: float, params: dict | None = None) -> float:
         band = "medium"
     else:
         band = "long"
+
+    tiered = isinstance(caps.get("hub"), dict)
+    if not tiered:
+        try:
+            return float(caps.get(band) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ms = float(min_score) if min_score is not None else 0.0
+    if ms > float(params.get("score_tier_hub", 600_000.0)):
+        order = ("hub", "med", "thin")
+    elif ms >= float(params.get("score_tier_med", 100_000.0)):
+        order = ("med", "thin", "hub")
+    else:
+        order = ("thin", "med", "hub")
+    # A tier/band cell can be too sparse to have produced a cap; fall through to
+    # the next most similar tier rather than uncapping the route entirely.
+    for tier in order:
+        try:
+            val = float((caps.get(tier) or {}).get(band) or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val > 0:
+            return val
+    return 0.0
+
+
+def min_weekly_pool(origin_ap: dict, dest_ap: dict) -> tuple[float, bool]:
+    """
+    Minimum playable weekly market for a pair, scaled by airport size.
+
+    A flat floor made 86.8% of anchored routes display an identical number, so a
+    dying regional route looked exactly like a busy one. Real demand at the tenth
+    percentile scales as min_score**0.435 (fitted across score bands), so the
+    floor follows the same curve.
+
+    Only ever scales *downward* from the configured pool. Scaling up would inflate
+    dead pairs between two large airports -- BWI-IAD is a 39nm drive with almost
+    no traffic, and both endpoints are hub-scored. Returns (floor, scaled).
+    """
+    base = _fc("bts_min_weekly_pool", 500.0)
+    if base <= 0:
+        return 0.0, False
+    ref = _fc("bts_floor_score_ref", 1_200_000.0)
+    exp = _fc("bts_floor_score_exponent", 0.435)
+    hard = _fc("bts_floor_min_weekly", 250.0)
     try:
-        return float(caps.get(band) or 0.0)
+        ms = min(float(origin_ap.get("score") or 0), float(dest_ap.get("score") or 0))
     except (TypeError, ValueError):
-        return 0.0
+        return base, False
+    if ms <= 0 or ref <= 0:
+        return base, False
+    scaled = base * (ms / ref) ** exp
+    return max(hard, min(base, scaled)), scaled < base
 
 
 def compute_base_demand(
@@ -463,6 +547,24 @@ def compute_base_demand(
         anchor = db.lookup_bts_anchor_weekly(o, d)
     except Exception:
         anchor = None
+
+    # BTS and T-100 list every city pair a carrier ever touched, so a one-off
+    # charter leaves an anchor of a few pax a week. Those beat gravity, collapse
+    # under Mode B and land on the floor -- HND-PUS showed 750/wk off an anchor of
+    # 3.35 where the model gives 3,838. Below the level the fit itself trusts
+    # (GRAVITY_MIN_WEEKLY) an anchor carries no signal: gravity disagrees with that
+    # band by ~209x, against 1.0x for anchors over 200/wk, which are informative
+    # and must be kept.
+    #
+    # The distance guard matters more than the threshold. On short pairs a
+    # near-zero anchor is *correct* -- ORD-MDW is 13nm apart and nobody flies it,
+    # but gravity knows nothing about driving and wants 8,120/wk. Only discard an
+    # anchor where a dead market cannot be explained by surface transport.
+    if anchor is not None:
+        min_credible = _fc("bts_min_credible_anchor", 10.0)
+        guard_nm = _fc("bts_anchor_discard_min_nm", 250.0)
+        if float(anchor) < min_credible and float(distance_nm) > guard_nm:
+            anchor = None
 
     legacy_b, legacy_l = legacy_base_demand(distance_nm, origin_airport, dest_airport)
     legacy_total = float(max(0, int(legacy_b)) + max(0, int(legacy_l)))
@@ -496,8 +598,9 @@ def compute_base_demand(
         }
 
     base_total = max(floor, base_total)
-    # Soft weekly pool floor (pax/week after eff_mult, before seasonality/logit).
-    min_pool = _fc("bts_min_weekly_pool", 500.0)
+    # Soft weekly pool floor (pax/week after eff_mult, before seasonality/logit),
+    # scaled down for pairs of small airports so thin routes stay distinguishable.
+    min_pool, _scaled = min_weekly_pool(origin_airport, dest_airport)
     eff = effective_demand_multiplier()
     market_floor_applied = False
     if min_pool > 0 and eff > 0:

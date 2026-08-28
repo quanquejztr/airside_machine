@@ -143,12 +143,16 @@ class TestBtsDbLoad(unittest.TestCase):
             gru_info = compute_base_demand(d_gru, jfk, gru)
             self.assertGreater(float(intl["base_total"]), float(gru_info["base_total"]))
 
-            # Foreign<->foreign has no anchor and must come from banded gravity,
+            # Foreign<->foreign with no anchor must come from banded gravity,
             # never LEGACY, and must not out-market a real anchored trunk route.
-            cdg = get_airport("CDG")
-            self.assertIsNotNone(cdg)
-            d_ff = haversine_distance(lhr["lat"], lhr["lon"], cdg["lat"], cdg["lon"])
-            ff = compute_base_demand(d_ff, lhr, cdg)
+            # Chinese domestic is the safe example: LHR-CDG used to serve here
+            # but Eurostat now anchors it, and no free source covers China.
+            pek = get_airport("PEK")
+            pvg = get_airport("PVG")
+            self.assertIsNotNone(pek)
+            self.assertIsNotNone(pvg)
+            d_ff = haversine_distance(pek["lat"], pek["lon"], pvg["lat"], pvg["lon"])
+            ff = compute_base_demand(d_ff, pek, pvg)
             self.assertEqual(ff["demand_source"], "GRAVITY")
             self.assertGreater(
                 ff["base_demand_business"] + ff["base_demand_leisure"], 0
@@ -165,7 +169,13 @@ class TestBtsDbLoad(unittest.TestCase):
             self.assertEqual(thin["demand_source"], "BTS")
             eff = effective_demand_multiplier()
             pool = float(thin["base_total"]) * eff
-            self.assertGreaterEqual(pool, min_pool * 0.99)
+            # The floor scales down with airport size, so compare against this
+            # pair's own floor rather than the configured hub-reference value.
+            from engine.route_demand import min_weekly_pool
+
+            pair_floor, _ = min_weekly_pool(tpa, san)
+            self.assertLessEqual(pair_floor, min_pool)
+            self.assertGreaterEqual(pool, pair_floor * 0.99)
             # Playable (fills a narrowbody daily) without running far past the real
             # market -- TPA-SAN carries ~540 pax/wk for real.
             week1 = int(preview_weekly_demand_before_open(tpa, san, d_thin)["total_pax"])
@@ -233,22 +243,40 @@ class TestBtsDbLoad(unittest.TestCase):
                 self.assertGreater(cur, prev)
                 prev = cur
 
-            # Betas rise with distance, which is what the joint fit measured.
-            self.assertLess(float(params["beta_short"]), float(params["beta_medium"]))
-            self.assertLess(float(params["beta_medium"]), float(params["beta_long"]))
+            # Long-haul decays fastest. Short and medium came out nearly equal
+            # once European short-haul entered the fit, so their relative order
+            # is not a property worth asserting -- only that both are positive
+            # and below the long-haul rate.
+            short = float(params["beta_short"])
+            medium = float(params["beta_medium"])
+            long_ = float(params["beta_long"])
+            self.assertGreater(short, 0.0)
+            self.assertGreater(medium, 0.0)
+            self.assertGreater(long_, short)
+            self.assertGreater(long_, medium)
 
             # No modelled market may exceed the per-band plausibility cap.
             def get(iata):
                 row = world.fetch_one("SELECT * FROM airports WHERE iata=?", (iata,))
                 return dict(row) if row else None
 
+            # Caps are stratified by the smaller of the two scores as well as by
+            # distance, so the ceiling must be looked up for this specific pair --
+            # calling it without a score asks for the thin-tier cap, which a pair
+            # of hubs is entitled to exceed.
             for o, d, nm in (("LHR", "CDG", 187.0), ("NRT", "ICN", 679.0), ("SYD", "SIN", 3399.0)):
                 a, b = get(o), get(d)
                 self.assertIsNotNone(a, f"{o} missing")
                 self.assertIsNotNone(b, f"{d} missing")
                 weekly = gravity_weekly(a, b, nm)
                 self.assertGreater(weekly, 0.0)
-                self.assertLessEqual(weekly, gravity_cap_weekly(nm) + 1e-6)
+                pair_cap = gravity_cap_weekly(
+                    nm, min_score=min(float(a["score"]), float(b["score"]))
+                )
+                self.assertGreater(pair_cap, 0.0)
+                self.assertLessEqual(weekly, pair_cap + 1e-6)
+                # A hub pair must not be held to the thin-tier ceiling.
+                self.assertGreaterEqual(pair_cap, gravity_cap_weekly(nm, min_score=0.0))
 
     def test_quantile_mapping_widens_spread_without_reordering(self):
         import sys
@@ -300,6 +328,125 @@ class TestBtsDbLoad(unittest.TestCase):
                 self.assertIsNotNone(row, f"{iata} missing from airports.csv")
                 self.assertGreater(float(row["score"]), 0)
                 self.assertNotEqual(float(row["lat"]), 0.0)
+
+    def test_korean_routes_are_anchored_not_modelled(self):
+        """Intra-Asian pairs from airportal.go.kr must resolve to real anchors."""
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import FreshGame
+
+        with FreshGame() as world:
+            from engine.route_demand import compute_base_demand
+
+            # Before the Korean import every one of these fell through to gravity,
+            # which under-predicts Asian trunk routes by an order of magnitude.
+            for origin, dest, low, high in (
+                ("ICN", "NRT", 20_000, 45_000),
+                ("ICN", "KIX", 20_000, 45_000),
+                ("ICN", "BKK", 15_000, 40_000),
+            ):
+                ao = dict(world.fetch_one("SELECT * FROM airports WHERE iata=?", (origin,)))
+                ad = dict(world.fetch_one("SELECT * FROM airports WHERE iata=?", (dest,)))
+                info = compute_base_demand(_nm(ao, ad), ao, ad)
+                self.assertEqual(
+                    info["demand_source"], "BTS", f"{origin}-{dest} lost its anchor"
+                )
+                self.assertFalse(info["market_floor_applied"])
+                weekly = info["anchor_weekly"]
+                self.assertIsNotNone(weekly)
+                self.assertGreaterEqual(weekly, low)
+                self.assertLessEqual(weekly, high)
+
+    def test_japanese_and_european_trunks_are_anchored(self):
+        """e-Stat and Eurostat must cover the busiest domestic/intra-EU markets."""
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import FreshGame
+
+        with FreshGame() as world:
+            from engine.route_demand import compute_base_demand
+
+            # HND-FUK and HND-CTS are among the busiest routes anywhere; gravity
+            # priced them at a few hundred a week before the Japanese import.
+            for origin, dest, low in (
+                ("HND", "FUK", 50_000),
+                ("HND", "CTS", 50_000),
+                ("LHR", "CDG", 8_000),
+                ("MAD", "BCN", 8_000),
+            ):
+                ao = dict(world.fetch_one("SELECT * FROM airports WHERE iata=?", (origin,)))
+                ad = dict(world.fetch_one("SELECT * FROM airports WHERE iata=?", (dest,)))
+                info = compute_base_demand(_nm(ao, ad), ao, ad)
+                self.assertEqual(
+                    info["demand_source"], "BTS", f"{origin}-{dest} is not anchored"
+                )
+                self.assertGreaterEqual(info["anchor_weekly"], low)
+
+    def test_junk_anchors_yield_to_gravity_only_when_far_apart(self):
+        """A charter-sized anchor must not beat the model, unless people can drive."""
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from helpers import FreshGame
+
+        with FreshGame() as world:
+            from engine.route_demand import compute_base_demand
+
+            def info(origin, dest):
+                ao = dict(world.fetch_one("SELECT * FROM airports WHERE iata=?", (origin,)))
+                ad = dict(world.fetch_one("SELECT * FROM airports WHERE iata=?", (dest,)))
+                return compute_base_demand(_nm(ao, ad), ao, ad)
+
+            # HND-PUS carries an anchor of ~3/wk, which used to collapse to the
+            # playability floor. Over water at 531nm there is no ground
+            # alternative, so the model should take over.
+            far = info("HND", "PUS")
+            self.assertEqual(far["demand_source"], "GRAVITY")
+            self.assertFalse(far["market_floor_applied"])
+            self.assertGreater(far["base_total"], 0)
+
+            # These are correct near-zero anchors, not junk: ORD-MDW is 13nm and
+            # BWI-IAD a short drive. Gravity wants thousands a week on both, so
+            # the anchor must win however small it is.
+            for origin, dest in (("ORD", "MDW"), ("BWI", "IAD"), ("SJC", "SMF")):
+                near = info(origin, dest)
+                self.assertEqual(
+                    near["demand_source"],
+                    "BTS",
+                    f"{origin}-{dest} is short enough to drive; anchor must hold",
+                )
+                self.assertTrue(near["market_floor_applied"])
+
+            # Anchors above the credibility threshold are untouched at any range.
+            for origin, dest in (("ICN", "PUS"), ("ATL", "LAX")):
+                keep = info(origin, dest)
+                self.assertEqual(keep["demand_source"], "BTS")
+                self.assertFalse(keep["market_floor_applied"])
+
+    def test_russian_far_east_is_asian_not_european(self):
+        """Vladivostok trades with Seoul, so ICN-VVO must not get a Europe prior."""
+        from engine.route_demand import _region
+
+        self.assertEqual(_region("RU", 131.9), "AS")  # VVO
+        self.assertEqual(_region("RU", 37.4), "EU")  # SVO
+        # Without a longitude we cannot tell them apart; keep the old default.
+        self.assertEqual(_region("RU"), "EU")
+
+
+def _nm(a: dict, b: dict) -> float:
+    import math
+
+    lat1, lat2 = math.radians(a["lat"]), math.radians(b["lat"])
+    h = (
+        math.sin((lat2 - lat1) / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(math.radians(b["lon"] - a["lon"]) / 2) ** 2
+    )
+    return 2 * 3440.065 * math.asin(math.sqrt(h))
 
 
 if __name__ == "__main__":

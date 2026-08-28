@@ -15,6 +15,7 @@ from engine.ai_gates import (
     seed_competitor_hub_gates,
     seed_spoke_gate_if_needed,
 )
+from engine.slots import seed_competitor_slot_capacity, slot_freq_cap
 from engine.ai_log import (
     append_ai_narrative,
     begin_ai_narrative,
@@ -244,12 +245,22 @@ def _growth_profile(competitor_id: str) -> Dict[str, Any]:
     if need_pnl is None:
         need_pnl = True
     exp = int(spec.get("expansion_rate") or 1)
+    # Tails added per evaluation. One was hardcoded, which caps growth at ~26
+    # aircraft a year however rich or aggressive a carrier is -- far too slow for
+    # a fleet ceiling in the hundreds to ever be approached.
+    fleet_growth = 2 if style == "aggressive" else 1
+    if g.get("fleet_growth_per_eval") is not None:
+        try:
+            fleet_growth = max(1, int(g["fleet_growth_per_eval"]))
+        except (TypeError, ValueError):
+            pass
     return {
         "style": style,
         "deepen_per_eval": deepen,
         "extra_exit_grace_weeks": extra,
         "require_flown_pnl_to_exit": bool(need_pnl),
         "expansion_rate": max(1, exp),
+        "fleet_growth_per_eval": fleet_growth,
     }
 
 
@@ -289,8 +300,14 @@ def _ai_stance(competitor_id: str, game_week: int) -> str:
         floor = float(_fc("ai_runway_weeks_premium", 16.0))
     else:
         floor = float(_fc("ai_runway_weeks_hubspoke", 20.0))
+    grace = int(_fc("ai_stance_grace_weeks", 4))
     if runway < floor or cash < 0:
-        desired = "CONSOLIDATE"
+        # Starter networks need a few weeks to fly before lease/utilization math
+        # looks sane; instant CONSOLIDATE froze the whole roster on week 1.
+        if gw <= grace and cash > 0:
+            desired = "GROW" if flown_net >= 0 else "DEFEND"
+        else:
+            desired = "CONSOLIDATE"
     elif contested_n >= 2 and agr >= 1.35 and runway > floor * 1.15 and flown_net >= 0:
         desired = "ATTACK"
     elif contested_n >= 1 and flown_net < 0:
@@ -316,7 +333,7 @@ def _ai_stance(competitor_id: str, game_week: int) -> str:
 def _stance_expand_cap(competitor_id: str, base_expansion: int) -> int:
     stance = _competitor_stance(competitor_id)
     if stance == "CONSOLIDATE":
-        return 0
+        return 1
     profile = _growth_profile(competitor_id)
     extra = 2 if str(profile["style"]) == "aggressive" else 1
     if stance == "GROW":
@@ -526,6 +543,33 @@ def _ensure_competitors_seeded_body() -> None:
         a, b = _route_pair_components(str(r["route_pair_id"]))
         seed_spoke_gate_if_needed(str(r["competitor_id"]), a)
         seed_spoke_gate_if_needed(str(r["competitor_id"]), b)
+    for row in db.fetch_all("SELECT competitor_id FROM competitors"):
+        _sync_competitor_slots(str(row["competitor_id"]), 1)
+
+
+def _airport_freq_map(competitor_id: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for r in db.fetch_all(
+        """
+        SELECT route_pair_id, frequency_per_week FROM competitor_routes
+        WHERE competitor_id = ? AND COALESCE(status, 'ACTIVE') IN ('ACTIVE', 'SUSPENDED')
+        """,
+        (str(competitor_id),),
+    ):
+        pair = str(r["route_pair_id"] or "")
+        parts = pair.split("-", 1)
+        if len(parts) != 2:
+            continue
+        freq = max(1, int(r["frequency_per_week"] or 1))
+        for ap in parts:
+            out[ap] = max(out.get(ap, 0), freq)
+    return out
+
+
+def _sync_competitor_slots(competitor_id: str, game_week: int | None = None) -> None:
+    gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    gw = int(game_week if game_week is not None else (gs["game_week"] if gs else 1))
+    seed_competitor_slot_capacity(str(competitor_id), _airport_freq_map(competitor_id), start_week=gw)
 
 
 def _seed_ai_fleet_for_competitor(competitor_id: str, fleet_size: int, strategy: str) -> None:
@@ -536,11 +580,24 @@ def _seed_ai_fleet_for_competitor(competitor_id: str, fleet_size: int, strategy:
     n = max(0, int(fleet_size))
     if n <= 0:
         return
-    # Simple type picks; ai_resolve_aircraft_type will refine later.
+    # Strategy-appropriate types; avoid always picking max-range (= max lease).
     if strategy == "PREMIUM":
-        pick = db.fetch_one("SELECT type_id FROM aircraft_types WHERE category = 'WIDE' ORDER BY range_nm DESC LIMIT 1")
+        pick = db.fetch_one(
+            "SELECT type_id FROM aircraft_types WHERE type_id = 'B789' LIMIT 1"
+        ) or db.fetch_one(
+            "SELECT type_id FROM aircraft_types WHERE category = 'WIDE' "
+            "ORDER BY weekly_lease_cost ASC LIMIT 1"
+        )
+    elif strategy == "BUDGET":
+        pick = db.fetch_one(
+            "SELECT type_id FROM aircraft_types WHERE type_id IN ('CRJ7','E175','A320') "
+            "ORDER BY weekly_lease_cost ASC LIMIT 1"
+        )
     else:
-        pick = db.fetch_one("SELECT type_id FROM aircraft_types WHERE category = 'NARROW' ORDER BY range_nm DESC LIMIT 1")
+        pick = db.fetch_one(
+            "SELECT type_id FROM aircraft_types WHERE type_id IN ('A320','B738') "
+            "ORDER BY weekly_lease_cost ASC LIMIT 1"
+        )
     type_id = str(pick["type_id"]) if pick and pick["type_id"] else "A320"
     for i in range(1, n + 1):
         tail = f"{cid.split('_')[-1][:2]}-{i:03d}"
@@ -805,6 +862,7 @@ def ai_full_evaluation(competitor_id: str, game_week: int) -> None:
             append_ai_narrative(cid, f"SKIPPED:{pair}:score{float(sc):.2f}<{thresh:.2f}")
             break
     db.execute("UPDATE competitors SET last_evaluation_week = ? WHERE competitor_id = ?", (gw, cid))
+    _sync_competitor_slots(cid, gw)
 
 
 def ai_generate_candidates(competitor_id: str) -> List[str]:
@@ -1034,8 +1092,11 @@ def ai_score_candidate(competitor_id: str, route_pair_id: str, game_week: int) -
     strat = str(comp["strategy"] or "HUBSPOKE").upper()
     risk = float(comp["risk_tolerance"] or 0.5)
 
-    # Component 1 demand
-    est_pax = (float(rt["base_demand_business"] or 0) + float(rt["base_demand_leisure"] or 0)) * 2.0
+    # Component 1 demand — calibrated pool, not the legacy template on routes.
+    from engine.ai_economics import _live_route_bases
+
+    base_b, base_l = _live_route_bases(dict(rt))
+    est_pax = (base_b + base_l) * 2.0
     demand_score = min(1.0, est_pax / 1600.0)
 
     # Entry fares vs real market (player listed) or distance reference — never placeholder.
@@ -1180,15 +1241,27 @@ def ai_score_candidate(competitor_id: str, route_pair_id: str, game_week: int) -
         comp_score *= max(0.15, 1.0 - 0.07 * cooldown)
 
     profit_floor = mp * (1.0 - risk)
+    thresh = 0.50 + (1.0 - risk) * 0.20
     reason = None
+    stance_now = str((comp["stance"] if "stance" in comp.keys() else None) or "GROW").upper()
     if est_profit < profit_floor:
-        comp_score = 0.0
-        reason = "PROFIT_FLOOR"
+        if stance_now == "CONSOLIDATE":
+            comp_score = 0.0
+            reason = "PROFIT_FLOOR"
+        elif stance_now in ("GROW", "ATTACK") and (
+            demand_score >= 0.12 or network_fit >= 0.99
+        ):
+            # Marginal-route PnL is pessimistic while most of the fleet is idle;
+            # hub spokes with real demand should still enter the queue.
+            comp_score = max(comp_score, thresh + 0.05)
+            reason = "GROWTH_DEMAND"
+        else:
+            comp_score *= max(0.2, 1.0 + (est_profit / max(1.0, abs(profit_floor))))
+            reason = "PROFIT_SOFT"
     elif not hours_ok and not owned:
         reason = "NO_HOURS"
 
     decision = "PENDING"
-    thresh = 0.50 + (1.0 - risk) * 0.20
     if comp_score >= thresh:
         decision = "WATCHING"
     elif reason is None and comp_score > 0:
@@ -1572,6 +1645,8 @@ def _open_queued_candidates(competitor_id: str, game_week: int) -> None:
         )
         append_ai_narrative(cid, f"OPENED:{pair}:{freq}x")
         push_ai_news(f"✈ {competitor_display_name(cid)} opens {pair} {freq}x/wk")
+    if opened:
+        _sync_competitor_slots(cid, gw)
 
 
 def _remove_closed_routes(competitor_id: str, game_week: int) -> None:
@@ -1694,6 +1769,8 @@ def _deepen_existing_routes(competitor_id: str, game_week: int) -> None:
         opened = int(r["opened_week"] or 1)
         tid = str(r["aircraft_type_id"] or ai_resolve_aircraft_type(cid, pair) or "A320")
         cap = _max_freq_for_type(tid, strat)
+        origin, dest = _route_pair_components(pair)
+        cap = min(cap, slot_freq_cap(cid, origin, dest, gw))
         prow = db.fetch_one(
             "SELECT COUNT(*) AS c FROM flight_schedules WHERE route_id IN (?, ?) AND COALESCE(active,1)=1",
             (out_id, in_id),
@@ -1706,7 +1783,6 @@ def _deepen_existing_routes(competitor_id: str, game_week: int) -> None:
             lf = float(_rget(r, "actual_lf_avg", 0) or 0) or None
         if lf is None:
             continue
-        origin, dest = _route_pair_components(pair)
         extra_h = _hours_to_add_pair(cid, pair, 1, tid)
         if lf > 0.72 and freq < cap and deepened < deepen_cap and gw > opened:
             if used_h + extra_h > cap_h + 0.5:
@@ -1740,6 +1816,8 @@ def _deepen_existing_routes(competitor_id: str, game_week: int) -> None:
             )
             append_ai_narrative(cid, f"THINNED:{pair}:{freq}->{new_freq}x")
             thinned += 1
+    if deepened:
+        _sync_competitor_slots(cid, gw)
 
 
 def _gate_demand_map(competitor_id: str, game_week: int) -> Dict[str, Dict[str, float]]:
@@ -1953,13 +2031,28 @@ def _fleet_growth_decision(competitor_id: str, game_week: int) -> None:
     years = 3.0 if style == "aggressive" else 5.0
     if cash < (weekly * 52.0 * years):
         return
-    tail = f"{cid.split('_')[-1][:2]}-{fs + 1:03d}"
+    # Headroom is rechecked per tail so max_fleet_size still binds exactly, and
+    # the affordability test is re-run because each aircraft adds lease cost.
+    want = int(_growth_profile(cid)["fleet_growth_per_eval"])
+    added = 0
+    for i in range(max(1, want)):
+        if fs + i >= mx:
+            break
+        if cash < (weekly * 52.0 * years * (i + 1)):
+            break
+        tail = f"{cid.split('_')[-1][:2]}-{fs + i + 1:03d}"
+        db.execute(
+            "INSERT OR REPLACE INTO ai_fleet (ai_tail, competitor_id, type_id, status, assigned_route_pair_id) VALUES (?, ?, ?, 'ACTIVE', NULL)",
+            (tail, cid, type_id),
+        )
+        added += 1
+    if not added:
+        return
     db.execute(
-        "INSERT OR REPLACE INTO ai_fleet (ai_tail, competitor_id, type_id, status, assigned_route_pair_id) VALUES (?, ?, ?, 'ACTIVE', NULL)",
-        (tail, cid, type_id),
+        "UPDATE competitors SET fleet_size = fleet_size + ? WHERE competitor_id = ?",
+        (added, cid),
     )
-    db.execute("UPDATE competitors SET fleet_size = fleet_size + 1 WHERE competitor_id = ?", (cid,))
-    append_ai_narrative(cid, f"FLEET+1:{type_id}:{target_pair}")
+    append_ai_narrative(cid, f"FLEET+{added}:{type_id}:{target_pair}")
 
 
 def _decrement_cooldowns(competitor_id: str, game_week: int) -> None:

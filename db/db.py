@@ -196,7 +196,8 @@ def _delete_table_rows(table: str) -> None:
 def purge_all_player_game_data():
     """
     Remove all dynamic gameplay rows (flights, fleet, routes, ledgers, AI ops, etc.).
-    Static reference data (airports, aircraft types, constants, competitor identities) is kept.
+    Static reference data (airports, aircraft types, constants) is kept.
+    AI competitor rows are wiped too; re-seed from data/competitors.json after purge.
     Call before inserting a new airline so no ghost flights/routes remain.
     """
     for table in (
@@ -228,6 +229,7 @@ def purge_all_player_game_data():
         "ai_fleet",
         "competitor_bids",
         "competitor_routes",
+        "competitors",
     ):
         _delete_table_rows(table)
     execute("DELETE FROM airline WHERE id = 1")
@@ -417,6 +419,10 @@ def load_bts_demand_anchors_if_empty() -> int:
     expected_methods = {
         "bts_trend_wm_max_recent_v2",
         "t100i_trend_wm_max_recent_v2",
+        "kr_trend_wm_max_recent_v2",
+        "jp_trend_wm_max_recent_v2",
+        "eu_trend_wm_max_recent_v2",
+        "au_trend_wm_max_recent_v2",
     }
     row = fetch_one("SELECT COUNT(*) AS n FROM bts_demand_anchors")
     n = int(row["n"] or 0) if row else 0

@@ -44,6 +44,9 @@ ai_hub_radius_nm,2500
 ai_price_undercut_pct,0.08
 ai_price_recover_pct,0.03
 ai_suspension_threshold,0.15
+ai_stance_grace_weeks,4
+ai_lease_utilization_floor,0.35
+ai_slot_seed_weeks,16
 gate_auction_score_threshold,1080000
 gate_utilization_threshold,0.80
 gate_utilization_threshold_hub,0.06
@@ -57,6 +60,11 @@ bts_growth_rate,0.02
 bts_decay_lambda,0.85
 bts_base_demand_floor,5
 bts_min_weekly_pool,750
+bts_min_credible_anchor,10
+bts_anchor_discard_min_nm,250
+bts_floor_score_ref,1200000
+bts_floor_score_exponent,0.435
+bts_floor_min_weekly,250
 bts_gravity_k,0.0000071501
 bts_gravity_alpha,0.8134
 bts_gravity_beta,1.20
@@ -66,4 +74,4 @@ bts_gravity_beta_long,0.8936
 bts_gravity_band1_nm,800
 bts_gravity_band2_nm,3000
 bts_small_small_damp,1.0
-bts_gravity_quantile_blend,0.5
+bts_gravity_quantile_blend,0.75
