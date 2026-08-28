@@ -7,8 +7,9 @@ Two kinds of world:
                   airline created. Deterministic, independent of whatever is in your save.
                   Use this for end-to-end tests.
 
-  live_copy()   — a throwaway copy of db/airline_sim.db. Use when a test wants realistic
-                  accumulated state (an AI network, existing routes).
+  live_copy()   — a throwaway copy of db/airline_sim.db when that file exists locally.
+                  In CI (no save checked in) it bootstraps a fresh game instead so the
+                  same tests still run.
 
 Both repoint db.DB_FILE at a temp file and restore it on exit. Neither ever writes to
 db/airline_sim.db.
@@ -186,6 +187,38 @@ class _World:
         return False
 
 
+def _bootstrap_fresh_db(
+    world: _World,
+    *,
+    hub: str = "TPA",
+    callsign: str = "TST",
+    name: str = "Test Air",
+    cash: float | None = None,
+) -> None:
+    """Schema + seed + airline in world.path (used by FreshGame and CI LiveCopy fallback)."""
+    con = sqlite3.connect(world.path)
+    try:
+        con.executescript(SCHEMA.read_text())
+        con.commit()
+    finally:
+        con.close()
+    from db.seed import run_seed
+
+    with _quiet():
+        run_seed(world.path)
+    world.db.ensure_schema_migrations()
+    from engine import setup
+
+    with _quiet():
+        setup.create_airline(name=name, callsign=callsign, home_hub_iata=hub.upper())
+    base = world.db.get_financial_constant("fuel_base_price_bbl") or 195.0
+    world.db.execute(
+        "UPDATE game_state SET fuel_price_current = ? WHERE id = 1", (float(base),)
+    )
+    if cash is not None:
+        world.db.execute("UPDATE airline SET cash = ? WHERE id = 1", (float(cash),))
+
+
 class FreshGame(_World):
     """
     A new world: schema + seed + airline. Clock is paused at hour 0, week 1.
@@ -201,24 +234,13 @@ class FreshGame(_World):
         self._build(cash)
 
     def _build(self, cash):
-        con = sqlite3.connect(self.path)
-        try:
-            con.executescript(SCHEMA.read_text())
-            con.commit()
-        finally:
-            con.close()
-        from db.seed import run_seed
-        with _quiet():
-            run_seed(self.path)
-        self.db.ensure_schema_migrations()
-        from engine import setup
-        with _quiet():
-            setup.create_airline(name=self.name, callsign=self.callsign, home_hub_iata=self.hub)
-        # create_airline seeds fuel at 2.50 (a $/bbl column); normalise so fuel maths is sane.
-        base = self.db.get_financial_constant("fuel_base_price_bbl") or 195.0
-        self.db.execute("UPDATE game_state SET fuel_price_current = ? WHERE id = 1", (float(base),))
-        if cash is not None:
-            self.db.execute("UPDATE airline SET cash = ? WHERE id = 1", (float(cash),))
+        _bootstrap_fresh_db(
+            self,
+            hub=self.hub,
+            callsign=self.callsign,
+            name=self.name,
+            cash=cash,
+        )
 
     # ---- builders -------------------------------------------------------
     def lease(self, type_id="B738", tail=None):
@@ -286,12 +308,16 @@ class FreshGame(_World):
 
 
 class LiveCopy(_World):
-    """A disposable copy of the real save, for tests that want accumulated state."""
+    """Disposable copy of the real save, or a fresh bootstrap when no save exists (CI)."""
 
     def __init__(self):
         super().__init__()
         self._start()
-        shutil.copy2(LIVE_DB, self.path)
+        if LIVE_DB.is_file():
+            shutil.copy2(LIVE_DB, self.path)
+            self.db.ensure_schema_migrations()
+        else:
+            _bootstrap_fresh_db(self)
         self.db._migrations_done = False
 
 
