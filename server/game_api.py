@@ -561,6 +561,38 @@ def player_routes_overview() -> dict:
         origin = airports.get_airport(str(rt["origin_iata"]))
         dest = airports.get_airport(str(rt["dest_iata"]))
         flights = ops_by_route.get(rid) or []
+        src = str(rt.get("demand_source") or "")
+        floored = False
+        try:
+            from engine.demand_display import floor_flag_for_route, source_badge
+
+            src2, floored = floor_flag_for_route(
+                str(rt["origin_iata"]),
+                str(rt["dest_iata"]),
+                dist,
+                origin_airport=dict(origin) if origin else None,
+                dest_airport=dict(dest) if dest else None,
+            )
+            if src2:
+                src = src2
+            badge = source_badge(src)
+        except Exception:
+            badge = src or "—"
+        remaining_cabin = None
+        try:
+            from engine.scheduling import route_weekly_passenger_accounting
+
+            acct = route_weekly_passenger_accounting(rid, gw)
+            if acct:
+                rc = acct.get("remaining_cabin_demand") or {}
+                remaining_cabin = {
+                    "F": int(rc.get("F") or 0),
+                    "J": int(rc.get("J") or 0),
+                    "W": int(rc.get("W") or 0),
+                    "Y": int(rc.get("Y") or 0),
+                }
+        except Exception:
+            remaining_cabin = None
         out.append(
             {
                 "route_id": rid,
@@ -573,6 +605,10 @@ def player_routes_overview() -> dict:
                 "flight_hours_estimated": not bool(hours),
                 "base_demand_business": int(rt.get("base_demand_business") or 0),
                 "base_demand_leisure": int(rt.get("base_demand_leisure") or 0),
+                "remaining_cabin": remaining_cabin,
+                "demand_source": src,
+                "demand_source_badge": badge,
+                "market_floor_applied": bool(floored),
                 "price_leisure": float(rt.get("price_leisure") or 0),
                 "price_premium_economy": float(rt.get("price_premium_economy") or 0),
                 "price_business": float(rt.get("price_business") or 0),
@@ -627,12 +663,28 @@ def _route_preview_detail(origin: str, dest: str, prev: dict) -> dict:
 
         if o and d and dist > 0:
             dem = preview_weekly_demand_before_open(dict(o), dict(d), dist)
+            from engine.demand_display import summary_from_preview
+
+            summary = summary_from_preview(dem)
             out["demand"] = {
                 "business_pax": int(dem.get("business_pax") or 0),
                 "leisure_pax": int(dem.get("leisure_pax") or 0),
                 "total_pax": int(dem.get("total_pax") or 0),
+                "weekly_market_total": int(summary.get("weekly_market_total") or 0),
+                "base_demand_business": int(dem.get("base_demand_business") or 0),
+                "base_demand_leisure": int(dem.get("base_demand_leisure") or 0),
+                "demand_source": str(summary.get("demand_source") or ""),
+                "demand_source_badge": str(summary.get("demand_source_badge") or ""),
+                "market_floor_applied": bool(summary.get("market_floor_applied")),
+                "economy_pax": int(dem.get("economy_pax") or 0),
+                "premium_economy_pax": int(dem.get("premium_economy_pax") or 0),
+                "business_cabin_pax": int(dem.get("business_cabin_pax") or 0),
+                "first_pax": int(dem.get("first_pax") or 0),
+                "game_week": dem.get("game_week"),
+                "current_month": dem.get("current_month"),
                 "price_leisure_default": float(dem.get("price_leisure_default") or 0.0),
                 "price_business_default": float(dem.get("price_business_default") or 0.0),
+                "labels": summary.get("labels") or {},
             }
     except Exception:
         pass
@@ -713,6 +765,43 @@ def route_detail(route_id: str) -> dict:
         from engine.demand import estimate_route_performance
 
         raw = estimate_route_performance(rid)
+        from engine.demand_display import build_demand_summary, floor_flag_for_route
+
+        src = str(rt.get("demand_source") or "")
+        floored = False
+        try:
+            src2, floored = floor_flag_for_route(
+                str(rt["origin_iata"]),
+                str(rt["dest_iata"]),
+                float(rt.get("distance_nm") or 0),
+            )
+            if src2:
+                src = src2
+        except Exception:
+            pass
+        gw = cm = None
+        try:
+            gs = db.fetch_one("SELECT game_week, current_month FROM game_state WHERE id = 1")
+            if gs:
+                gw, cm = gs.get("game_week"), gs.get("current_month")
+        except Exception:
+            pass
+        summary = build_demand_summary(
+            business_pax=raw.get("business_pax"),
+            leisure_pax=raw.get("leisure_pax"),
+            demand_source=src,
+            market_floor_applied=floored,
+            base_demand_business=rt.get("base_demand_business"),
+            base_demand_leisure=rt.get("base_demand_leisure"),
+            economy_pax=raw.get("economy_pax"),
+            premium_economy_pax=raw.get("premium_economy_pax"),
+            business_cabin_pax=raw.get("business_cabin_pax"),
+            first_pax=raw.get("first_pax"),
+            weekly_market_total=raw.get("weekly_market_total"),
+            aircraft_fill_pax=raw.get("aircraft_fill_pax", raw.get("total_pax")),
+            game_week=gw,
+            current_month=cm,
+        )
         perf = {
             "business_pax": int(raw.get("business_pax") or 0),
             "leisure_pax": int(raw.get("leisure_pax") or 0),
@@ -725,6 +814,12 @@ def route_detail(route_id: str) -> dict:
             "pax_business": int(raw.get("pax_business") or 0),
             "pax_first": int(raw.get("pax_first") or 0),
             "total_pax": int(raw.get("total_pax") or 0),
+            "weekly_market_total": int(summary.get("weekly_market_total") or 0),
+            "aircraft_fill_pax": int(summary.get("aircraft_fill_pax") or 0),
+            "demand_source": str(summary.get("demand_source") or ""),
+            "demand_source_badge": str(summary.get("demand_source_badge") or ""),
+            "market_floor_applied": bool(summary.get("market_floor_applied")),
+            "labels": summary.get("labels") or {},
             "load_factor": float(raw.get("load_factor") or 0),
             "revenue_economy": float(raw.get("revenue_economy") or 0),
             "revenue_premium_economy": float(raw.get("revenue_premium_economy") or 0),
@@ -777,6 +872,7 @@ def route_detail(route_id: str) -> dict:
                 "price_first": float(rt.get("price_first") or 0),
                 "base_demand_business": int(rt.get("base_demand_business") or 0),
                 "base_demand_leisure": int(rt.get("base_demand_leisure") or 0),
+                "demand_source": str(rt.get("demand_source") or ""),
             },
             "schedule": sched,
             "performance": perf,

@@ -1,0 +1,19 @@
+{
+  "ref_year": 2019,
+  "growth_rate": 0.02,
+  "decay_lambda": 0.85,
+  "exclude_years": [
+    2020,
+    2021
+  ],
+  "skipped_duplicate_files": [],
+  "method": "grid_search_log_mse",
+  "k": 0.0001564,
+  "alpha": 0.8,
+  "beta": 0.95,
+  "small_small_damp": 0.854,
+  "fit_points": 4492,
+  "small_small_pairs": 83,
+  "log_sse": 13846.68,
+  "min_weekly_for_fit": 10.0
+}

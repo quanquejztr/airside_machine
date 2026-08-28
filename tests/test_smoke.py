@@ -61,7 +61,7 @@ DATA = ROOT / "data"
 # Shared fixtures own the DB redirection: they also reset db.py's cached per-thread
 # connection, without which every test after the first reads the previous world.
 from helpers import live_copy as TempSave  # noqa: E402
-from helpers import fresh_game, near_airports, pick_type  # noqa: E402
+from helpers import FreshGame, fresh_game, near_airports, pick_type  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +958,29 @@ class TestAIWiring(unittest.TestCase):
                 "SELECT competitor_id, error FROM ai_turn_log WHERE game_week=? AND error IS NOT NULL",
                 (week,))
             self.assertEqual([], [f"{r['competitor_id']}: {r['error']}" for r in errs])
+
+    def test_reset_airline_reseeds_competitors_from_json(self):
+        with FreshGame(hub="SGN", callsign="VNA", name="VNA") as world:
+            from engine import setup
+            from engine.ai import load_competitor_specs
+
+            spec = next(s for s in load_competitor_specs() if s["competitor_id"] == "AI_TITAN")
+            world.execute(
+                "UPDATE competitors SET cash = ?, fleet_size = ?, stance = 'CONSOLIDATE' WHERE competitor_id = ?",
+                (8_500_000_000.0, 120, "AI_TITAN"),
+            )
+            setup.reset_airline()
+            row = world.fetch_one(
+                "SELECT cash, fleet_size, stance FROM competitors WHERE competitor_id = 'AI_TITAN'"
+            )
+            self.assertIsNotNone(row)
+            self.assertAlmostEqual(float(row["cash"]), float(spec["cash"]), places=0)
+            self.assertEqual(int(row["fleet_size"]), int(spec["fleet_size"]))
+            self.assertEqual(str(row["stance"]).upper(), "GROW")
+            routes = world.fetch_one(
+                "SELECT COUNT(*) AS n FROM competitor_routes WHERE competitor_id = 'AI_TITAN'"
+            )["n"]
+            self.assertGreater(routes, 0, "starter network should be re-seeded after reset")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,34 @@ def _landing_or_gate(iata: str, mtow_lbs: float, kind: str) -> float:
     return float(cat["gate_fee"] or 0.0) if cat else 0.0
 
 
+def _live_route_bases(route: Dict[str, Any]) -> tuple[float, float]:
+    """
+    Weekly one-way business/leisure bases from the calibrated demand model.
+
+    The routes table still carries legacy template numbers from when the route was
+    first opened; BTS/Eurostat anchors can be 25x larger. Scoring and PnL must use
+    the same pool players see or every candidate looks unprofitable.
+    """
+    from engine.route_demand import compute_base_demand
+
+    o = str(route.get("origin_iata") or "").upper()
+    d = str(route.get("dest_iata") or "").upper()
+    if not o or not d:
+        return float(route.get("base_demand_business") or 0), float(
+            route.get("base_demand_leisure") or 0
+        )
+    ao = db.fetch_one("SELECT * FROM airports WHERE iata = ?", (o,))
+    ad = db.fetch_one("SELECT * FROM airports WHERE iata = ?", (d,))
+    if not ao or not ad:
+        return float(route.get("base_demand_business") or 0), float(
+            route.get("base_demand_leisure") or 0
+        )
+    info = compute_base_demand(float(route.get("distance_nm") or 0.0), dict(ao), dict(ad))
+    return float(info.get("base_demand_business") or 0), float(
+        info.get("base_demand_leisure") or 0
+    )
+
+
 def _market_demand(
     route: Dict[str, Any],
     fare_business: float,
@@ -130,14 +158,9 @@ def _market_demand(
     scale = _passenger_demand_multiplier()
     bus_seg = _demand_segment_multiplier("business")
     lei_seg = _demand_segment_multiplier("leisure")
-    demand_b = (
-        float(route["base_demand_business"] or 0)
-        * sb * pb * scale * bus_seg
-    )
-    demand_l = (
-        float(route["base_demand_leisure"] or 0)
-        * sl * pl * scale * lei_seg
-    )
+    base_b, base_l = _live_route_bases(route)
+    demand_b = base_b * sb * pb * scale * bus_seg
+    demand_l = base_l * sl * pl * scale * lei_seg
     return max(0.0, demand_b), max(0.0, demand_l)
 
 
@@ -326,24 +349,19 @@ def one_leg_pnl(
 
 
 def charge_weekly_fixed_costs(competitor_id: str) -> float:
-    """Debit weekly lease for every ACTIVE ai_fleet tail. Called once per settlement week."""
+    """
+    Debit weekly lease scaled by utilization.
+
+    Charging the full catalog lease on every tail on day one made runway negative
+    before the first flight — 8x B737ER is $7.2M/wk against $60M cash. Idle
+    tails still cost money (parking, insurance) but not the full operating lease.
+    """
     cid = str(competitor_id)
-    rows = db.fetch_all(
-        """
-        SELECT t.weekly_lease_cost
-        FROM ai_fleet f
-        JOIN aircraft_types t ON t.type_id = f.type_id
-        WHERE f.competitor_id = ? AND COALESCE(f.status, 'ACTIVE') = 'ACTIVE'
-        """,
-        (cid,),
-    )
-    total = 0.0
-    for r in rows or []:
-        total += float(r["weekly_lease_cost"] or 0.0)
-    if total <= 0:
+    charge = weekly_fixed_cost(cid)
+    if charge <= 0:
         return 0.0
-    db.execute("UPDATE competitors SET cash = cash - ? WHERE competitor_id = ?", (total, cid))
-    return total
+    db.execute("UPDATE competitors SET cash = cash - ? WHERE competitor_id = ?", (charge, cid))
+    return charge
 
 
 def weekly_fixed_cost(competitor_id: str) -> float:
@@ -356,7 +374,15 @@ def weekly_fixed_cost(competitor_id: str) -> float:
         """,
         (str(competitor_id),),
     )
-    return float(row["s"] or 0.0) if row else 0.0
+    total = float(row["s"] or 0.0) if row else 0.0
+    if total <= 0:
+        return 0.0
+    used = fleet_block_hours_used(str(competitor_id))
+    cap = fleet_block_hours_cap(str(competitor_id))
+    floor = float(_fc("ai_lease_utilization_floor", 0.35))
+    if cap <= 0 or used <= 0:
+        return total * floor
+    return total * max(floor, min(1.0, used / cap))
 
 
 def fleet_block_hours_used(competitor_id: str) -> float:

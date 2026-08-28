@@ -139,6 +139,12 @@ def execute(query, params=()):
         cursor.execute(query, params)
 
 
+def executemany(query, params_seq):
+    """Execute the same statement for a sequence of parameter tuples."""
+    with get_cursor() as cursor:
+        cursor.executemany(query, params_seq)
+
+
 def get_airport(iata):
     """Get airport by IATA code."""
     return fetch_one("SELECT * FROM airports WHERE iata = ?", (iata,))
@@ -190,7 +196,8 @@ def _delete_table_rows(table: str) -> None:
 def purge_all_player_game_data():
     """
     Remove all dynamic gameplay rows (flights, fleet, routes, ledgers, AI ops, etc.).
-    Static reference data (airports, aircraft types, constants, competitor identities) is kept.
+    Static reference data (airports, aircraft types, constants) is kept.
+    AI competitor rows are wiped too; re-seed from data/competitors.json after purge.
     Call before inserting a new airline so no ghost flights/routes remain.
     """
     for table in (
@@ -222,6 +229,7 @@ def purge_all_player_game_data():
         "ai_fleet",
         "competitor_bids",
         "competitor_routes",
+        "competitors",
     ):
         _delete_table_rows(table)
     execute("DELETE FROM airline WHERE id = 1")
@@ -270,6 +278,250 @@ def sync_financial_constants_from_csv():
             "INSERT OR REPLACE INTO financial_constants (key, value) VALUES (?, ?)",
             (key, val),
         )
+
+
+def _ensure_bts_demand_anchors_table() -> None:
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS bts_demand_anchors (
+            origin_iata TEXT NOT NULL,
+            dest_iata TEXT NOT NULL,
+            anchor_annual REAL NOT NULL,
+            anchor_weekly REAL NOT NULL,
+            years_used INTEGER,
+            first_year INTEGER,
+            last_year INTEGER,
+            method TEXT,
+            PRIMARY KEY (origin_iata, dest_iata)
+        )
+        """
+    )
+    execute(
+        "CREATE INDEX IF NOT EXISTS idx_bts_anchors_dest ON bts_demand_anchors(dest_iata)"
+    )
+
+
+def sync_bts_gravity_constants_from_json() -> None:
+    """
+    Overlay fitted gravity parameters into financial_constants (runtime reads the
+    DB, not the JSON files).
+
+    Two files feed this. bts_gravity_params.json holds the ingest settings and the
+    legacy single-beta fit; gravity_bands.json holds the Phase 6 banded fit and
+    wins on any key they share, since it is fitted on both anchor sets. The banded
+    region-prior matrix cannot be expressed as scalar constants and is read
+    directly from JSON by engine.route_demand.
+    """
+    import json
+
+    base = Path(__file__).resolve().parent.parent / "data"
+
+    def _read(name: str) -> dict:
+        path = base / name
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
+
+    raw = _read("bts_gravity_params.json")
+    bands = _read("gravity_bands.json")
+    if not raw and not bands:
+        return
+
+    mapping = {
+        "bts_gravity_k": raw.get("k"),
+        "bts_gravity_alpha": raw.get("alpha"),
+        "bts_gravity_beta": raw.get("beta"),
+        "bts_small_small_damp": raw.get("small_small_damp"),
+        "bts_ref_year": raw.get("ref_year"),
+        "bts_growth_rate": raw.get("growth_rate"),
+        "bts_decay_lambda": raw.get("decay_lambda"),
+    }
+    if bands:
+        mapping.update(
+            {
+                "bts_gravity_k": bands.get("k"),
+                "bts_gravity_alpha": bands.get("alpha"),
+                "bts_small_small_damp": bands.get("small_small_damp"),
+                "bts_gravity_beta_short": bands.get("beta_short"),
+                "bts_gravity_beta_medium": bands.get("beta_medium"),
+                "bts_gravity_beta_long": bands.get("beta_long"),
+                "bts_gravity_band1_nm": bands.get("band1_nm"),
+                "bts_gravity_band2_nm": bands.get("band2_nm"),
+            }
+        )
+
+    for key, val in mapping.items():
+        if val is None:
+            continue
+        try:
+            execute(
+                "INSERT OR REPLACE INTO financial_constants (key, value) VALUES (?, ?)",
+                (key, float(val)),
+            )
+        except (TypeError, ValueError):
+            continue
+
+
+def add_missing_airports_from_csv() -> int:
+    """
+    Insert airports present in data/airports.csv but absent from the save.
+
+    Seeding only runs on an empty table, so a save created before an airports.csv
+    update never sees the new entries — Phase 6 added 51 international hubs that
+    existing games could not fly to at all. Insert-only by design: player-facing
+    columns (fee overrides, curfews) and any hand-edited rows are left untouched.
+    """
+    from db.seed import load_csv
+
+    rows = load_csv("airports.csv")
+    if not rows:
+        return 0
+    have = {
+        str(r["iata"]) for r in fetch_all("SELECT iata FROM airports") if r["iata"]
+    }
+    cols = [
+        "iata", "icao", "name", "city", "country", "lat", "lon",
+        "runway_length_ft", "gate_count", "timezone", "score", "category",
+    ]
+    placeholders = ",".join("?" * len(cols))
+    added = 0
+    for r in rows:
+        iata = str(r.get("iata") or "").strip()
+        if not iata or iata in have:
+            continue
+        try:
+            execute(
+                f"INSERT INTO airports ({','.join(cols)}) VALUES ({placeholders})",
+                tuple((r.get(c) or None) for c in cols),
+            )
+            added += 1
+        except sqlite3.Error:
+            continue
+    return added
+
+
+def load_bts_demand_anchors_if_empty() -> int:
+    """
+    Bulk-load data/bts_demand_anchors.csv when the reference table is empty
+    or still on an older calibration method tag.
+
+    Returns number of rows inserted (0 if skipped or file missing).
+    """
+    import csv
+
+    _ensure_bts_demand_anchors_table()
+    # Phase 6: the table now holds two calibrations (US domestic from DB1B and
+    # international from T-100). Both tags must be present, otherwise the table
+    # predates the merge and needs a full reload.
+    expected_methods = {
+        "bts_trend_wm_max_recent_v2",
+        "t100i_trend_wm_max_recent_v2",
+        "kr_trend_wm_max_recent_v2",
+        "jp_trend_wm_max_recent_v2",
+        "eu_trend_wm_max_recent_v2",
+        "au_trend_wm_max_recent_v2",
+    }
+    row = fetch_one("SELECT COUNT(*) AS n FROM bts_demand_anchors")
+    n = int(row["n"] or 0) if row else 0
+    if n > 0:
+        present = {
+            str(r["method"] or "")
+            for r in fetch_all("SELECT DISTINCT method FROM bts_demand_anchors")
+        }
+        if expected_methods <= present:
+            return 0
+        # Stale calibration — replace with regenerated CSV.
+        execute("DELETE FROM bts_demand_anchors")
+
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "bts_demand_anchors.csv"
+    if not csv_path.is_file():
+        return 0
+
+    batch: list[tuple] = []
+    inserted = 0
+
+    def _opt_int(val) -> int | None:
+        if val is None or str(val).strip() == "":
+            return None
+        return int(float(val))
+
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            o = str(row.get("origin_iata") or "").strip().upper()
+            d = str(row.get("dest_iata") or "").strip().upper()
+            if not o or not d:
+                continue
+            batch.append(
+                (
+                    o,
+                    d,
+                    float(row.get("anchor_annual") or 0),
+                    float(row.get("anchor_weekly") or 0),
+                    _opt_int(row.get("years_used")),
+                    _opt_int(row.get("first_year")),
+                    _opt_int(row.get("last_year")),
+                    str(row.get("method") or "").strip() or None,
+                )
+            )
+            if len(batch) >= 5000:
+                executemany(
+                    """
+                    INSERT OR REPLACE INTO bts_demand_anchors (
+                        origin_iata, dest_iata, anchor_annual, anchor_weekly,
+                        years_used, first_year, last_year, method
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    batch,
+                )
+                inserted += len(batch)
+                batch.clear()
+    if batch:
+        executemany(
+            """
+            INSERT OR REPLACE INTO bts_demand_anchors (
+                origin_iata, dest_iata, anchor_annual, anchor_weekly,
+                years_used, first_year, last_year, method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            batch,
+        )
+        inserted += len(batch)
+    return inserted
+
+
+def lookup_bts_anchor_weekly(origin_iata: str, dest_iata: str):
+    """Return anchor_weekly for a directional US pair, or None if unknown."""
+    o = str(origin_iata or "").strip().upper()
+    d = str(dest_iata or "").strip().upper()
+    if not o or not d:
+        return None
+    row = fetch_one(
+        """
+        SELECT anchor_weekly FROM bts_demand_anchors
+        WHERE origin_iata = ? AND dest_iata = ?
+        """,
+        (o, d),
+    )
+    if not row or row["anchor_weekly"] is None:
+        return None
+    try:
+        val = float(row["anchor_weekly"])
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
+def bts_demand_anchors_loaded() -> int:
+    """Row count in bts_demand_anchors (0 if table missing)."""
+    try:
+        row = fetch_one("SELECT COUNT(*) AS n FROM bts_demand_anchors")
+        return int(row["n"] or 0) if row else 0
+    except sqlite3.OperationalError:
+        return 0
 
 
 def _add_column_if_missing(table: str, column: str, decl: str) -> None:
@@ -583,6 +835,7 @@ def ensure_schema_migrations():
     # Cabin-specific ticket prices (W/F); legacy DBs backfilled from B/L bases × yield
     _add_column_if_missing("routes", "price_premium_economy", "REAL")
     _add_column_if_missing("routes", "price_first", "REAL")
+    _add_column_if_missing("routes", "demand_source", "TEXT")
     try:
         execute(
             """
@@ -1072,6 +1325,11 @@ def ensure_schema_migrations():
         """
     )
     sync_financial_constants_from_csv()
+    sync_bts_gravity_constants_from_json()
+    try:
+        load_bts_demand_anchors_if_empty()
+    except Exception:
+        pass
 
     # Ensure static reference data exists (some flows create schema but never seed).
     try:
@@ -1080,6 +1338,8 @@ def ensure_schema_migrations():
         if n <= 0:
             from db.seed import run_seed
             run_seed(DB_FILE)
+        else:
+            add_missing_airports_from_csv()
     except Exception:
         # Never block startup if seeding fails; gameplay will surface missing ref data quickly.
         pass

@@ -368,33 +368,46 @@ def render_route_details(route_id):
     )
 
     if has_demand_data and performance:
+        from engine.demand_display import build_demand_summary, floor_flag_for_route, format_cli_block
+
+        src = str(route.get("demand_source") or "")
+        floored = False
+        try:
+            src2, floored = floor_flag_for_route(
+                str(route["origin_iata"]),
+                str(route["dest_iata"]),
+                float(route.get("distance_nm") or 0),
+            )
+            if src2:
+                src = src2
+        except Exception:
+            pass
+        summary = build_demand_summary(
+            business_pax=performance.get("business_pax"),
+            leisure_pax=performance.get("leisure_pax"),
+            demand_source=src,
+            market_floor_applied=floored,
+            base_demand_business=route.get("base_demand_business"),
+            base_demand_leisure=route.get("base_demand_leisure"),
+            economy_pax=performance.get("economy_pax"),
+            premium_economy_pax=performance.get("premium_economy_pax"),
+            business_cabin_pax=performance.get("business_cabin_pax"),
+            first_pax=performance.get("first_pax"),
+            weekly_market_total=performance.get("weekly_market_total"),
+            aircraft_fill_pax=performance.get("aircraft_fill_pax", performance.get("total_pax")),
+        )
+
         info.append(f"\nEstimated Weekly Demand:\n", style="bold green")
-        info.append(f"  Business: {performance['business_pax']} passengers\n", style="green")
-        info.append(f"  Leisure: {performance['leisure_pax']} passengers\n", style="green")
-        demand_total = int(performance["business_pax"]) + int(performance["leisure_pax"])
-        info.append(f"  Total: {demand_total} passengers\n", style="bold green")
-        info.append(
-            "  Cabin split (modeled market): "
-            f"E{int(performance.get('economy_pax', 0))} / "
-            f"W{int(performance.get('premium_economy_pax', 0))} / "
-            f"J{int(performance.get('business_cabin_pax', 0))} / "
-            f"F{int(performance.get('first_pax', 0))}\n",
-            style="green",
-        )
-        info.append(
-            f"  (Stored route template base: {route['base_demand_business']} B / "
-            f"{route['base_demand_leisure']} L — used inside demand formula.)\n",
-            style="dim",
-        )
+        for line in format_cli_block(summary):
+            style = "bold green" if line.startswith("This week's market") else (
+                "green" if line.startswith("Source:") or "business ·" in line or line.startswith("Cabin") else "dim"
+            )
+            info.append(f"  {line}\n", style=style)
         al = get_airline()
         rep = float(al["reputation_score"]) if al else 50.0
         rm = float(performance.get("reputation_multiplier") or 1.0)
         info.append(
             f"  Reputation {rep:.0f}/100 · demand ×{rm:.2f} (weekly score from ops, pax, network, revenue & finances)\n",
-            style="dim",
-        )
-        info.append(
-            f"  (At default cabin: up to {performance['total_pax']} of that demand fits one aircraft — see below.)\n",
             style="dim",
         )
 
@@ -410,9 +423,31 @@ def render_route_details(route_id):
         info.append(f"  Total Gross: ${performance['gross_revenue']:,.2f}\n", style="bold magenta")
         info.append(f"  Avg Fare: ${performance['avg_fare']:.2f}\n", style="magenta")
     else:
-        info.append(f"\nBase Weekly Demand:\n", style="bold")
-        info.append(f"  Business: {route['base_demand_business']} pax/week\n")
-        info.append(f"  Leisure: {route['base_demand_leisure']} pax/week\n")
+        from engine.demand_display import source_blurb, floor_flag_for_route
+
+        src = str(route.get("demand_source") or "")
+        floored = False
+        try:
+            src2, floored = floor_flag_for_route(
+                str(route["origin_iata"]),
+                str(route["dest_iata"]),
+                float(route.get("distance_nm") or 0),
+            )
+            if src2:
+                src = src2
+        except Exception:
+            pass
+        info.append(f"\nDemand (template only — open detail after schedule for weekly market):\n", style="bold")
+        info.append(
+            f"  {source_blurb(src)}"
+            f"{' · minimum playable market applied' if floored else ''}\n",
+            style="green",
+        )
+        info.append(
+            f"  Template base (internal): {route['base_demand_business']} B / "
+            f"{route['base_demand_leisure']} L — not weekly passengers\n",
+            style="dim",
+        )
 
     ops = route_weekly_passenger_accounting(route["route_id"])
     if ops:

@@ -504,6 +504,7 @@ function openFleet() {
 
 function routePreviewCard(p) {
   const d = p.demand || {};
+  const labels = d.labels || {};
   const ends = p.endpoints || [];
   const legs = (p.opens || []);
   const legLines = legs.length
@@ -519,18 +520,26 @@ function routePreviewCard(p) {
       landing $${Number(e.landing_fee_per_1000 || 0).toFixed(2)}/1000lb · gate $${Number(e.gate_fee || 0).toFixed(0)}
       ${flags ? "· " + escapeHtml(flags) : ""}</span></div>`;
   }).join("");
+  const market = Number(d.weekly_market_total != null ? d.weekly_market_total : d.total_pax || 0);
+  const src = d.demand_source_badge || "Demand";
+  const floorNote = d.market_floor_applied ? " · min market" : "";
   return `
     <div class="tip-grid">
       <div><span class="muted">Acquisition</span><br><b>${money(p.total_new_cost)}</b>
         ${Number(p.cost_reference || 0) !== Number(p.total_new_cost || 0)
           ? `<br><span class="muted">one leg would be ${money(p.cost_reference)}</span>` : ""}</div>
       <div><span class="muted">Distance</span><br><b>${Number(p.distance_nm || 0).toLocaleString()} nm</b></div>
-      <div><span class="muted">Expected weekly pax</span><br><b>${Number(d.total_pax || 0).toLocaleString()}</b>
-        <br><span class="muted">${Number(d.business_pax || 0).toLocaleString()} business ·
-        ${Number(d.leisure_pax || 0).toLocaleString()} leisure</span></div>
+      <div><span class="muted">This week's market</span><br><b>${market.toLocaleString()} pax</b>
+        <br><span class="muted">${escapeHtml(src)}${escapeHtml(floorNote)} ·
+        ${Number(d.business_pax || 0).toLocaleString()} business ·
+        ${Number(d.leisure_pax || 0).toLocaleString()} leisure</span>
+        <br><span class="muted">Cabins Y${Number(d.economy_pax || 0)} / W${Number(d.premium_economy_pax || 0)} / J${Number(d.business_cabin_pax || 0)} / F${Number(d.first_pax || 0)}
+        (split — not the only number)</span>
+        <br><span class="muted">Template ${Number(d.base_demand_business || 0)}B / ${Number(d.base_demand_leisure || 0)}L (internal)</span></div>
       <div><span class="muted">Default fares</span><br><b>$${Number(d.price_leisure_default || 0).toFixed(0)}</b> leisure
         <br><span class="muted">$${Number(d.price_business_default || 0).toFixed(0)} business</span></div>
     </div>
+    ${labels.hero ? `<div class="tip-sec muted">${escapeHtml(labels.source || "")}</div>` : ""}
     <div class="tip-sec"><span class="muted">Why this price</span><br>${escapeHtml(p.cost_reason || "")}</div>
     <div class="tip-sec"><span class="muted">Legs opened</span>${legLines}</div>
     <div class="tip-sec"><span class="muted">Airports</span>${endLines}</div>`;
@@ -617,9 +626,15 @@ function openRoutes() {
       $("#rt-d", el).value = d;
       const p = await api(`/api/routes/preview?origin=${encodeURIComponent(o)}&dest=${encodeURIComponent(d)}`);
       const note = p.already_operated ? " · you already operate this" : "";
+      const dem = p.demand || {};
+      const market = Number(dem.weekly_market_total != null ? dem.weekly_market_total : dem.total_pax || 0);
+      const src = dem.demand_source_badge || "Demand";
+      const floorNote = dem.market_floor_applied ? " · min market" : "";
       $("#rt-prev", el).innerHTML =
         `<span class="tip">Cost ~ <b>${money(p.total_new_cost)}</b> · ${Number(p.distance_nm || 0).toLocaleString()} nm`
-        + ` · ~${Number((p.demand || {}).total_pax || 0).toLocaleString()} pax/wk${escapeHtml(note)}`
+        + ` · <b>${market.toLocaleString()}</b> pax/wk market`
+        + (src ? ` · ${escapeHtml(src)}${escapeHtml(floorNote)}` : "")
+        + `${escapeHtml(note)}`
         + ` <span class="tip-mark">details</span>`
         + `<span class="tip-body">${routePreviewCard(p)}</span></span>`;
     } catch (err) { $("#rt-prev", el).innerHTML = `<span class="err">${err.message}</span>`; }
@@ -1032,11 +1047,14 @@ function openRouteDetail(preselect) {
           <button type="button" id="rd-close-panel">Close</button>
         </div>
         <p class="muted">This week: ${escapeHtml(d.schedule || "no flights scheduled")}</p>
-        ${p ? `<p>Forecast demand: ${p.business_pax} business / ${p.leisure_pax} leisure
-          <span class="muted">(cabin pool E${p.economy_pax} / W${p.premium_economy_pax} / J${p.business_cabin_pax} / F${p.first_pax})</span></p>
-          <p>One-aircraft projection: ${p.total_pax} pax · LF ${(Number(p.load_factor) * 100).toFixed(0)}% · gross ${money2(p.gross_revenue)}</p>` : ""}
-        ${ops ? `<p class="muted">Week ${ops.game_week} remaining market F${rc.F || 0} / J${rc.J || 0} / W${rc.W || 0} / Y${rc.Y || 0}
-          (carried ${ops.carried_business}/${ops.carried_leisure} of ${ops.weekly_business}/${ops.weekly_leisure})</p>` : ""}
+        ${p ? `<p><b>This week's market: ${(p.weekly_market_total != null ? p.weekly_market_total : (Number(p.business_pax||0)+Number(p.leisure_pax||0))).toLocaleString()} pax</b>
+          · ${escapeHtml(p.demand_source_badge || "Demand")}${p.market_floor_applied ? " · min market" : ""}</p>
+          <p class="muted">${Number(p.business_pax||0).toLocaleString()} business · ${Number(p.leisure_pax||0).toLocaleString()} leisure
+          · cabin split Y${p.economy_pax} / W${p.premium_economy_pax} / J${p.business_cabin_pax} / F${p.first_pax}</p>
+          <p class="muted">Template base ${Number(r.base_demand_business||0)}B / ${Number(r.base_demand_leisure||0)}L (internal)</p>
+          <p>One-aircraft projection: ${p.aircraft_fill_pax != null ? p.aircraft_fill_pax : p.total_pax} pax · LF ${(Number(p.load_factor) * 100).toFixed(0)}% · gross ${money2(p.gross_revenue)}</p>` : ""}
+        ${ops ? `<p class="muted">Week ${ops.game_week} — market pool ${ops.weekly_business}/${ops.weekly_leisure} · carried ${ops.carried_business}/${ops.carried_leisure}
+          · remaining cabin F${rc.F || 0} / J${rc.J || 0} / W${rc.W || 0} / Y${rc.Y || 0}</p>` : ""}
         <form id="rd-fares">
           <div class="row2">
             <div><label>Leisure / Y base</label><input name="price_leisure" type="number" min="0.01" step="0.01" value="${r.price_leisure}" /></div>
@@ -1085,7 +1103,8 @@ function openRouteDetail(preselect) {
             <th>Cities</th>
             <th>Distance</th>
             <th>Flight time</th>
-            <th>Demand / wk</th>
+            <th>Remaining demand</th>
+            <th>Source</th>
             <th>Ops</th>
             <th>Flights this week</th>
             <th></th>
@@ -1094,13 +1113,19 @@ function openRouteDetail(preselect) {
         <tbody>
           ${rows.map((r) => {
             const est = r.flight_hours_estimated ? " · est." : "";
-            const dem = `${Number(r.base_demand_business || 0).toLocaleString()}B / ${Number(r.base_demand_leisure || 0).toLocaleString()}L`;
+            const rc = r.remaining_cabin || null;
+            const dem = rc
+              ? `F${Number(rc.F || 0).toLocaleString()} / J${Number(rc.J || 0).toLocaleString()} / W${Number(rc.W || 0).toLocaleString()} / Y${Number(rc.Y || 0).toLocaleString()}`
+              : "—";
+            const demTitle = "Remaining cabin market this week (after carried + scheduled absorption)";
+            const src = `${escapeHtml(r.demand_source_badge || "Demand")}${r.market_floor_applied ? " · min" : ""}`;
             return `<tr data-rid="${escapeHtml(r.route_id)}">
               <td><b>${escapeHtml(r.route_id)}</b></td>
               <td>${escapeHtml(r.origin_city || r.origin_iata || "")} → ${escapeHtml(r.dest_city || r.dest_iata || "")}</td>
               <td>${Number(r.distance_nm || 0).toLocaleString()} nm</td>
               <td>${escapeHtml(formatBlockHours(r.flight_hours))}${escapeHtml(est)}</td>
-              <td>${escapeHtml(dem)}</td>
+              <td title="${escapeHtml(demTitle)}">${escapeHtml(dem)}</td>
+              <td>${src}</td>
               <td>${Number(r.weekly_ops || 0)}</td>
               <td class="rd-flights">${escapeHtml(r.flights_label || "—")}</td>
               <td><button type="button" data-fares="${escapeHtml(r.route_id)}">Fares</button></td>
