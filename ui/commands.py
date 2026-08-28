@@ -8,7 +8,7 @@ from __future__ import annotations
 from rich.console import Console
 
 from db import db
-from engine import aircraft, airports, routes
+from engine import aircraft, airports, routes, setup
 from ui import panels
 from ui.flight_board import game_time_status_line
 
