@@ -365,7 +365,10 @@ def _gate_intervals_at_airport(
 
     out: list[tuple[float, float]] = []
     for _tail, events in by_tail.items():
-        out.extend(_visit_intervals_for_tail_events(events))
+        # Repeated segment rows for the same tail/time (spawn bug) must not multiply stands.
+        deduped = list({(float(t), str(k), float(m)) for t, k, m in events})
+        ordered = sorted(deduped, key=lambda x: (float(x[0]), 0 if x[1] == "A" else 1))
+        out.extend(_visit_intervals_for_tail_events(ordered))
     return out
 
 
@@ -493,7 +496,12 @@ def player_gate_gap_starts_by_unit(
     return gaps
 
 
-def assert_player_gate_capacity_for_new_segments(game_week: int, segments: list[dict]) -> None:
+def assert_player_gate_capacity_for_new_segments(
+    game_week: int,
+    segments: list[dict],
+    *,
+    replace_tails: bool = True,
+) -> None:
     """
     Enforce concurrent gates at each auctioned airport for the new segments.
 
@@ -501,6 +509,10 @@ def assert_player_gate_capacity_for_new_segments(game_week: int, segments: list[
       - origin_iata, dest_iata (str)
       - dep_abs, arr_abs (float absolute game hours)
       - tail_number (optional; one scheduling batch defaults to one tail)
+
+    replace_tails: when True (default), existing DB segments for tails in this batch are
+    excluded before adding the new plan — used when rescheduling one aircraft. When False,
+    new segments are checked against the full week already in the DB (weekly spawn adds).
     """
     gw = int(game_week)
     airports: set[str] = set()
@@ -518,13 +530,15 @@ def assert_player_gate_capacity_for_new_segments(game_week: int, segments: list[
         cap = _allocated_gates(ap, "PLAYER")
         if cap <= 0:
             raise ValueError(f"No gate allocation at {ap}. Bid in gate auctions to operate there.")
-        exclude_tails = {
-            str(s.get("tail_number"))
-            for s in (segments or [])
-            if s.get("tail_number")
-        }
+        exclude_tails = None
+        if replace_tails:
+            exclude_tails = {
+                str(s.get("tail_number"))
+                for s in (segments or [])
+                if s.get("tail_number")
+            } or None
         peak = player_gate_peak_at_airport(
-            ap, gw, extra_segments=segments, exclude_tails=exclude_tails or None
+            ap, gw, extra_segments=segments, exclude_tails=exclude_tails
         )
         if peak > cap:
             raise ValueError(

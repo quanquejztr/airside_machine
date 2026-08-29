@@ -45,14 +45,6 @@ def _seed_auctions_and_flights() -> None:
         ensure_weekly_airport_auctions(cur_week)
     except Exception:
         pass
-    try:
-        from engine.scheduling import spawn_rotation_segments_for_week
-
-        gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
-        cur_week = int(gs["game_week"]) if gs and gs["game_week"] is not None else 1
-        spawn_rotation_segments_for_week(cur_week)
-    except Exception:
-        pass
 
 
 def _ai_bootstrap_bg() -> None:
@@ -261,6 +253,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/routes/preview":
             self._send_json(api.preview_route(q.get("origin", ""), q.get("dest", "")))
+            return
+        if path == "/api/routes/suggestions":
+            lim = q.get("limit", "25")
+            try:
+                lim_i = int(lim)
+            except (TypeError, ValueError):
+                lim_i = 25
+            self._send_json(api.route_suggestions(q.get("origin", ""), limit=lim_i))
             return
         if path == "/api/routes/detail":
             self._send_json(api.route_detail(q.get("route_id", "")))

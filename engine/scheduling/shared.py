@@ -48,12 +48,61 @@ def _flight_fuel_gallons(route, aircraft_type) -> float:
     return (dist / speed) * burn
 
 
-def _assert_new_segment_airport_limits(game_week: int, segs: list) -> None:
+def segment_exists_for_spawn(
+    tail_number: str,
+    game_week: int,
+    route_id: str,
+    dep_abs: float,
+) -> bool:
+    """True when this tail/week/route/departure already has a live segment row."""
+    return bool(
+        db.fetch_one(
+            """
+            SELECT 1 FROM flight_segments
+            WHERE tail_number = ? AND game_week = ? AND route_id = ?
+              AND ABS(scheduled_dep_game_hour - ?) < 0.001
+              AND status != 'CANCELLED'
+            """,
+            (str(tail_number), int(game_week), str(route_id), float(dep_abs)),
+        )
+    )
+
+
+def _filter_new_spawn_segments(game_week: int, segs: list) -> list:
+    """Return only segments that are not already present for this week."""
+    out = []
+    for s in segs or []:
+        tail = str(s.get("tail_number") or "")
+        rid = str(s.get("route_id") or "")
+        dep = s.get("dep_abs")
+        if not tail or not rid or dep is None:
+            out.append(s)
+            continue
+        if segment_exists_for_spawn(tail, game_week, rid, float(dep)):
+            continue
+        out.append(s)
+    return out
+
+
+def _assert_new_segment_airport_limits(
+    game_week: int,
+    segs: list,
+    *,
+    replace_tails: bool = True,
+) -> None:
     """Gate concurrency and slot hourly caps. Raises ValueError on failure."""
     from engine.gates import assert_player_gate_capacity_for_new_segments as _assert_gates
     from engine.slots import assert_player_slots_for_new_segments
 
-    _assert_gates(int(game_week), segs)
+    _assert_gates(int(game_week), segs, replace_tails=replace_tails)
     assert_player_slots_for_new_segments(int(game_week), segs)
+
+
+def _assert_incremental_spawn_airport_limits(game_week: int, segs: list) -> None:
+    """Gate/slot check for weekly spawn adds (DB rows kept; no tail exclusion)."""
+    new_segs = _filter_new_spawn_segments(int(game_week), segs)
+    if not new_segs:
+        return
+    _assert_new_segment_airport_limits(int(game_week), new_segs, replace_tails=False)
 
 

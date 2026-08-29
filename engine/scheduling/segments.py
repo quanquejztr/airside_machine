@@ -17,6 +17,40 @@ from engine.routes import get_route, haversine_distance
 
 from engine.scheduling.shared import DAY_START_HOURS
 
+
+def dedupe_duplicate_spawn_segments(game_week: int) -> int:
+    """
+    Remove duplicate live segments for the same tail/week/route/departure.
+
+    Keeps the earliest segment_id per key. Returns rows deleted.
+    """
+    gw = int(game_week)
+    rows = db.fetch_all(
+        """
+        SELECT segment_id, tail_number, route_id, scheduled_dep_game_hour
+        FROM flight_segments
+        WHERE game_week = ? AND status != 'CANCELLED'
+        ORDER BY tail_number, route_id, scheduled_dep_game_hour, segment_id
+        """,
+        (gw,),
+    )
+    seen: set[tuple[str, str, float]] = set()
+    delete_ids: list[str] = []
+    for r in rows or []:
+        key = (
+            str(r["tail_number"]),
+            str(r["route_id"]),
+            round(float(r["scheduled_dep_game_hour"] or 0.0), 3),
+        )
+        if key in seen:
+            delete_ids.append(str(r["segment_id"]))
+        else:
+            seen.add(key)
+    for sid in delete_ids:
+        db.execute("DELETE FROM flight_segments WHERE segment_id = ?", (sid,))
+    return len(delete_ids)
+
+
 def reset_operational_schedule_for_new_calendar_week(new_calendar_week: int) -> int:
     """
     At the start of a new game week: snap all unflown legs whose **published** plan
@@ -95,7 +129,11 @@ def remove_superseded_scheduled_segments_for_tail(tail_number: str) -> None:
 
 def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
     """Spawn quick-rotation template (list of leg dicts). Returns (inserted_count, touched_tails)."""
-    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
+    from engine.scheduling.shared import (
+        _assert_incremental_spawn_airport_limits,
+        get_financial_constant,
+        segment_exists_for_spawn,
+    )
     from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour, week_base_hours
     inserted = 0
     tails_touched = set()
@@ -120,6 +158,7 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
         planned.append(
             {
                 "tail_number": tail_number,
+                "route_id": str(route_id),
                 "origin_iata": str(rt["origin_iata"]).upper(),
                 "dest_iata": str(rt["dest_iata"]).upper(),
                 "dep_abs": float(dep_abs),
@@ -128,7 +167,7 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
             }
         )
     if planned:
-        _assert_new_segment_airport_limits(int(target_game_week), planned)
+        _assert_incremental_spawn_airport_limits(int(target_game_week), planned)
 
     template_dirty = False
     for i, leg in enumerate(legs):
@@ -143,6 +182,10 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
 
         dep_abs = w_base + dep_off
         arr_abs = dep_abs + fh
+
+        if segment_exists_for_spawn(tail_number, target_game_week, route_id, dep_abs):
+            continue
+
         segment_id = f"{tail_number}-{route_id}-W{target_game_week}-{uuid.uuid4().hex[:12]}"
 
         if db.fetch_one("SELECT 1 FROM flight_segments WHERE segment_id = ?", (segment_id,)):
@@ -252,7 +295,11 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
 
 def _spawn_detailed_template_week(tail_number, target_game_week, items):
     """Spawn detailed template segments for a week. Returns (inserted_count, touched_tails)."""
-    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
+    from engine.scheduling.shared import (
+        _assert_incremental_spawn_airport_limits,
+        get_financial_constant,
+        segment_exists_for_spawn,
+    )
     from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour, week_base_hours
     inserted = 0
     tails_touched = set()
@@ -300,6 +347,7 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
             planned_all.append(
                 {
                     "tail_number": tail_number,
+                    "route_id": str(route_id),
                     "origin_iata": str(route["origin_iata"]).upper(),
                     "dest_iata": str(route["dest_iata"]).upper(),
                     "dep_abs": float(dep_abs),
@@ -308,7 +356,7 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
                 }
             )
     if planned_all:
-        _assert_new_segment_airport_limits(int(target_game_week), planned_all)
+        _assert_incremental_spawn_airport_limits(int(target_game_week), planned_all)
 
     for item in items:
         route_id = item.get("route_id")
@@ -345,10 +393,11 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
             dup = db.fetch_one(
                 """
                 SELECT 1 FROM flight_segments
-                WHERE tail_number = ? AND game_week = ? AND route_id = ? AND flight_number = ?
+                WHERE tail_number = ? AND game_week = ? AND route_id = ?
                 AND ABS(scheduled_dep_game_hour - ?) < 0.001
+                AND status != 'CANCELLED'
                 """,
-                (tail_number, target_game_week, route_id, flight_number, dep_abs),
+                (tail_number, target_game_week, route_id, dep_abs),
             )
             if dup:
                 continue
@@ -421,6 +470,7 @@ def _gate_segments_from_planned(
             "dest_iata": p["dest_iata"],
             "dep_abs": p["dep_abs"],
             "arr_abs": p["arr_abs"],
+            "route_id": str(p["route_id"]),
             "turn_minutes": turn_by_route.get(str(p["route_id"]), default_turn),
         }
         for p in (planned or [])
@@ -489,7 +539,7 @@ def _plan_detailed_chained_chain(tail_number, target_game_week, chain: dict):
 
 def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict, *, skip_gate_assert: bool = False):
     """Insert segments for one chained block (used by weekly spawn)."""
-    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
+    from engine.scheduling.shared import _assert_incremental_spawn_airport_limits, get_financial_constant
     from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour
     inserted = 0
     tails_touched = set()
@@ -504,19 +554,18 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
     planned, turn_by_route = planned_bundle
 
     if not skip_gate_assert:
-        _assert_new_segment_airport_limits(
-            int(target_game_week),
-            _gate_segments_from_planned(tail_number, planned, turn_by_route, default_turn),
-        )
+        gate_segs = _gate_segments_from_planned(tail_number, planned, turn_by_route, default_turn)
+        _assert_incremental_spawn_airport_limits(int(target_game_week), gate_segs)
 
     for p in planned:
         dup = db.fetch_one(
             """
             SELECT 1 FROM flight_segments
-            WHERE tail_number = ? AND game_week = ? AND route_id = ? AND flight_number = ?
+            WHERE tail_number = ? AND game_week = ? AND route_id = ?
             AND ABS(scheduled_dep_game_hour - ?) < 0.001
+            AND status != 'CANCELLED'
             """,
-            (tail_number, target_game_week, p["route_id"], p["flight_number"], p["dep_abs"]),
+            (tail_number, target_game_week, p["route_id"], p["dep_abs"]),
         )
         if dup:
             continue
@@ -568,7 +617,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
 def _spawn_detailed_chained_template_week(tail_number, target_game_week, raw_blob: dict):
     """Spawn segments for mode=detailed_chained (all stored chains)."""
     from engine.scheduling.rotation import _detailed_chained_chains_list_from_blob
-    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
+    from engine.scheduling.shared import _assert_incremental_spawn_airport_limits, get_financial_constant
 
     chains = _detailed_chained_chains_list_from_blob(raw_blob or {})
     default_turn = int(round(float(get_financial_constant("mtt_minutes", 30))))
@@ -582,7 +631,7 @@ def _spawn_detailed_chained_template_week(tail_number, target_game_week, raw_blo
             _gate_segments_from_planned(tail_number, planned, turn_by_route, default_turn)
         )
     if planned_all:
-        _assert_new_segment_airport_limits(int(target_game_week), planned_all)
+        _assert_incremental_spawn_airport_limits(int(target_game_week), planned_all)
 
     inserted = 0
     tails_touched = set()
@@ -602,7 +651,9 @@ def spawn_rotation_segments_for_week(target_game_week: int) -> dict:
     Idempotent: skips existing segments.
     """
     if target_game_week < 1:
-        return {"inserted": 0, "tails": []}
+        return {"inserted": 0, "tails": [], "deduped": 0}
+
+    deduped = dedupe_duplicate_spawn_segments(int(target_game_week))
 
     rows = db.fetch_all("SELECT tail_number, legs_json FROM weekly_rotations")
     if not rows:
@@ -666,7 +717,7 @@ def spawn_rotation_segments_for_week(target_game_week: int) -> dict:
             (tail,),
         )
 
-    return {"inserted": inserted_total, "tails": sorted(all_tails)}
+    return {"inserted": inserted_total, "tails": sorted(all_tails), "deduped": deduped}
 
 
 def _per_leg_demand_from_weekly_pool(
