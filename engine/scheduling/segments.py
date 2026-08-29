@@ -116,12 +116,15 @@ def _spawn_simple_rotation_legs(tail_number, target_game_week, legs, callsign):
         except (KeyError, TypeError, ValueError):
             continue
         dep_abs = w_base + dep_off
+        leg_turn = leg.get("turn_minutes")
         planned.append(
             {
+                "tail_number": tail_number,
                 "origin_iata": str(rt["origin_iata"]).upper(),
                 "dest_iata": str(rt["dest_iata"]).upper(),
                 "dep_abs": float(dep_abs),
                 "arr_abs": float(dep_abs) + float(fh),
+                "turn_minutes": int(round(float(leg_turn))) if leg_turn is not None else None,
             }
         )
     if planned:
@@ -293,12 +296,15 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
             if day not in DAY_START_HOURS:
                 continue
             dep_abs = w_base + DAY_START_HOURS[day] + hod
+            item_turn = item.get("turn_minutes")
             planned_all.append(
                 {
+                    "tail_number": tail_number,
                     "origin_iata": str(route["origin_iata"]).upper(),
                     "dest_iata": str(route["dest_iata"]).upper(),
                     "dep_abs": float(dep_abs),
                     "arr_abs": float(dep_abs) + float(flight_hours),
+                    "turn_minutes": int(round(float(item_turn))) if item_turn is not None else None,
                 }
             )
     if planned_all:
@@ -390,27 +396,56 @@ def _spawn_detailed_template_week(tail_number, target_game_week, items):
     return inserted, tails_touched
 
 
-def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict):
-    """Insert segments for one chained block (used by weekly spawn)."""
+def _turn_by_route_from_legs(legs_conf: list, default_turn: int) -> dict[str, int]:
+    turn_by_route: dict[str, int] = {}
+    for leg in legs_conf or []:
+        rid = leg.get("route_id")
+        if not rid:
+            continue
+        tm = leg.get("turn_minutes")
+        if tm is not None and str(tm).strip() != "":
+            turn_by_route[str(rid)] = int(round(float(tm)))
+    return turn_by_route
+
+
+def _gate_segments_from_planned(
+    tail_number: str,
+    planned: list,
+    turn_by_route: dict[str, int],
+    default_turn: int,
+) -> list[dict]:
+    return [
+        {
+            "tail_number": tail_number,
+            "origin_iata": p["origin_iata"],
+            "dest_iata": p["dest_iata"],
+            "dep_abs": p["dep_abs"],
+            "arr_abs": p["arr_abs"],
+            "turn_minutes": turn_by_route.get(str(p["route_id"]), default_turn),
+        }
+        for p in (planned or [])
+    ]
+
+
+def _plan_detailed_chained_chain(tail_number, target_game_week, chain: dict):
+    """Plan chained segments for gate checks / spawn. Returns (planned, turn_by_route) or None."""
     from engine.scheduling.rotation import _operating_days_list, _plan_chained_detailed_segments, normalize_turn_minutes
-    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
-    from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour
-    inserted = 0
-    tails_touched = set()
+    from engine.scheduling.shared import get_financial_constant
+
     legs_conf = (chain or {}).get("legs") or []
     if not legs_conf:
-        return 0, tails_touched
+        return None
 
     aircraft = get_fleet_aircraft(tail_number)
     if not aircraft:
-        return 0, tails_touched
+        return None
 
     aircraft_type = db.fetch_one(
         "SELECT * FROM aircraft_types WHERE type_id = ?",
         (aircraft["type_id"],),
     )
     if not aircraft_type:
-        return 0, tails_touched
+        return None
 
     routes_ordered = []
     flight_numbers = []
@@ -419,7 +454,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
         fn = leg.get("flight_number") or "FL001"
         r = get_route(rid) if rid else None
         if not r:
-            return 0, tails_touched
+            return None
         routes_ordered.append(r)
         flight_numbers.append(fn)
 
@@ -428,6 +463,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
     first_dep = chain.get("first_departure_time") or "08:00"
     mtt_hours = float(get_financial_constant("mtt_minutes", 30)) / 60.0
     cruise_speed_kts = aircraft_type["cruise_speed_kts"]
+    default_turn = int(round(float(get_financial_constant("mtt_minutes", 30))))
 
     operating_days = _operating_days_list(days_str)
     try:
@@ -445,32 +481,33 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
             )],
         )
     except ValueError:
+        return None
+
+    turn_by_route = _turn_by_route_from_legs(legs_conf, default_turn)
+    return planned, turn_by_route
+
+
+def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict, *, skip_gate_assert: bool = False):
+    """Insert segments for one chained block (used by weekly spawn)."""
+    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
+    from engine.scheduling.time_helpers import hhmm_from_absolute_game_hour
+    inserted = 0
+    tails_touched = set()
+    legs_conf = (chain or {}).get("legs") or []
+    if not legs_conf:
         return 0, tails_touched
 
-    # Concurrent-gates capacity check for this chain block (auctioned airports only).
-    _assert_new_segment_airport_limits(
-        int(target_game_week),
-        [
-            {
-                "tail_number": tail_number,
-                "origin_iata": p["origin_iata"],
-                "dest_iata": p["dest_iata"],
-                "dep_abs": p["dep_abs"],
-                "arr_abs": p["arr_abs"],
-            }
-            for p in planned
-        ],
-    )
-
-    turn_by_route: dict[str, int] = {}
     default_turn = int(round(float(get_financial_constant("mtt_minutes", 30))))
-    for leg in legs_conf:
-        rid = leg.get("route_id")
-        if not rid:
-            continue
-        tm = leg.get("turn_minutes")
-        if tm is not None and str(tm).strip() != "":
-            turn_by_route[str(rid)] = int(round(float(tm)))
+    planned_bundle = _plan_detailed_chained_chain(tail_number, target_game_week, chain)
+    if not planned_bundle:
+        return 0, tails_touched
+    planned, turn_by_route = planned_bundle
+
+    if not skip_gate_assert:
+        _assert_new_segment_airport_limits(
+            int(target_game_week),
+            _gate_segments_from_planned(tail_number, planned, turn_by_route, default_turn),
+        )
 
     for p in planned:
         dup = db.fetch_one(
@@ -531,10 +568,28 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
 def _spawn_detailed_chained_template_week(tail_number, target_game_week, raw_blob: dict):
     """Spawn segments for mode=detailed_chained (all stored chains)."""
     from engine.scheduling.rotation import _detailed_chained_chains_list_from_blob
+    from engine.scheduling.shared import _assert_new_segment_airport_limits, get_financial_constant
+
+    chains = _detailed_chained_chains_list_from_blob(raw_blob or {})
+    default_turn = int(round(float(get_financial_constant("mtt_minutes", 30))))
+    planned_all: list[dict] = []
+    for chain in chains:
+        planned_bundle = _plan_detailed_chained_chain(tail_number, target_game_week, chain)
+        if not planned_bundle:
+            continue
+        planned, turn_by_route = planned_bundle
+        planned_all.extend(
+            _gate_segments_from_planned(tail_number, planned, turn_by_route, default_turn)
+        )
+    if planned_all:
+        _assert_new_segment_airport_limits(int(target_game_week), planned_all)
+
     inserted = 0
     tails_touched = set()
-    for chain in _detailed_chained_chains_list_from_blob(raw_blob or {}):
-        n, ts = _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain)
+    for chain in chains:
+        n, ts = _spawn_one_detailed_chained_chain(
+            tail_number, target_game_week, chain, skip_gate_assert=True
+        )
         inserted += n
         tails_touched |= ts
     return inserted, tails_touched

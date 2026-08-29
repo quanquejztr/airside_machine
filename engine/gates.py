@@ -329,7 +329,6 @@ def _gate_intervals_at_airport(
     )
     by_tail: dict[str, list[tuple[float, str, float]]] = {}
     planned_tail = "__PLANNED__"
-    orphan_mtt = _mtt_hours()
 
     def _touch(tail: str, t: float, kind: str, mtt_h: float) -> None:
         if t <= 0 and kind == "A":
@@ -350,7 +349,7 @@ def _gate_intervals_at_airport(
         if oi == ap:
             _touch(tail, dep, "D", turn_h)
         if di == ap:
-            _touch(tail, arr, "A", orphan_mtt)
+            _touch(tail, arr, "A", turn_h)
 
     for s in extra_segments or []:
         tail = str(s.get("tail_number") or planned_tail)
@@ -362,7 +361,7 @@ def _gate_intervals_at_airport(
         if oi == ap:
             _touch(tail, dep, "D", turn_h)
         if di == ap:
-            _touch(tail, arr, "A", orphan_mtt)
+            _touch(tail, arr, "A", turn_h)
 
     out: list[tuple[float, float]] = []
     for _tail, events in by_tail.items():

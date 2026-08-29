@@ -1353,6 +1353,83 @@ class TestConcurrentGates(unittest.TestCase):
             self.assertEqual(2, without_exclude, "old + new overlap should double-count without exclude")
             self.assertEqual(1, with_exclude)
 
+    def test_spawn_gate_check_excludes_same_tail_from_db(self):
+        """Weekly re-spawn must not double-count existing segments for the same tail."""
+        import uuid
+
+        from engine.gates import _upsert_allocation, assert_player_gate_capacity_for_new_segments
+
+        tail = "N888"
+        turn = 150
+        arr1 = 360.0
+        dep1 = arr1 + (turn / 60.0)
+        arr2 = 453.5
+        dep2 = arr2 + (turn / 60.0)
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            _upsert_allocation("IST", "PLAYER", 1, effective_week=1)
+            for rid, oi, di, dep, arr in (
+                ("MNL-IST", "MNL", "IST", arr1 - 10.0, arr1),
+                ("IST-MNL", "IST", "MNL", dep1, dep1 + 10.0),
+                ("MNL-IST", "MNL", "IST", arr2 - 10.0, arr2),
+                ("IST-MNL", "IST", "MNL", dep2, dep2 + 10.0),
+            ):
+                if not db.fetch_one("SELECT 1 FROM routes WHERE route_id=?", (rid,)):
+                    self.skipTest(f"need route {rid}")
+                db.execute(
+                    """
+                    INSERT INTO flight_segments (
+                        segment_id, game_week, day_of_week, tail_number, route_id,
+                        origin_iata, dest_iata, flight_number,
+                        scheduled_dep_time, scheduled_dep_game_hour,
+                        scheduled_arr_time, scheduled_arr_game_hour,
+                        baseline_dep_game_hour, baseline_arr_game_hour,
+                        turn_minutes, status, pax_business, pax_leisure, revenue_gross,
+                        excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee
+                    ) VALUES (?, 3, 'MON', ?, ?, ?, ?, 'TST01', '08:00', ?, '18:00', ?, ?, ?, ?, 'SCHEDULED',
+                              0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    """,
+                    (str(uuid.uuid4()), tail, rid, oi, di, dep, arr, dep, arr, turn),
+                )
+            planned = [
+                {
+                    "tail_number": tail,
+                    "origin_iata": oi,
+                    "dest_iata": di,
+                    "dep_abs": dep,
+                    "arr_abs": arr,
+                    "turn_minutes": turn,
+                }
+                for _rid, oi, di, dep, arr in (
+                    ("MNL-IST", "MNL", "IST", arr1 - 10.0, arr1),
+                    ("IST-MNL", "IST", "MNL", dep1, dep1 + 10.0),
+                    ("MNL-IST", "MNL", "IST", arr2 - 10.0, arr2),
+                    ("IST-MNL", "IST", "MNL", dep2, dep2 + 10.0),
+                )
+            ]
+            assert_player_gate_capacity_for_new_segments(3, planned)
+
+    def test_inbound_turn_minutes_extend_dest_gate_hold(self):
+        """Per-leg turnaround applies after landing at the destination airport."""
+        from engine.gates import _gate_intervals_at_airport
+
+        with fresh_game():
+            arr = 200.0
+            turn_h = 150.0 / 60.0
+            inbound = {
+                "tail_number": "N900",
+                "origin_iata": "MNL",
+                "dest_iata": "IST",
+                "dep_abs": arr - 10.0,
+                "arr_abs": arr,
+                "turn_minutes": 150,
+            }
+            busy = sum(
+                e - s
+                for s, e in _gate_intervals_at_airport("IST", 2, extra_segments=[inbound])
+            )
+            self.assertAlmostEqual(busy, turn_h, places=2)
+
     def test_ai_turnaround_at_dest_uses_one_gate(self):
         from engine.gates import gate_intervals_for_ai_at_airport, peak_concurrency
 

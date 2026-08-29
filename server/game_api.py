@@ -1441,7 +1441,7 @@ def flight_board() -> dict:
 
 def airport_flight_board(iata: str) -> dict:
     from engine.scheduling import hhmm_from_absolute_game_hour
-    from ui.airport_board import get_airport_board_rows
+    from ui.airport_board import format_board_pax_label, get_airport_board_rows
 
     ap = str(iata or "").strip().upper()
     if not ap:
@@ -1469,11 +1469,7 @@ def airport_flight_board(iata: str) -> dict:
         op = str(d.get("operator_id") or "")
         d["operator_label"] = player_label if op == "PLAYER" else comp_labels.get(op, op)
         d["route"] = f"{d.get('origin_iata') or '?'}→{d.get('dest_iata') or '?'}"
-        pax = d.get("pax")
-        if pax is not None and op != "PLAYER":
-            d["pax_label"] = f"~{int(pax)}"
-        else:
-            d["pax_label"] = "—"
+        d["pax_label"] = format_board_pax_label(d.get("pax"), op)
         enriched.append(d)
 
     deps = [x for x in enriched if str(x.get("direction") or "").upper() == "DEP"]
