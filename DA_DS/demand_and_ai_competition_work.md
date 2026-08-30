@@ -844,3 +844,5 @@ docs/phase_implementation_detail.md        # phase roadmap
 | Why is VN/CN AI weak? | Roster gap (no VN/CN hub) + scoring/radius + demand/gravity on thin pairs. |
 | Fastest fix for more VN/CN AI? | New `competitors.json` hubs + VN anchors + lower profit floor for thin routes. |
 | First week action? | Run `check_routes.py`, build 100-route backtest, SQL AI routes by country. |
+
+"Testing"
