@@ -1,0 +1,35 @@
+# Fail PRs whose head branch does not follow: <nickname>/<topic>
+# See contribution-rules/COLLABORATION_RULES.md
+
+name: Branch name
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          # Allowed without nickname/ prefix (automation only)
+          case "$BRANCH" in
+            dependabot/*) echo "OK: dependabot branch"; exit 0 ;;
+          esac
+          # <nickname>/<topic> — nickname and topic: letters, digits, . _ -
+          pattern='^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]+$'
+          if echo "$BRANCH" | grep -Eq "$pattern"; then
+            echo "OK: branch name '$BRANCH' matches $pattern"
+            exit 0
+          fi
+          echo "::error::Branch name must be <nickname>/<topic> (e.g. tcun/gate-peak-fix)."
+          echo "Got: '$BRANCH'"
+          echo "See contribution-rules/COLLABORATION_RULES.md"
+          exit 1
