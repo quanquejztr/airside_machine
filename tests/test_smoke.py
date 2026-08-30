@@ -871,6 +871,7 @@ class TestOverlayAPI(unittest.TestCase):
                 "list_player_routes": lambda: api.list_player_routes(),
                 "player_routes_overview": lambda: api.player_routes_overview(),
                 "preview_route": lambda: api.preview_route(o, d),
+                "route_suggestions": lambda: api.route_suggestions(o, limit=5),
             }
             if prow:
                 cases["route_detail"] = lambda: api.route_detail(rid)
@@ -1546,6 +1547,133 @@ class TestConcurrentGates(unittest.TestCase):
                     f"{ap} week {gw}: peak {peak} > cap {cap}",
                 )
             assert_player_gate_capacity_for_week(gw)
+
+
+class TestRouteSuggestions(unittest.TestCase):
+    def test_suggestions_are_bidirectional_and_sorted(self):
+        from engine.route_suggestions import popular_destinations_from_origin
+
+        with fresh_game(hub="ATL"):
+            rows = popular_destinations_from_origin("ATL", limit=10)
+            self.assertGreater(len(rows), 0)
+            for r in rows:
+                self.assertIn("outbound", r)
+                self.assertIn("inbound", r)
+                self.assertEqual(r["outbound"]["from"], "ATL")
+                self.assertEqual(r["inbound"]["to"], "ATL")
+                self.assertGreaterEqual(int(r["outbound"]["weekly_demand"]), 0)
+                self.assertGreaterEqual(int(r["inbound"]["weekly_demand"]), 0)
+                self.assertGreater(float(r["distance_nm"]), 0)
+            ranks = [int(r["rank_demand"]) for r in rows]
+            self.assertEqual(ranks, sorted(ranks, reverse=True))
+
+    def test_suggestions_api_requires_origin(self):
+        from server import game_api as api
+
+        with fresh_game(hub="ATL"):
+            bad = api.route_suggestions("")
+            self.assertFalse(bad.get("ok"))
+            good = api.route_suggestions("ATL", limit=3)
+            self.assertTrue(good.get("ok"))
+            self.assertEqual(good.get("origin_iata"), "ATL")
+            self.assertGreater(len(good.get("suggestions") or []), 0)
+
+
+class TestSpawnIdempotency(unittest.TestCase):
+    def test_quick_spawn_skips_duplicate_tail_route_dep(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation, spawn_rotation_segments_for_week
+            from engine.scheduling.segments import dedupe_duplicate_spawn_segments
+
+            tid, other, out_id, in_id = TestFlightNumbers._rt_setup(self, g)
+            tail = g.lease(tid)
+            assign_rotation(tail, [out_id, in_id])
+            out1 = spawn_rotation_segments_for_week(2)
+            out2 = spawn_rotation_segments_for_week(2)
+            self.assertGreater(int(out1.get("inserted") or 0), 0)
+            self.assertEqual(0, int(out2.get("inserted") or 0))
+            n = g.db.fetch_one(
+                "SELECT COUNT(*) AS n FROM flight_segments WHERE tail_number=? AND game_week=2",
+                (tail,),
+            )["n"]
+            self.assertEqual(int(out1.get("inserted") or 0), int(n))
+
+    def test_dedupe_removes_duplicate_spawn_rows(self):
+        import uuid
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.scheduling.segments import dedupe_duplicate_spawn_segments
+
+            rt = db.fetch_one("SELECT route_id, origin_iata, dest_iata FROM routes LIMIT 1")
+            if not rt:
+                self.skipTest("need a route")
+            route_id = str(rt["route_id"])
+            oi = str(rt["origin_iata"])
+            di = str(rt["dest_iata"])
+            tail = "N777"
+            dep = 50.0
+            arr = 54.0
+            for i in range(3):
+                db.execute(
+                    """
+                    INSERT INTO flight_segments (
+                        segment_id, game_week, day_of_week, tail_number, route_id,
+                        origin_iata, dest_iata, flight_number,
+                        scheduled_dep_time, scheduled_dep_game_hour,
+                        scheduled_arr_time, scheduled_arr_game_hour,
+                        baseline_dep_game_hour, baseline_arr_game_hour,
+                        status, pax_business, pax_leisure, revenue_gross,
+                        excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee
+                    ) VALUES (?, 2, 'MON', ?, ?, ?, ?, ?, '08:00', ?, '09:00', ?, ?, ?, 'SCHEDULED',
+                              0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    """,
+                    (str(uuid.uuid4()), tail, route_id, oi, di, f"FN{i}", dep, arr, dep, arr),
+                )
+            removed = dedupe_duplicate_spawn_segments(2)
+            self.assertEqual(2, removed)
+            left = db.fetch_one(
+                "SELECT COUNT(*) AS n FROM flight_segments WHERE tail_number=? AND game_week=2",
+                (tail,),
+            )["n"]
+            self.assertEqual(1, int(left))
+
+    def test_duplicate_db_rows_do_not_inflate_gate_peak(self):
+        import uuid
+
+        from engine.gates import _gate_intervals_at_airport, peak_concurrency, _upsert_allocation
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            rt = db.fetch_one("SELECT route_id, origin_iata, dest_iata FROM routes LIMIT 1")
+            if not rt:
+                self.skipTest("need a route")
+            route_id = str(rt["route_id"])
+            oi = str(rt["origin_iata"]).upper()
+            di = str(rt["dest_iata"]).upper()
+            _upsert_allocation(oi, "PLAYER", 2, effective_week=1)
+            tail = "N555"
+            dep = 60.0
+            arr = 64.0
+            for _ in range(4):
+                db.execute(
+                    """
+                    INSERT INTO flight_segments (
+                        segment_id, game_week, day_of_week, tail_number, route_id,
+                        origin_iata, dest_iata, flight_number,
+                        scheduled_dep_time, scheduled_dep_game_hour,
+                        scheduled_arr_time, scheduled_arr_game_hour,
+                        baseline_dep_game_hour, baseline_arr_game_hour,
+                        status, pax_business, pax_leisure, revenue_gross,
+                        excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee
+                    ) VALUES (?, 1, 'MON', ?, ?, ?, ?, 'TST', '08:00', ?, '09:00', ?, ?, ?, 'SCHEDULED',
+                              0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    """,
+                    (str(uuid.uuid4()), tail, route_id, oi, di, dep, arr, dep, arr),
+                )
+            peak = peak_concurrency(_gate_intervals_at_airport(oi, 1))
+            self.assertEqual(1, peak)
+
 
 # ---------------------------------------------------------------------------
 # Flight numbers: sticky-by-route, random (not 001), overlap rules, spawn persist

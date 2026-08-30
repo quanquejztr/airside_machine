@@ -736,6 +736,36 @@ def preview_route(origin: str, dest: str) -> dict:
     return _ok(prev)
 
 
+def route_suggestions(origin: str, limit: int = 25) -> dict:
+    """Popular destinations from an origin with bidirectional weekly demand."""
+    from engine.route_suggestions import popular_destinations_from_origin
+
+    origin_u = str(origin or "").strip().upper()
+    if not origin_u:
+        return _err("origin is required.")
+    al = setup.get_airline()
+    hub = str(al["home_hub_iata"]) if al else None
+    try:
+        items = popular_destinations_from_origin(
+            origin_u,
+            limit=int(limit or 25),
+            hub_iata=hub,
+        )
+    except ValueError as e:
+        return _err(str(e))
+    except Exception as e:
+        return _err(str(e))
+    ap = airports.get_airport(origin_u)
+    return _ok(
+        {
+            "origin_iata": origin_u,
+            "origin_name": str(ap["name"] or "") if ap else "",
+            "origin_city": str(ap["city"] or "") if ap else "",
+            "suggestions": items,
+        }
+    )
+
+
 def open_player_route(body: dict) -> dict:
     origin = str(body.get("origin") or "").strip().upper()
     dest = str(body.get("dest") or "").strip().upper()
