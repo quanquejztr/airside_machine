@@ -6,11 +6,31 @@ Rules for anyone contributing to Airside Machine via GitHub.
 
 ## 1. Git & branches
 
+### Branch naming (required)
+
+Every feature branch **must** start with your nickname, then a slash, then a short topic:
+
+```
+<nickname>/<short-topic>
+```
+
+| Good | Bad |
+|------|-----|
+| `tcun/gate-peak-fix` | `gate-peak-fix` (no nickname) |
+| `jd/flight-display` | `tcun_gate_fix` (use `/`, not `_`) |
+| `alex.m/popular-destinations` | `main`, `fix-bug` |
+
+**Pattern (enforced on PRs by CI):**  
+`^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]+$`
+
+- **Nickname:** your GitHub username or agreed handle (`tcun`, `jd`, …)
+- **Topic:** lowercase words with hyphens (`gate-peak-fix`, `ui-phase-6`)
+- Pick **one nickname** and use it on every branch so reviews are easy to trace
+
 ### Do
 
 - **Branch from latest `main`** for every task
-- Use branch names: `<initials>/<short-topic>`  
-  Examples: `jd/gate-peak-fix`, `tcun/flight-display`
+- Create branches with: `git checkout -b <nickname>/<short-topic>`
 - **Open a PR into `main`** — do not push directly to `main`
 - Keep PRs **small and focused** (one feature or one bug fix)
 - **Pull before you branch** when starting new work:
