@@ -438,6 +438,21 @@ html, body {
   margin: 0;
 }
 .board-subtabs { margin-top: 4px; }
+.rt-sug-grid { width: 100%; font-size: 12px; }
+.rt-sug-grid th, .rt-sug-grid td { padding: 4px 6px; }
+.rt-sug-row { cursor: pointer; }
+.rt-sug-row:hover td { background: rgba(40, 108, 148, 0.12); }
+.rt-st {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 0.5rem;
+  font-size: 10px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.rt-st-open { background: rgba(40, 108, 148, 0.18); color: var(--logo-blue-deep); }
+.rt-st-partial { background: rgba(225, 179, 130, 0.45); color: #5a3e1a; }
 table.board-grid td:nth-child(2) {
   font-weight: 700;
   color: var(--lg-muted);

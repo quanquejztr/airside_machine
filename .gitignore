@@ -21,11 +21,13 @@ venv/
 !.env.example
 *.pem
 
-# Docs — track README + docs/; other local notes stay ignored
+# Docs — track README + docs/ + DA_DS/; other local notes stay ignored
 *.md
 !README.md
 !docs/
 !docs/*.md
+!DA_DS/
+!DA_DS/*.md
 *.docx
 *.txt
 

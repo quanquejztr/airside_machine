@@ -597,32 +597,100 @@ async function resolveAirportCode(value) {
   return String((exact || list[0]).iata).toUpperCase();
 }
 
+function routeSuggestionStatus(row) {
+  if (row.network_status === "open") return '<span class="rt-st rt-st-open">In network</span>';
+  if (row.network_status === "partial") return '<span class="rt-st rt-st-partial">Partial</span>';
+  return "";
+}
+
+function renderRouteSuggestionsTable(origin, rows) {
+  if (!rows || !rows.length) {
+    return `<p class="muted">No strong markets found within range from ${escapeHtml(origin)}.</p>`;
+  }
+  const hdr = (label) => `<th>${escapeHtml(label)}</th>`;
+  const body = rows.map((r) => {
+    const label = [r.other_city, r.other_iata].filter(Boolean).join(" · ");
+    const out = Number((r.outbound && r.outbound.weekly_demand) || 0);
+    const inn = Number((r.inbound && r.inbound.weekly_demand) || 0);
+    const cost = Number(r.open_cost || 0);
+    const costTxt = r.network_status === "open" ? "—" : money(cost);
+    return `<tr class="rt-sug-row" data-dest="${escapeHtml(r.other_iata)}" tabindex="0">
+      <td><b>${escapeHtml(label)}</b>${routeSuggestionStatus(r)}</td>
+      <td>${out.toLocaleString()}</td>
+      <td>${inn.toLocaleString()}</td>
+      <td>${Number(r.distance_nm || 0).toLocaleString()} nm</td>
+      <td>${escapeHtml(formatBlockHours(r.flight_hours))}</td>
+      <td>${escapeHtml(costTxt)}</td>
+    </tr>`;
+  }).join("");
+  return `<table class="grid rt-sug-grid">
+    <thead><tr>
+      ${hdr("Destination")}
+      ${hdr(`${origin} →`)}
+      ${hdr(`→ ${origin}`)}
+      ${hdr("Distance")}
+      ${hdr("Est. time")}
+      ${hdr("Open cost")}
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
 function openRoutes() {
+  const hubDefault = (lastState && lastState.airline && lastState.airline.home_hub_iata) || "";
   const el = openWindow("routes", "Open route", `
     <div class="row2">
-      <div><label>Origin</label><input id="rt-o" placeholder="TPA" maxlength="4" /></div>
-      <div><label>Destination</label><input id="rt-d" placeholder="MCO" maxlength="4" /></div>
+      <div><label>Origin</label><input id="rt-o" placeholder="TPA" maxlength="4" value="${escapeHtml(hubDefault)}" /></div>
+      <div id="rt-manual-dest"><label>Destination</label><input id="rt-d" placeholder="MCO" maxlength="4" /></div>
     </div>
-    <button type="button" id="rt-preview">Preview cost</button>
-    <button type="button" id="rt-open">Open route</button>
-    <div id="rt-prev" class="muted"></div>
+    <div class="win-tabs" id="rt-tabs">
+      <button type="button" class="active" data-rt-tab="popular">Popular destinations</button>
+      <button type="button" data-rt-tab="manual">Manual search</button>
+    </div>
+    <div id="rt-popular-panel">
+      <p class="muted" id="rt-pop-hint">Enter an origin to see popular markets.</p>
+      <div id="rt-suggestions"></div>
+    </div>
+    <div id="rt-manual-panel" hidden>
+      <button type="button" id="rt-preview">Preview cost</button>
+      <button type="button" id="rt-open">Open route</button>
+      <div id="rt-prev" class="muted"></div>
+    </div>
     <div id="rt-list"></div>`);
-  attachAirportPicker($("#rt-o", el));
+
+  const originInput = $("#rt-o", el);
+  const destWrap = $("#rt-manual-dest", el);
+  const popularPanel = $("#rt-popular-panel", el);
+  const manualPanel = $("#rt-manual-panel", el);
+  const sugBox = $("#rt-suggestions", el);
+  const popHint = $("#rt-pop-hint", el);
+
+  attachAirportPicker(originInput);
   attachAirportPicker($("#rt-d", el));
-  const showList = async () => {
-    const list = await api("/api/routes");
-    $("#rt-list", el).innerHTML = `<p class="muted">Your routes</p><table class="grid"><tbody>${
-      (list.routes || []).map((r) => `<tr><td>${escapeHtml(r.route_id)}</td><td>${Number(r.distance_nm || 0).toFixed(0)} nm</td><td><button type="button" data-route="${escapeHtml(r.route_id)}">Detail</button></td></tr>`).join("")
-    }</tbody></table>`;
-    el.querySelectorAll("[data-route]").forEach((btn) => {
-      btn.onclick = () => openRouteDetail(btn.dataset.route);
+
+  let sugTimer = null;
+  let sugSeq = 0;
+  let lastSugOrigin = "";
+
+  const setTab = (name) => {
+    const popular = name === "popular";
+    popularPanel.hidden = !popular;
+    manualPanel.hidden = popular;
+    destWrap.hidden = popular;
+    el.querySelectorAll("#rt-tabs button").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.rtTab === name);
     });
   };
-  $("#rt-preview", el).onclick = async () => {
+
+  el.querySelectorAll("#rt-tabs button").forEach((btn) => {
+    btn.onclick = () => setTab(btn.dataset.rtTab || "popular");
+  });
+
+  const previewRoute = async () => {
     try {
-      const o = await resolveAirportCode($("#rt-o", el).value);
+      const o = await resolveAirportCode(originInput.value);
       const d = await resolveAirportCode($("#rt-d", el).value);
-      $("#rt-o", el).value = o;
+      originInput.value = o;
       $("#rt-d", el).value = d;
       const p = await api(`/api/routes/preview?origin=${encodeURIComponent(o)}&dest=${encodeURIComponent(d)}`);
       const note = p.already_operated ? " · you already operate this" : "";
@@ -639,21 +707,108 @@ function openRoutes() {
         + `<span class="tip-body">${routePreviewCard(p)}</span></span>`;
     } catch (err) { $("#rt-prev", el).innerHTML = `<span class="err">${err.message}</span>`; }
   };
+
+  const wireSuggestionRows = () => {
+    sugBox.querySelectorAll(".rt-sug-row").forEach((row) => {
+      const pick = async () => {
+        const dest = row.dataset.dest;
+        if (!dest) return;
+        $("#rt-d", el).value = dest;
+        setTab("manual");
+        await previewRoute();
+      };
+      row.onclick = pick;
+      row.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          pick();
+        }
+      };
+    });
+  };
+
+  const loadSuggestions = async () => {
+    const raw = originInput.value.trim();
+    if (!raw) {
+      popHint.textContent = "Enter an origin to see popular markets.";
+      sugBox.innerHTML = "";
+      lastSugOrigin = "";
+      return;
+    }
+    const seq = ++sugSeq;
+    popHint.textContent = "Loading markets…";
+    sugBox.innerHTML = "";
+    let origin;
+    try {
+      origin = await resolveAirportCode(raw);
+    } catch (err) {
+      if (seq !== sugSeq) return;
+      popHint.textContent = err.message || "Unknown origin.";
+      return;
+    }
+    if (seq !== sugSeq) return;
+    if (origin !== raw.toUpperCase()) originInput.value = origin;
+    if (origin === lastSugOrigin && sugBox.dataset.loaded === "1") {
+      popHint.textContent = `Markets from ${origin}`;
+      return;
+    }
+    try {
+      const r = await api(`/api/routes/suggestions?origin=${encodeURIComponent(origin)}&limit=25`);
+      if (seq !== sugSeq) return;
+      lastSugOrigin = origin;
+      sugBox.dataset.loaded = "1";
+      const rows = r.suggestions || [];
+      popHint.textContent = rows.length
+        ? `Top markets from ${origin} (weekly pax, both directions)`
+        : `No strong markets found from ${origin}.`;
+      sugBox.innerHTML = renderRouteSuggestionsTable(origin, rows);
+      wireSuggestionRows();
+    } catch (err) {
+      if (seq !== sugSeq) return;
+      popHint.textContent = "";
+      sugBox.innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+    }
+  };
+
+  const scheduleSuggestions = () => {
+    sugBox.dataset.loaded = "0";
+    clearTimeout(sugTimer);
+    sugTimer = setTimeout(() => { loadSuggestions().catch(() => {}); }, 350);
+  };
+
+  originInput.addEventListener("input", scheduleSuggestions);
+  originInput.addEventListener("change", () => { loadSuggestions().catch(() => {}); });
+
+  const showList = async () => {
+    const list = await api("/api/routes");
+    $("#rt-list", el).innerHTML = `<p class="muted">Your routes</p><table class="grid"><tbody>${
+      (list.routes || []).map((r) => `<tr><td>${escapeHtml(r.route_id)}</td><td>${Number(r.distance_nm || 0).toFixed(0)} nm</td><td><button type="button" data-route="${escapeHtml(r.route_id)}">Detail</button></td></tr>`).join("")
+    }</tbody></table>`;
+    el.querySelectorAll("[data-route]").forEach((btn) => {
+      btn.onclick = () => openRouteDetail(btn.dataset.route);
+    });
+  };
+  $("#rt-preview", el).onclick = () => { previewRoute().catch(() => {}); };
   $("#rt-open", el).onclick = async () => {
     try {
       await api("/api/routes", {
         method: "POST",
         body: JSON.stringify({
-          origin: await resolveAirportCode($("#rt-o", el).value),
+          origin: await resolveAirportCode(originInput.value),
           dest: await resolveAirportCode($("#rt-d", el).value),
         }),
       });
       toast("Route opened");
       await refreshHud();
       await showList();
+      sugBox.dataset.loaded = "0";
+      lastSugOrigin = "";
+      await loadSuggestions();
     } catch (err) { toast(err.message); }
   };
+  setTab("popular");
   showList().catch((err) => toast(err.message));
+  if (hubDefault) loadSuggestions().catch(() => {});
 }
 
 function escapeHtml(s) {
