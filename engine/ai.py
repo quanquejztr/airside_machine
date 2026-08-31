@@ -74,6 +74,46 @@ def _ai_hub_radius_nm() -> float:
     return float(_fc("ai_hub_radius_nm", 2500.0))
 
 
+def _pick_aircraft_type(category_sql: str, preferred: str) -> str:
+    row = db.fetch_one(
+        "SELECT type_id FROM aircraft_types WHERE type_id = ? LIMIT 1",
+        (preferred,),
+    ) or db.fetch_one(
+        f"SELECT type_id FROM aircraft_types WHERE category IN {category_sql} "
+        "ORDER BY weekly_lease_cost ASC LIMIT 1"
+    )
+    return str(row["type_id"]) if row and row["type_id"] else preferred
+
+
+def _hub_radius_for_competitor(competitor_id: str, strategy: str) -> float:
+    """Hub reach for candidate generation; international majors use intercontinental radius."""
+    spec = _spec_for(competitor_id)
+    strat = str(strategy or "").upper()
+    rad = float(spec.get("hub_radius_nm") or _ai_hub_radius_nm())
+    if spec.get("international"):
+        intl_rad = float(spec.get("international_radius_nm") or 5600.0)
+        if strat in ("HUBSPOKE", "POINTTOPOINT", "PREMIUM"):
+            rad = max(rad, intl_rad)
+    elif strat == "PREMIUM":
+        rad = max(rad, 4200.0)
+    elif strat == "BUDGET":
+        rad = min(rad, 1500.0)
+    return rad
+
+
+_WIDE_TYPE_IDS: Optional[set] = None
+
+
+def _wide_type_ids() -> set:
+    global _WIDE_TYPE_IDS
+    if _WIDE_TYPE_IDS is None:
+        _WIDE_TYPE_IDS = {
+            str(r["type_id"])
+            for r in db.fetch_all("SELECT type_id FROM aircraft_types WHERE category = 'WIDE'")
+        }
+    return _WIDE_TYPE_IDS
+
+
 def _ai_price_undercut_pct() -> float:
     return float(_fc("ai_price_undercut_pct", 0.08))
 
@@ -574,38 +614,33 @@ def _sync_competitor_slots(competitor_id: str, game_week: int | None = None) -> 
 
 def _seed_ai_fleet_for_competitor(competitor_id: str, fleet_size: int, strategy: str) -> None:
     """
-    Seed ai_fleet rows for an AI. For now: generate N tails of a strategy-appropriate type.
+    Seed ai_fleet rows for an AI. International hub carriers get a narrow + wide mix.
     """
     cid = str(competitor_id)
     n = max(0, int(fleet_size))
     if n <= 0:
         return
-    # Strategy-appropriate types; avoid always picking max-range (= max lease).
-    if strategy == "PREMIUM":
-        pick = db.fetch_one(
-            "SELECT type_id FROM aircraft_types WHERE type_id = 'B789' LIMIT 1"
-        ) or db.fetch_one(
-            "SELECT type_id FROM aircraft_types WHERE category = 'WIDE' "
-            "ORDER BY weekly_lease_cost ASC LIMIT 1"
-        )
-    elif strategy == "BUDGET":
-        pick = db.fetch_one(
-            "SELECT type_id FROM aircraft_types WHERE type_id IN ('CRJ7','E175','A320') "
-            "ORDER BY weekly_lease_cost ASC LIMIT 1"
-        )
-    else:
-        pick = db.fetch_one(
-            "SELECT type_id FROM aircraft_types WHERE type_id IN ('A320','B738') "
-            "ORDER BY weekly_lease_cost ASC LIMIT 1"
-        )
-    type_id = str(pick["type_id"]) if pick and pick["type_id"] else "A320"
+    spec = _spec_for(cid)
+    strat = str(strategy or "").upper()
+    international = bool(spec.get("international"))
+
+    def _type_for_index(i: int) -> str:
+        if strat == "PREMIUM" or (international and strat in ("HUBSPOKE", "POINTTOPOINT")):
+            narrow = _pick_aircraft_type("('NARROW')", "A320")
+            wide = _pick_aircraft_type("('WIDE')", "B789")
+            narrow_n = max(1, int(n * 0.55))
+            return wide if i > narrow_n else narrow
+        if strat == "BUDGET":
+            return _pick_aircraft_type("('NARROW','REGIONAL_JET')", "A320")
+        return _pick_aircraft_type("('NARROW')", "A320")
+
     for i in range(1, n + 1):
         tail = f"{cid.split('_')[-1][:2]}-{i:03d}"
         if db.fetch_one("SELECT 1 FROM ai_fleet WHERE ai_tail = ?", (tail,)):
             continue
         db.execute(
             "INSERT OR REPLACE INTO ai_fleet (ai_tail, competitor_id, type_id, status, assigned_route_pair_id) VALUES (?, ?, ?, 'ACTIVE', NULL)",
-            (tail, cid, type_id),
+            (tail, cid, _type_for_index(i)),
         )
 
 
@@ -880,12 +915,8 @@ def ai_generate_candidates(competitor_id: str) -> List[str]:
         return []
     hub_lat = float(hub_row["lat"])
     hub_lon = float(hub_row["lon"])
-    rad = _ai_hub_radius_nm()
-    # Widebody long-haul: 2500nm from DXB excludes LHR/CDG and empties the pool.
-    if strat == "PREMIUM":
-        rad = max(rad, 4200.0)
-    elif strat == "BUDGET":
-        rad = min(rad, 1500.0)
+    rad = _hub_radius_for_competitor(cid, strat)
+    spec = _spec_for(cid)
 
     # Filter airports by radius and strategy gates.
     arows = db.fetch_all("SELECT iata, lat, lon, score, category FROM airports")
@@ -980,7 +1011,8 @@ def ai_generate_candidates(competitor_id: str) -> List[str]:
         (gated if _needs_foreign_gate(p) else ungated).append(p)
     ungated.sort(key=lambda p: (0 if hub in (p.split("-", 1)[0], p.split("-", 1)[-1]) else 1, -score_of.get(p, 0)))
     pool = max(5, _ai_candidate_pool_size())
-    n_free = max(4, pool // 3)
+    # International carriers bid on trophy airports; give gated pairs more pool slots.
+    n_free = max(2, pool // 5) if spec.get("international") else max(4, pool // 3)
     top = gated[: max(0, pool - n_free)] + ungated[:n_free]
     # de-dupe, preserve order
     seen = set()
@@ -1070,6 +1102,12 @@ def ai_resolve_aircraft_type(competitor_id: str, route_pair_id: str) -> Optional
             (dist,),
         )
     ids = [str(r["type_id"]) for r in (rows or [])]
+    wide = _wide_type_ids()
+    # Long-haul needs widebodies — do not assign a owned narrow to a 7,000 nm leg.
+    if dist >= 3000.0:
+        for t in ids:
+            if t in wide:
+                return t
     for t in ids:
         if t in owned:
             return t
@@ -1220,6 +1258,9 @@ def ai_score_candidate(competitor_id: str, route_pair_id: str, game_week: int) -
         (cid, f"{a}-%", f"%-{a}", f"{b}-%", f"%-{b}"),
     )
     if int(conn_n["c"] or 0) > 2:
+        network_fit = min(1.0, network_fit + 0.12)
+
+    if _spec_for(cid).get("international") and float(rt["distance_nm"] or 0) >= 2500.0:
         network_fit = min(1.0, network_fit + 0.12)
 
     # Component 5 feasibility

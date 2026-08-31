@@ -165,6 +165,61 @@ class TestScheduling(LifecycleBase):
         gap = (float(segs[1]["d"]) - float(segs[0]["a"])) * 60.0
         self.assertAlmostEqual(240.0, gap, places=1)
 
+    def test_chained_detailed_airborne_uses_operating_days_not_calendar_span(self):
+        """One weekly start must not multiply block time by weekday labels the rotation crosses."""
+        from engine.scheduling import create_chained_detailed_rotation, _plan_chained_detailed_segments
+        from engine.routes import get_route
+
+        others = [s for s in self.spokes if s != self.spoke]
+        if not others:
+            self.skipTest("need a second spoke")
+        spoke2 = others[0]
+        out2, in2 = self.g.open_round_trip(spoke2)
+        route_ids = [self.out_id, self.in_id, self.out_id, self.in_id, out2, in2]
+        turn_mins = [600] * len(route_ids)  # long turns stretch calendar span, not airborne hours
+
+        self.db.execute(
+            "INSERT OR REPLACE INTO financial_constants (key, value) VALUES "
+            "('max_weekly_airborne_hours_per_tail', 8.0)"
+        )
+        gw = int(self.db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")["game_week"])
+        cruise = float(self.db.fetch_one(
+            "SELECT cruise_speed_kts FROM aircraft_types WHERE type_id = ?", (self.type_id,)
+        )["cruise_speed_kts"] or 450)
+        routes = [dict(get_route(rid)) for rid in route_ids]
+        planned, fh_list, _ = _plan_chained_detailed_segments(
+            gw,
+            ["THU"],
+            "08:00",
+            routes,
+            ["X1"] * len(route_ids),
+            cruise,
+            0.5,
+            turn_hours=[m / 60.0 for m in turn_mins],
+        )
+        calendar_labels = len({p["day"] for p in planned})
+        airborne_once = sum(fh_list)
+        self.assertGreater(calendar_labels, 1)
+        self.assertLess(airborne_once, 8.0)
+        self.assertGreater(
+            airborne_once * calendar_labels,
+            8.0,
+            "old formula multiplied by calendar labels and would reject",
+        )
+        create_chained_detailed_rotation(
+            self.tail,
+            route_ids,
+            [f"CH{i}" for i in range(len(route_ids))],
+            '["THU"]',
+            "08:00",
+            turn_minutes=turn_mins,
+        )
+        rows = self.db.fetch_all(
+            "SELECT route_id FROM flight_schedules WHERE tail_number = ? AND active = 1",
+            (self.tail,),
+        )
+        self.assertEqual(len(route_ids), len(rows))
+
     def test_clear_removes_plan_and_repositions(self):
         from engine.scheduling import assign_rotation, cancel_rotation
         assign_rotation(self.tail, [self.out_id])          # one-way: ends at the spoke

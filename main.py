@@ -773,6 +773,7 @@ def game_clock_menu():
         console.print("  [cyan]3.[/cyan] Set speed 2×")
         console.print("  [cyan]4.[/cyan] Set speed 4×")
         console.print("  [cyan]4s.[/cyan] Speedrun: set speed 20×")
+        console.print("  [cyan]6s.[/cyan] Turbo: set speed 60×")
         console.print("  [cyan]5.[/cyan] Back to main menu")
         p = get_pause_on_week_summary()
         console.print(
@@ -819,6 +820,9 @@ def game_clock_menu():
                 console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
             elif sub in ("4s", "s", "20", "20x", "20×"):
                 ok, msg = clk.set_speed(20, player_initiated=True)
+                console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
+            elif sub in ("6s", "60", "60x", "60×"):
+                ok, msg = clk.set_speed(60, player_initiated=True)
                 console.print(f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]")
             elif sub == "5":
                 break

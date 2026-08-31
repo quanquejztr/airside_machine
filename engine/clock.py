@@ -18,6 +18,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db import db
 
+# Pause + simulation speed tiers exposed in UI/CLI/API.
+ALLOWED_SPEED_MULTIPLIERS = (0, 1, 2, 4, 20, 60)
+
+
+def calendar_week_from_game_hours(game_hours_elapsed: float) -> int:
+    """1-based calendar week from absolute game hours (week 1 starts at hour 0)."""
+    return int(float(game_hours_elapsed) // 168.0) + 1
+
+
+def clock_thread_active() -> bool:
+    clk = get_global_clock()
+    return clk is not None and clk.is_alive()
+
 
 def _cash_warning_threshold() -> float:
     row = db.fetch_one(
@@ -125,8 +138,16 @@ class GameClock(threading.Thread):
                     sp = int(self.speed_multiplier)
                 try:
                     self._persist_game_state_unlocked()
-                except Exception:
-                    pass
+                    self._persist_error_sent = False
+                except Exception as exc:
+                    if not getattr(self, "_persist_error_sent", False):
+                        self._persist_error_sent = True
+                        try:
+                            from engine.news_feed import push_news
+
+                            push_news(f"⚠ Clock persist failed: {exc}")
+                        except Exception:
+                            pass
                 try:
                     if self.on_tick:
                         self.on_tick(ghe, sp)
@@ -273,8 +294,9 @@ class GameClock(threading.Thread):
             self.last_auto_pause_reason = None
 
     def set_speed(self, multiplier, *, player_initiated: bool = False):
-        if multiplier not in (0, 1, 2, 4, 20):
-            return False, f"Invalid speed multiplier: {multiplier}. Must be 0, 1, 2, 4, or 20."
+        if multiplier not in ALLOWED_SPEED_MULTIPLIERS:
+            allowed = ", ".join(str(x) for x in ALLOWED_SPEED_MULTIPLIERS)
+            return False, f"Invalid speed multiplier: {multiplier}. Must be one of: {allowed}."
 
         with self.lock:
             old_speed = self.speed_multiplier
@@ -397,6 +419,42 @@ def get_display_game_hours():
         return clk.get_interpolated_game_hours()
     gt = get_game_time()
     return float(gt["game_hours_elapsed"]) if gt else 0.0
+
+
+def get_api_clock_status() -> dict:
+    """
+    Authoritative clock payload for HTTP/UI.
+
+    When the clock thread is not running, report speed 0 so the browser does not
+    extrapolate ahead of persisted game_hours_elapsed (stale DB speed_multiplier
+  would otherwise make the HUD race weeks ahead of the sim).
+    """
+    clk = get_global_clock()
+    if clk is not None and clk.is_alive():
+        status = clk.get_status()
+        status["clock_alive"] = True
+        return status
+
+    ghe = float(get_display_game_hours())
+    week = calendar_week_from_game_hours(ghe)
+    hours_in_week = ghe % 168.0
+    day = int(hours_in_week // 24) + 1
+    hod = hours_in_week % 24.0
+    hh = int(hod)
+    mm = int((hod - hh) * 60.0) % 60
+    return {
+        "game_hours_elapsed": ghe,
+        "current_game_hour": ghe,
+        "current_week": week,
+        "current_day": day,
+        "current_hour": hh,
+        "speed_multiplier": 0,
+        "is_paused": True,
+        "real_seconds_per_game_hour": 30.0,
+        "time_display": f"Week {week} · Day {day} · {hh:02d}:{mm:02d} · paused",
+        "auto_pause_alert": None,
+        "clock_alive": False,
+    }
 
 
 def get_game_time():

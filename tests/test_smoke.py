@@ -406,6 +406,23 @@ class TestClockSpeed(unittest.TestCase):
             self.assertAlmostEqual(before, after, delta=0.05)
             self.assertEqual(20, clk.speed_multiplier)
 
+    def test_dead_clock_reports_paused_speed_for_api(self):
+        """Regression: stale DB speed 60 + dead thread made the HUD extrapolate weeks ahead."""
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine import clock as clock_mod
+            from engine.clock import GameClock, get_api_clock_status
+
+            clk = GameClock()
+            clk.running = False
+            clk.set_speed(60, player_initiated=True)
+            clk._persist_game_state_unlocked()
+            clock_mod._global_clock = clk
+            st = get_api_clock_status()
+            self.assertFalse(st["clock_alive"])
+            self.assertEqual(0, st["speed_multiplier"])
+            self.assertTrue(st["is_paused"])
+
 
 class TestFlightMapVisibility(unittest.TestCase):
     def test_future_legs_are_not_all_drawn(self):
@@ -959,6 +976,31 @@ class TestAIWiring(unittest.TestCase):
                 "SELECT competitor_id, error FROM ai_turn_log WHERE game_week=? AND error IS NOT NULL",
                 (week,))
             self.assertEqual([], [f"{r['competitor_id']}: {r['error']}" for r in errs])
+
+    def test_international_ai_reaches_intercontinental_radius(self):
+        with TempSave() as db:
+            from engine.ai import _hub_radius_for_competitor, ai_generate_candidates, load_competitor_specs
+            from engine.routes import get_route
+
+            titan = next(s for s in load_competitor_specs() if s["competitor_id"] == "AI_TITAN")
+            self.assertTrue(titan.get("international"))
+            self.assertGreaterEqual(_hub_radius_for_competitor("AI_TITAN", "HUBSPOKE"), 5600.0)
+            self.assertLessEqual(_hub_radius_for_competitor("AI_TEMPEST", "BUDGET"), 1500.0)
+
+            pairs = ai_generate_candidates("AI_TITAN")
+            self.assertTrue(any("LHR" in p or "CDG" in p or "FRA" in p for p in pairs),
+                            f"expected European pairs in pool, got sample {pairs[:8]}")
+
+            from engine.ai import ai_resolve_aircraft_type, _wide_type_ids
+            rt = get_route("ATL-LHR")
+            if rt and float(rt["distance_nm"] or 0) >= 3000:
+                db.execute("DELETE FROM ai_fleet WHERE competitor_id = 'AI_TITAN'")
+                db.execute(
+                    "INSERT INTO ai_fleet (ai_tail, competitor_id, type_id, status) VALUES (?, ?, ?, 'ACTIVE')",
+                    ("TN-001", "AI_TITAN", "A320"),
+                )
+                picked = ai_resolve_aircraft_type("AI_TITAN", "ATL-LHR")
+                self.assertIn(picked, _wide_type_ids())
 
     def test_reset_airline_reseeds_competitors_from_json(self):
         with FreshGame(hub="SGN", callsign="VNA", name="VNA") as world:

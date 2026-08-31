@@ -73,8 +73,9 @@ def gate_price_step() -> float:
 
 
 def current_game_week() -> int:
-    row = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
-    return int(row["game_week"] or 1) if row else 1
+    from engine.scheduling.time_helpers import calendar_game_week_from_state
+
+    return calendar_game_week_from_state()
 
 
 def is_auctioned_airport(iata: str) -> bool:

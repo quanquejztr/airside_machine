@@ -82,6 +82,15 @@ def _ai_bootstrap_bg() -> None:
 
 def ensure_runtime_clock():
     """Start the game clock immediately. AI seed work is backgrounded so 20× is not blocked."""
+    return _start_runtime_clock(full_bootstrap=True)
+
+
+def ensure_clock_running():
+    """Keep the clock thread alive without repeating heavy boot work."""
+    return _start_runtime_clock(full_bootstrap=False)
+
+
+def _start_runtime_clock(*, full_bootstrap: bool):
     from engine.clock import get_global_clock, start_game_clock
     from engine.scheduling import on_arrival, on_departure
     from engine.ai_flights import ai_on_arrival as ai_on_arrival_cb
@@ -92,29 +101,33 @@ def ensure_runtime_clock():
         return None
 
     existing = get_global_clock()
-    if existing is None or not existing.is_alive():
+    if existing is not None and existing.is_alive():
+        return existing
 
-        def on_week_roll(new_week):
-            if new_week <= 1:
-                return
-            enqueue_settlement_after_week_boundary(new_week)
+    def on_week_roll(new_week):
+        if new_week <= 1:
+            return
+        enqueue_settlement_after_week_boundary(new_week)
 
-        def on_fuel_tick(game_hours_elapsed, speed_multiplier):
-            try:
-                from engine import fuel as fuel_mod
+    def on_fuel_tick(game_hours_elapsed, speed_multiplier):
+        try:
+            from engine import fuel as fuel_mod
 
-                fuel_mod.tick_fuel_price(game_hours_elapsed, speed_multiplier)
-            except Exception:
-                pass
+            fuel_mod.tick_fuel_price(game_hours_elapsed, speed_multiplier)
+        except Exception:
+            pass
 
-        existing = start_game_clock(
-            on_week=on_week_roll,
-            on_tick=on_fuel_tick,
-            on_departure=on_departure,
-            on_arrival=on_arrival,
-            on_ai_departure=ai_on_departure_cb,
-            on_ai_arrival=ai_on_arrival_cb,
-        )
+    existing = start_game_clock(
+        on_week=on_week_roll,
+        on_tick=on_fuel_tick,
+        on_departure=on_departure,
+        on_arrival=on_arrival,
+        on_ai_departure=ai_on_departure_cb,
+        on_ai_arrival=ai_on_arrival_cb,
+    )
+
+    if not full_bootstrap:
+        return existing
 
     try:
         from engine.settlement import catch_up_missing_settlements
@@ -228,9 +241,11 @@ class _Handler(BaseHTTPRequestHandler):
         from server import game_api as api
 
         if path == "/api/state":
+            ensure_clock_running()
             self._send_json(api.get_state())
             return
         if path == "/api/flight-map.json":
+            ensure_clock_running()
             self._send_json(api.flight_map())
             return
         if path == "/api/airports":

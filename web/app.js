@@ -9,19 +9,28 @@ let winOffset = 0;
 let lastState = null;
 let hudSeq = 0;
 let didFitFlights = false;
-const mapClock = { hour: 0, speed: 0, realSecPerHour: 30, at: 0 };
+const mapClock = { hour: 0, speed: 0, realSecPerHour: 30, at: 0, alive: true };
 const seenNoticeIds = new Set();
 
 function syncMapClock(src) {
   if (!src) return;
-  if (src.game_hours_elapsed != null) mapClock.hour = Number(src.game_hours_elapsed);
-  if (src.current_game_hour != null) mapClock.hour = Number(src.current_game_hour);
+  const incoming = src.current_game_hour != null ? Number(src.current_game_hour)
+    : src.game_hours_elapsed != null ? Number(src.game_hours_elapsed)
+    : null;
+  if (incoming != null && Number.isFinite(incoming)) {
+    const extrapolated = mapClock.at ? liveGameHour() : mapClock.hour;
+    if (!Number.isFinite(extrapolated) || Math.abs(incoming - extrapolated) > 0.05) {
+      mapClock.hour = incoming;
+    }
+  }
   if (src.speed_multiplier != null) mapClock.speed = Number(src.speed_multiplier);
   if (src.real_seconds_per_game_hour) mapClock.realSecPerHour = Number(src.real_seconds_per_game_hour);
+  if (src.clock_alive != null) mapClock.alive = Boolean(src.clock_alive);
   mapClock.at = performance.now();
 }
 
 function liveGameHour() {
+  if (mapClock.alive === false) return mapClock.hour;
   const elapsed = (performance.now() - (mapClock.at || performance.now())) / 1000;
   return mapClock.hour + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
 }
