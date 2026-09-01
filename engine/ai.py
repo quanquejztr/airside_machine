@@ -588,11 +588,12 @@ def _ensure_competitors_seeded_body() -> None:
 
 
 def _airport_freq_map(competitor_id: str) -> Dict[str, int]:
+    """Sum weekly frequencies per airport across all ACTIVE routes (not max)."""
     out: Dict[str, int] = {}
     for r in db.fetch_all(
         """
         SELECT route_pair_id, frequency_per_week FROM competitor_routes
-        WHERE competitor_id = ? AND COALESCE(status, 'ACTIVE') IN ('ACTIVE', 'SUSPENDED')
+        WHERE competitor_id = ? AND COALESCE(status, 'ACTIVE') = 'ACTIVE'
         """,
         (str(competitor_id),),
     ):
@@ -602,7 +603,7 @@ def _airport_freq_map(competitor_id: str) -> Dict[str, int]:
             continue
         freq = max(1, int(r["frequency_per_week"] or 1))
         for ap in parts:
-            out[ap] = max(out.get(ap, 0), freq)
+            out[str(ap).upper()] = int(out.get(str(ap).upper(), 0)) + freq
     return out
 
 
@@ -774,10 +775,10 @@ def ai_update_load_streaks(competitor_id: str, demand_week: int, current_month: 
     cid = str(competitor_id)
     rows = db.fetch_all(
         """
-        SELECT outbound_route_id, route_pair_id, COALESCE(consecutive_loss_weeks, 0) AS lw,
+        SELECT outbound_route_id, route_pair_id, COALESCE(low_lf_weeks, 0) AS lw,
                COALESCE(actual_weekly_revenue_avg, 0) AS actual_rev
         FROM competitor_routes
-        WHERE competitor_id = ?
+        WHERE competitor_id = ? AND COALESCE(status, 'ACTIVE') = 'ACTIVE'
         """,
         (cid,),
     )
@@ -799,7 +800,7 @@ def ai_update_load_streaks(competitor_id: str, demand_week: int, current_month: 
         db.execute(
             """
             UPDATE competitor_routes
-            SET consecutive_loss_weeks = ?
+            SET low_lf_weeks = ?
             WHERE competitor_id = ? AND route_pair_id = ?
             """,
             (int(lw), cid, pair),
@@ -853,6 +854,13 @@ def ai_light_pass(competitor_id: str, game_week: int) -> None:
     gw = int(game_week)
     month = _current_month()
     _ai_stance(cid, gw)
+    try:
+        from engine.ai_gates import sync_hub_gates_to_network
+
+        sync_hub_gates_to_network(cid)
+        _sync_competitor_slots(cid, gw)
+    except Exception:
+        pass
     from engine.ai_economics import charge_weekly_fixed_costs
 
     lease = charge_weekly_fixed_costs(cid)
@@ -869,6 +877,7 @@ def ai_light_pass(competitor_id: str, game_week: int) -> None:
     _open_queued_candidates(cid, gw)
     _remove_closed_routes(cid, gw)
     _financial_distress_check(cid, gw)
+    _reactivate_suspended_routes(cid, gw)
 
 
 def ai_full_evaluation(competitor_id: str, game_week: int) -> None:
@@ -878,6 +887,13 @@ def ai_full_evaluation(competitor_id: str, game_week: int) -> None:
     """
     cid = str(competitor_id)
     gw = int(game_week)
+    try:
+        from engine.ai_gates import sync_hub_gates_to_network
+
+        sync_hub_gates_to_network(cid)
+        _sync_competitor_slots(cid, gw)
+    except Exception:
+        pass
     candidates = ai_generate_candidates(cid)
     scored = []
     for rid in candidates:
@@ -1499,6 +1515,7 @@ def _update_loss_tracking_and_status(competitor_id: str) -> None:
     rows = db.fetch_all("SELECT * FROM competitor_routes WHERE competitor_id = ?", (cid,))
     profile = _growth_profile(cid)
     extra_grace = int(profile["extra_exit_grace_weeks"])
+    require_flown = bool(profile.get("require_flown_pnl_to_exit", True))
     hub_row = db.fetch_one(
         "SELECT home_hub_iata, strategy FROM competitors WHERE competitor_id = ?",
         (cid,),
@@ -1562,7 +1579,7 @@ def _update_loss_tracking_and_status(competitor_id: str) -> None:
             low_lf += 1
         else:
             low_lf = 0
-        if flown_loss >= thresh or low_lf >= 6:
+        if flown_loss >= thresh or (not require_flown and low_lf >= 6):
             status = "CLOSING"
             append_ai_narrative(cid, f"CLOSING:{pair}:net{net_avg:.0f}:lf{lf_avg:.2f}")
         db.execute(
@@ -2104,6 +2121,71 @@ def _decrement_cooldowns(competitor_id: str, game_week: int) -> None:
         (int(k), cid),
     )
     db.execute("DELETE FROM ai_memory WHERE competitor_id = ? AND cooldown_weeks <= 0", (cid,))
+
+
+def _reactivate_suspended_routes(competitor_id: str, game_week: int) -> None:
+    """
+    Restore SUSPENDED routes when the airline recovers financially.
+
+    Suspension is one-way in distress; without reactivation the roster shrinks forever
+    even after cash turns positive.
+    """
+    cid = str(competitor_id)
+    if _competitor_stance(cid) == "CONSOLIDATE":
+        return
+    comp = db.fetch_one("SELECT cash FROM competitors WHERE competitor_id = ?", (cid,))
+    if not comp or float(comp["cash"] or 0.0) < 0.0:
+        return
+
+    from engine.ai_economics import block_hours, fleet_block_hours_cap, fleet_block_hours_used
+    from engine.ai_gates import ai_gate_shortfall
+    from engine.routes import get_route
+
+    gw = int(game_week)
+    mtt = _mtt_hours_ai()
+    rows = db.fetch_all(
+        """
+        SELECT route_pair_id, outbound_route_id, frequency_per_week, aircraft_type_id,
+               estimated_weekly_profit
+        FROM competitor_routes
+        WHERE competitor_id = ? AND status = 'SUSPENDED'
+        ORDER BY estimated_weekly_profit DESC
+        """,
+        (cid,),
+    )
+    for r in rows or []:
+        pair = str(r["route_pair_id"])
+        freq = max(1, int(r["frequency_per_week"] or 1))
+        out_id = str(r["outbound_route_id"])
+        rt = get_route(out_id)
+        if not rt:
+            continue
+        dist = float(rt["distance_nm"] or 0.0)
+        tid = str(r["aircraft_type_id"] or "A320")
+        extra_h = 2.0 * freq * block_hours(dist, tid)
+        if fleet_block_hours_used(cid) + extra_h > fleet_block_hours_cap(cid) + 0.5:
+            continue
+        origin, dest = _route_pair_components(pair)
+        overrides = {pair.upper(): freq}
+        if ai_gate_shortfall(cid, origin, [pair], mtt, freq_overrides=overrides) > 0:
+            continue
+        if ai_gate_shortfall(cid, dest, [pair], mtt, freq_overrides=overrides) > 0:
+            continue
+        try:
+            cap = slot_freq_cap(cid, origin, dest, gw)
+            if cap < freq:
+                continue
+        except Exception:
+            pass
+        db.execute(
+            """
+            UPDATE competitor_routes
+            SET status = 'ACTIVE', consecutive_loss_weeks = 0, low_lf_weeks = 0
+            WHERE competitor_id = ? AND route_pair_id = ?
+            """,
+            (cid, pair),
+        )
+        append_ai_narrative(cid, f"REACTIVATE:{pair}")
 
 
 def _financial_distress_check(competitor_id: str, game_week: int) -> None:

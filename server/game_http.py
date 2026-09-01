@@ -90,12 +90,26 @@ def ensure_clock_running():
     return _start_runtime_clock(full_bootstrap=False)
 
 
+def _on_week_roll(new_week: int) -> None:
+    if new_week <= 1:
+        return
+    from engine.settlement import (
+        enqueue_settlement_after_week_boundary,
+        spawn_segments_for_calendar_week,
+    )
+
+    try:
+        spawn_segments_for_calendar_week(new_week)
+    except Exception:
+        pass
+    enqueue_settlement_after_week_boundary(new_week)
+
+
 def _start_runtime_clock(*, full_bootstrap: bool):
     from engine.clock import get_global_clock, start_game_clock
     from engine.scheduling import on_arrival, on_departure
     from engine.ai_flights import ai_on_arrival as ai_on_arrival_cb
     from engine.ai_flights import ai_on_departure as ai_on_departure_cb
-    from engine.settlement import enqueue_settlement_after_week_boundary
 
     if not setup.airline_exists():
         return None
@@ -103,11 +117,6 @@ def _start_runtime_clock(*, full_bootstrap: bool):
     existing = get_global_clock()
     if existing is not None and existing.is_alive():
         return existing
-
-    def on_week_roll(new_week):
-        if new_week <= 1:
-            return
-        enqueue_settlement_after_week_boundary(new_week)
 
     def on_fuel_tick(game_hours_elapsed, speed_multiplier):
         try:
@@ -118,7 +127,7 @@ def _start_runtime_clock(*, full_bootstrap: bool):
             pass
 
     existing = start_game_clock(
-        on_week=on_week_roll,
+        on_week=_on_week_roll,
         on_tick=on_fuel_tick,
         on_departure=on_departure,
         on_arrival=on_arrival,

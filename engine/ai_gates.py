@@ -187,7 +187,7 @@ def _planned_freqs(
         """
         SELECT route_pair_id, frequency_per_week
         FROM competitor_routes
-        WHERE competitor_id = ? AND status IN ('ACTIVE','SUSPENDED')
+        WHERE competitor_id = ? AND status = 'ACTIVE'
         """,
         (cid,),
     )
@@ -319,6 +319,62 @@ def ai_bid_for_airport(
     return True
 
 
+def _hub_gate_floor(strategy: str) -> int:
+    return {
+        "HUBSPOKE": 4,
+        "BUDGET": 2,
+        "PREMIUM": 3,
+        "POINTTOPOINT": 2,
+    }.get(str(strategy or "").upper(), 2)
+
+
+def _hub_gate_cap() -> int:
+    try:
+        return max(4, int(float(db.get_financial_constant("ai_hub_gate_cap") or 24)))
+    except (TypeError, ValueError):
+        return 24
+
+
+def sync_hub_gates_to_network(
+    competitor_id: str,
+    *,
+    strategy: str | None = None,
+    hub: str | None = None,
+    mtt_hours: float | None = None,
+) -> int:
+    """
+    Grant enough hub stands for the ACTIVE network's peak concurrency (+1 buffer).
+
+    Starter megas were seeded with only 2–4 stands while running 6×5 weekly banks,
+    so spawn hit GATE_PEAK every week while routes stayed ACTIVE.
+    """
+    from engine.gates import _upsert_allocation, current_game_week
+
+    cid = str(competitor_id)
+    if strategy is None or hub is None:
+        row = db.fetch_one(
+            "SELECT strategy, home_hub_iata FROM competitors WHERE competitor_id = ?",
+            (cid,),
+        )
+        if not row:
+            return 0
+        strategy = str(row["strategy"] or "HUBSPOKE")
+        hub = str(row["home_hub_iata"] or "")
+    ap = str(hub).upper().strip()
+    if not ap or not is_auctioned_airport(ap):
+        return 0
+    mtt = float(mtt_hours if mtt_hours is not None else _mtt_hours_default())
+    peak = ai_peak_concurrent_at(cid, ap, [], mtt)
+    base = _hub_gate_floor(strategy)
+    target = min(_hub_gate_cap(), max(base, int(peak) + 1))
+    held = ai_gates_held(cid, ap)
+    if held >= target:
+        return 0
+    _upsert_allocation(ap, cid, target - held, effective_week=max(1, current_game_week()))
+    append_ai_narrative(cid, f"HUB_GATES:{ap}:{held}->{target}")
+    return target - held
+
+
 def seed_spoke_gate_if_needed(competitor_id: str, iata: str) -> None:
     """Give 1 stand at an auctioned spoke so a starter route is legal on week 1."""
     from engine.gates import _upsert_allocation
@@ -333,16 +389,5 @@ def seed_spoke_gate_if_needed(competitor_id: str, iata: str) -> None:
 
 
 def seed_competitor_hub_gates(competitor_id: str, strategy: str, hub: str) -> None:
-    """Give a new (or unallocated) AI starter stands at an auctioned hub."""
-    from engine.gates import _upsert_allocation
-
-    cid = str(competitor_id)
-    ap = str(hub).upper().strip()
-    if not ap or not is_auctioned_airport(ap):
-        return
-    hub_gates = {"HUBSPOKE": 4, "BUDGET": 2, "PREMIUM": 3, "POINTTOPOINT": 1}
-    units = int(hub_gates.get(str(strategy or "").upper(), 2))
-    held = ai_gates_held(cid, ap)
-    if held >= units:
-        return
-    _upsert_allocation(ap, cid, units - held, effective_week=1)
+    """Ensure hub stands cover the current ACTIVE network (see sync_hub_gates_to_network)."""
+    sync_hub_gates_to_network(competitor_id, strategy=strategy, hub=hub)

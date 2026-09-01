@@ -427,7 +427,7 @@ def get_api_clock_status() -> dict:
 
     When the clock thread is not running, report speed 0 so the browser does not
     extrapolate ahead of persisted game_hours_elapsed (stale DB speed_multiplier
-  would otherwise make the HUD race weeks ahead of the sim).
+    would otherwise make the HUD race weeks ahead of the sim).
     """
     clk = get_global_clock()
     if clk is not None and clk.is_alive():

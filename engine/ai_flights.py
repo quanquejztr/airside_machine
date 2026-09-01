@@ -8,6 +8,7 @@ similar to player flight_segments.
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from db import db
@@ -108,6 +109,57 @@ def _flight_duration_hours(route_id: str, type_id: str) -> float:
     return float(dist / spd)
 
 
+def _reconcile_unspawned_routes(
+    game_week: int,
+    spawned_legs_by_pair: Dict[tuple[str, str], int],
+) -> int:
+    """
+    ACTIVE routes that produced zero legs this week are thinned (or suspended at 1×).
+
+    Without this, GATE_PEAK / SLOT_QUOTA skips leave ghost ACTIVE routes that earn
+  nothing and still consume planning headroom.
+    """
+    from engine.ai_log import append_ai_narrative
+
+    gw = int(game_week)
+    changed = 0
+    rows = db.fetch_all(
+        """
+        SELECT competitor_id, route_pair_id, frequency_per_week
+        FROM competitor_routes
+        WHERE COALESCE(status, 'ACTIVE') = 'ACTIVE'
+        """
+    )
+    for r in rows or []:
+        cid = str(r["competitor_id"])
+        pair = str(r["route_pair_id"])
+        if int(spawned_legs_by_pair.get((cid, pair), 0) or 0) > 0:
+            continue
+        freq = max(1, int(r["frequency_per_week"] or 1))
+        if freq <= 1:
+            db.execute(
+                """
+                UPDATE competitor_routes
+                SET status = 'SUSPENDED'
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (cid, pair),
+            )
+            append_ai_narrative(cid, f"SPAWN_SUSPEND:{pair}")
+        else:
+            db.execute(
+                """
+                UPDATE competitor_routes
+                SET frequency_per_week = ?
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (freq - 1, cid, pair),
+            )
+            append_ai_narrative(cid, f"SPAWN_THIN:{pair}:{freq}->{freq - 1}")
+        changed += 1
+    return changed
+
+
 def spawn_ai_segments_for_week(target_game_week: int) -> Dict[str, Any]:
     """
     Create ai_flight_segments for all ACTIVE competitor_routes for the target week.
@@ -139,6 +191,7 @@ def spawn_ai_segments_for_week(target_game_week: int) -> Dict[str, Any]:
     w0 = week_base_hours(gw)
     mtt = _mtt_hours()
     inserted = 0
+    spawned_legs_by_pair: Dict[tuple[str, str], int] = defaultdict(int)
 
     rows = db.fetch_all(
         """
@@ -151,6 +204,7 @@ def spawn_ai_segments_for_week(target_game_week: int) -> Dict[str, Any]:
     )
     for r in rows:
         cid = str(r["competitor_id"])
+        pair = str(r["route_pair_id"])
         callsign = str(r["callsign"] or "AI")
         out_id = str(r["outbound_route_id"])
         in_id = str(r["inbound_route_id"])
@@ -251,9 +305,11 @@ def spawn_ai_segments_for_week(target_game_week: int) -> Dict[str, Any]:
                 ),
             )
             inserted += 1
+            spawned_legs_by_pair[(cid, pair)] += 2
 
+    thinned = _reconcile_unspawned_routes(gw, spawned_legs_by_pair)
     rebuild_slot_usages_for_week(gw)
-    return {"inserted": inserted}
+    return {"inserted": inserted, "thinned": thinned}
 
 
 def ai_on_departure(segment_id: str) -> None:

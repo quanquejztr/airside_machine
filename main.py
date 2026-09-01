@@ -139,6 +139,15 @@ def ensure_game_clock():
     def on_week_roll(new_week):
         if new_week <= 1:
             return
+        try:
+            from engine.settlement import (
+                enqueue_settlement_after_week_boundary,
+                spawn_segments_for_calendar_week,
+            )
+
+            spawn_segments_for_calendar_week(new_week)
+        except Exception:
+            pass
         enqueue_settlement_after_week_boundary(new_week)
 
     def on_fuel_tick(game_hours_elapsed, speed_multiplier):

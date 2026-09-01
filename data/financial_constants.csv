@@ -36,7 +36,7 @@ eec_cost_first,4.0
 reconfig_cost_per_eec,500.00
 fuel_reserve_cap_gallons,500000
 fuel_hedge_premium_rate,0.05
-ai_evaluation_interval_weeks,2
+ai_evaluation_interval_weeks,1
 ai_candidate_pool_size,15
 ai_exit_loss_threshold,4
 ai_min_profit_to_open,8000
@@ -46,7 +46,8 @@ ai_price_recover_pct,0.03
 ai_suspension_threshold,0.15
 ai_stance_grace_weeks,4
 ai_lease_utilization_floor,0.35
-ai_slot_seed_weeks,16
+ai_slot_seed_weeks,24
+ai_hub_gate_cap,24
 gate_auction_score_threshold,1080000
 gate_utilization_threshold,0.80
 gate_utilization_threshold_hub,0.06
