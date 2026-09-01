@@ -11,6 +11,8 @@ let hudSeq = 0;
 let didFitFlights = false;
 const mapClock = { hour: 0, speed: 0, realSecPerHour: 30, at: 0, alive: true };
 const seenNoticeIds = new Set();
+let mapLoadSeq = 0;
+let mapPollTimer = null;
 
 function syncMapClock(src) {
   if (!src) return;
@@ -27,6 +29,7 @@ function syncMapClock(src) {
   if (src.real_seconds_per_game_hour) mapClock.realSecPerHour = Number(src.real_seconds_per_game_hour);
   if (src.clock_alive != null) mapClock.alive = Boolean(src.clock_alive);
   mapClock.at = performance.now();
+  scheduleMapPoll();
 }
 
 function liveGameHour() {
@@ -2274,9 +2277,23 @@ function initMap() {
 async function loadMap() {
   try { initMap(); } catch (err) { toast(err.message); return; }
   if (!mapInst) return;
+  const seq = ++mapLoadSeq;
   const data = await api("/api/flight-map.json");
+  if (seq !== mapLoadSeq) return;
   syncMapClock(data);
   updateFlights(data);
+}
+
+function mapPollIntervalMs() {
+  const sp = mapClock.speed || 0;
+  if (sp >= 20) return 500;
+  if (sp >= 4) return 800;
+  return 1500;
+}
+
+function scheduleMapPoll() {
+  if (mapPollTimer) clearInterval(mapPollTimer);
+  mapPollTimer = setInterval(() => { loadMap().catch(() => {}); }, mapPollIntervalMs());
 }
 
 $("#dock").addEventListener("click", (e) => {
@@ -2322,6 +2339,6 @@ $("#hud-speeds").addEventListener("click", async (e) => {
 try { initMap(); } catch (err) { toast(err.message); }
 refreshHud().catch((err) => toast(err.message));
 loadMap().catch((err) => toast(err.message));
-setInterval(() => { loadMap().catch(() => {}); }, 1500);
+scheduleMapPoll();
 setInterval(() => { refreshHud().catch(() => {}); }, 4000);
 setInterval(paintHudTime, 250);

@@ -126,7 +126,7 @@
       "max_fleet_size": 111,
       "weekly_route_budget": 600000,
       "bid_probability": 0.55,
-      "weekly_slot_budget": 250000,
+      "weekly_slot_budget": 450000,
       "reputation": 78,
       "starter_spokes": [
         "LHR",
@@ -549,7 +549,7 @@
       "max_fleet_size": 18,
       "weekly_route_budget": 720000,
       "bid_probability": 0.72,
-      "weekly_slot_budget": 240000,
+      "weekly_slot_budget": 400000,
       "reputation": 79,
       "starter_spokes": [
         "ICN",
@@ -598,7 +598,7 @@
       "max_fleet_size": 18,
       "weekly_route_budget": 780000,
       "bid_probability": 0.75,
-      "weekly_slot_budget": 260000,
+      "weekly_slot_budget": 420000,
       "reputation": 82,
       "starter_spokes": [
         "LHR",
@@ -659,8 +659,8 @@
         "LHR",
         "CDG"
       ],
-      "starter_count": 6,
-      "starter_frequency": 5,
+      "starter_count": 4,
+      "starter_frequency": 3,
       "international": true,
       "international_radius_nm": 8000,
       "growth": {
@@ -697,8 +697,8 @@
         "LAX",
         "SYD"
       ],
-      "starter_count": 6,
-      "starter_frequency": 5,
+      "starter_count": 4,
+      "starter_frequency": 3,
       "international": true,
       "international_radius_nm": 8000,
       "growth": {
@@ -735,8 +735,8 @@
         "JFK",
         "DXB"
       ],
-      "starter_count": 6,
-      "starter_frequency": 5,
+      "starter_count": 4,
+      "starter_frequency": 3,
       "international": true,
       "international_radius_nm": 8000,
       "growth": {

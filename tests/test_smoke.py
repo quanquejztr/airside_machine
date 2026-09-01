@@ -1026,6 +1026,531 @@ class TestAIWiring(unittest.TestCase):
             self.assertGreater(routes, 0, "starter network should be re-seeded after reset")
 
 
+# ---------------------------------------------------------------------------
+# 8b. AI Phase 1 — load streak column, gate planning, distress reactivation.
+# ---------------------------------------------------------------------------
+class TestAiPhase1(unittest.TestCase):
+    def test_load_streaks_write_low_lf_weeks_not_consecutive_loss(self):
+        """Regression: LF streak overwrote consecutive_loss_weeks and triggered premature CLOSING."""
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from unittest.mock import patch
+            from engine.ai import ai_update_load_streaks, ensure_competitors_seeded
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                """
+                SELECT competitor_id, route_pair_id, outbound_route_id
+                FROM competitor_routes
+                WHERE status = 'ACTIVE'
+                LIMIT 1
+                """
+            )
+            self.assertIsNotNone(row)
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"])
+            db.execute(
+                """
+                UPDATE competitor_routes
+                SET consecutive_loss_weeks = 0, low_lf_weeks = 0,
+                    actual_weekly_revenue_avg = 50000
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (cid, pair),
+            )
+            with patch(
+                "engine.demand.estimate_competitor_route_load_factor",
+                return_value=0.40,
+            ):
+                ai_update_load_streaks(cid, 2, 1)
+            after = db.fetch_one(
+                """
+                SELECT consecutive_loss_weeks, low_lf_weeks
+                FROM competitor_routes
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (cid, pair),
+            )
+            self.assertEqual(1, int(after["low_lf_weeks"]))
+            self.assertEqual(0, int(after["consecutive_loss_weeks"]))
+
+    def test_planned_gate_freqs_ignore_suspended_routes(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import ensure_competitors_seeded
+            from engine.ai_gates import _planned_freqs
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, route_pair_id FROM competitor_routes WHERE status='ACTIVE' LIMIT 1"
+            )
+            self.assertIsNotNone(row)
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"]).upper()
+            db.execute(
+                """
+                UPDATE competitor_routes
+                SET status = 'SUSPENDED', frequency_per_week = 99
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (cid, row["route_pair_id"]),
+            )
+            freqs = _planned_freqs(cid, [])
+            self.assertNotIn(pair, freqs)
+
+    def test_reactivate_suspended_when_cash_recovered(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from unittest.mock import patch
+            from engine.ai import _reactivate_suspended_routes, ensure_competitors_seeded
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, route_pair_id FROM competitor_routes LIMIT 1"
+            )
+            self.assertIsNotNone(row)
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"])
+            db.execute(
+                "UPDATE competitor_routes SET status = 'SUSPENDED' WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )
+            db.execute(
+                "UPDATE competitors SET cash = 50000000, stance = 'GROW' WHERE competitor_id = ?",
+                (cid,),
+            )
+            with patch("engine.ai_gates.ai_gate_shortfall", return_value=0):
+                _reactivate_suspended_routes(cid, 5)
+            st = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )["status"]
+            self.assertEqual("ACTIVE", str(st))
+
+    def test_reactivate_skipped_under_consolidate_or_negative_cash(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import _reactivate_suspended_routes, ensure_competitors_seeded
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, route_pair_id FROM competitor_routes LIMIT 1"
+            )
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"])
+            db.execute(
+                "UPDATE competitor_routes SET status = 'SUSPENDED' WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )
+            db.execute(
+                "UPDATE competitors SET cash = -1000, stance = 'GROW' WHERE competitor_id = ?",
+                (cid,),
+            )
+            _reactivate_suspended_routes(cid, 5)
+            st = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )["status"]
+            self.assertEqual("SUSPENDED", str(st))
+
+            db.execute(
+                "UPDATE competitors SET cash = 50000000, stance = 'CONSOLIDATE' WHERE competitor_id = ?",
+                (cid,),
+            )
+            _reactivate_suspended_routes(cid, 5)
+            st = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )["status"]
+            self.assertEqual("SUSPENDED", str(st))
+
+    def test_light_pass_reactivates_after_distress_recovery(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from unittest.mock import patch
+            from engine.ai import ai_light_pass, ensure_competitors_seeded
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, route_pair_id FROM competitor_routes LIMIT 1"
+            )
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"])
+            db.execute(
+                "UPDATE competitor_routes SET status = 'SUSPENDED' WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )
+            db.execute(
+                "UPDATE competitors SET cash = 500000000, stance = 'GROW', consecutive_loss_weeks = 0"
+                " WHERE competitor_id = ?",
+                (cid,),
+            )
+            with patch("engine.ai_gates.ai_gate_shortfall", return_value=0):
+                ai_light_pass(cid, 10)
+            st = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )["status"]
+            self.assertEqual("ACTIVE", str(st))
+
+
+# ---------------------------------------------------------------------------
+# 8c. AI Phase 2 — hub gate scaling, spawn reconcile, mega starter balance.
+# ---------------------------------------------------------------------------
+class TestAiPhase2(unittest.TestCase):
+    def test_hub_gates_scale_to_peak_concurrency(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import ensure_competitors_seeded
+            from engine.ai_gates import ai_gates_held, ai_peak_concurrent_at, sync_hub_gates_to_network
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, home_hub_iata FROM competitors WHERE competitor_id = 'AI_TITAN'"
+            )
+            if not row:
+                self.skipTest("AI_TITAN not in roster")
+            cid = str(row["competitor_id"])
+            hub = str(row["home_hub_iata"])
+            peak = ai_peak_concurrent_at(cid, hub, [], 0.5)
+            db.execute(
+                """
+                UPDATE airport_gate_allocations
+                SET gate_units = 1
+                WHERE holder_id = ? AND airport_iata = ?
+                """,
+                (cid, hub),
+            )
+            added = sync_hub_gates_to_network(cid)
+            held = ai_gates_held(cid, hub)
+            self.assertGreater(added, 0)
+            self.assertGreaterEqual(held, min(24, peak + 1))
+
+    def test_reconcile_thins_route_with_zero_spawned_legs(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import ensure_competitors_seeded
+            from engine.ai_flights import _reconcile_unspawned_routes
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, route_pair_id FROM competitor_routes WHERE status='ACTIVE' LIMIT 1"
+            )
+            self.assertIsNotNone(row)
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"])
+            db.execute(
+                """
+                UPDATE competitor_routes SET frequency_per_week = 3
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (cid, pair),
+            )
+            spawned = {
+                (str(r["competitor_id"]), str(r["route_pair_id"])): 2
+                for r in db.fetch_all(
+                    "SELECT competitor_id, route_pair_id FROM competitor_routes WHERE status='ACTIVE'"
+                )
+            }
+            spawned.pop((cid, pair), None)
+            changed = _reconcile_unspawned_routes(2, spawned)
+            self.assertEqual(1, changed)
+            freq = int(
+                db.fetch_one(
+                    "SELECT frequency_per_week FROM competitor_routes WHERE competitor_id = ? AND route_pair_id = ?",
+                    (cid, pair),
+                )["frequency_per_week"]
+            )
+            self.assertEqual(2, freq)
+
+    def test_reconcile_suspends_route_at_one_frequency(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import ensure_competitors_seeded
+            from engine.ai_flights import _reconcile_unspawned_routes
+
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id, route_pair_id FROM competitor_routes WHERE status='ACTIVE' LIMIT 1"
+            )
+            cid = str(row["competitor_id"])
+            pair = str(row["route_pair_id"])
+            db.execute(
+                """
+                UPDATE competitor_routes SET frequency_per_week = 1
+                WHERE competitor_id = ? AND route_pair_id = ?
+                """,
+                (cid, pair),
+            )
+            spawned = {
+                (str(r["competitor_id"]), str(r["route_pair_id"])): 2
+                for r in db.fetch_all(
+                    "SELECT competitor_id, route_pair_id FROM competitor_routes WHERE status='ACTIVE'"
+                )
+            }
+            spawned.pop((cid, pair), None)
+            _reconcile_unspawned_routes(2, spawned)
+            st = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = ? AND route_pair_id = ?",
+                (cid, pair),
+            )["status"]
+            self.assertEqual("SUSPENDED", str(st))
+
+    def test_spawn_creates_segments_for_titan_after_gate_sync(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import ensure_competitors_seeded
+            from engine.ai_flights import spawn_ai_segments_for_week
+            from engine.ai_gates import sync_hub_gates_to_network
+
+            ensure_competitors_seeded()
+            sync_hub_gates_to_network("AI_TITAN")
+            db.execute("UPDATE game_state SET game_week = 2, game_hours_elapsed = 168 WHERE id = 1")
+            out = spawn_ai_segments_for_week(2)
+            self.assertGreater(int(out.get("inserted") or 0), 0)
+            titan = db.fetch_one(
+                """
+                SELECT COUNT(*) AS n FROM ai_flight_segments
+                WHERE competitor_id = 'AI_TITAN' AND game_week = 2
+                """
+            )["n"]
+            self.assertGreater(int(titan), 0)
+
+
+# ---------------------------------------------------------------------------
+# 8d. Phase 3 — clock/map reliability and synchronous week-boundary spawn.
+# ---------------------------------------------------------------------------
+class TestAiPhase3(unittest.TestCase):
+    def tearDown(self):
+        try:
+            from engine.clock import stop_game_clock
+
+            stop_game_clock()
+        except Exception:
+            pass
+
+    def test_dead_clock_reports_zero_speed_not_db_stale_value(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import get_api_clock_status, stop_game_clock
+
+            stop_game_clock()
+            db.execute(
+                "UPDATE game_state SET speed_multiplier = 60, game_hours_elapsed = 100 WHERE id = 1"
+            )
+            status = get_api_clock_status()
+            self.assertFalse(status["clock_alive"])
+            self.assertEqual(0, status["speed_multiplier"])
+            self.assertTrue(status["is_paused"])
+            self.assertAlmostEqual(100.0, float(status["current_game_hour"]), places=2)
+
+    def test_flight_map_payload_uses_live_calendar_week(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import stop_game_clock
+            from engine.flight_map_data import get_flight_map_payload
+
+            stop_game_clock()
+            db.execute(
+                """
+                UPDATE game_state
+                SET game_week = 1, game_hours_elapsed = 200, speed_multiplier = 60
+                WHERE id = 1
+                """
+            )
+            payload = get_flight_map_payload()
+            self.assertEqual(2, payload["game_week"])
+            self.assertEqual(0, payload["speed_multiplier"])
+            self.assertFalse(payload.get("clock_alive"))
+
+    def test_calendar_week_from_interpolated_clock_hours(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            import engine.clock as clock_mod
+            from engine.scheduling.time_helpers import calendar_game_week_from_state
+
+            class _FakeClk:
+                def is_alive(self):
+                    return True
+
+                def get_interpolated_game_hours(self):
+                    return 200.0
+
+            old = clock_mod._global_clock
+            clock_mod._global_clock = _FakeClk()
+            try:
+                self.assertEqual(2, calendar_game_week_from_state())
+            finally:
+                clock_mod._global_clock = old
+
+    def test_spawn_segments_for_calendar_week_is_immediate(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.scheduling import assign_rotation
+            from engine.settlement import spawn_segments_for_calendar_week
+
+            tid, other, out_id, in_id = TestFlightNumbers._rt_setup(self, g)
+            tail = g.lease(tid)
+            assign_rotation(tail, [out_id, in_id])
+            g.db.execute(
+                "UPDATE game_state SET game_week = 2, game_hours_elapsed = 168 WHERE id = 1"
+            )
+            before = int(
+                g.db.fetch_one("SELECT COUNT(*) AS n FROM flight_segments WHERE game_week = 2")["n"]
+            )
+            self.assertEqual(0, before)
+            out = spawn_segments_for_calendar_week(2)
+            self.assertGreater(int((out.get("spawn") or {}).get("inserted") or 0), 0)
+            after = int(
+                g.db.fetch_one("SELECT COUNT(*) AS n FROM flight_segments WHERE game_week = 2")["n"]
+            )
+            self.assertGreater(after, 0)
+
+    def test_ensure_clock_running_restarts_dead_thread(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.clock import get_global_clock, stop_game_clock
+            from server.game_http import ensure_clock_running
+
+            stop_game_clock()
+            self.assertIsNone(get_global_clock())
+            clk = ensure_clock_running()
+            self.assertIsNotNone(clk)
+            self.assertTrue(clk.is_alive())
+
+
+# ---------------------------------------------------------------------------
+# 8e. Phase 4 — slot seeding balance, exit policy, settlement AI retry.
+# ---------------------------------------------------------------------------
+class TestAiPhase4(unittest.TestCase):
+    def test_airport_freq_map_sums_routes_at_hub(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import _airport_freq_map
+
+            cid = "AI_TEST_FREQ"
+            db.execute(
+                """
+                INSERT INTO competitors (
+                    competitor_id, name, callsign, home_hub_iata, cash, strategy,
+                    aggressiveness, risk_tolerance, expansion_rate, fleet_size,
+                    max_fleet_size, weekly_route_budget, bid_probability,
+                    weekly_slot_budget, reputation, brand_power
+                ) VALUES (
+                    ?, 'Test', 'TST', 'ATL', 50000000, 'HUBSPOKE',
+                    1.0, 0.5, 2, 3, 10, 100000, 0.5, 50000, 50, 1.0
+                )
+                """,
+                (cid,),
+            )
+            for pair, freq in (("ATL-JFK", 3), ("ATL-MIA", 2), ("ORD-ATL", 4)):
+                o, d = pair.split("-")
+                db.execute(
+                    """
+                    INSERT INTO competitor_routes (
+                        competitor_id, route_pair_id, outbound_route_id, inbound_route_id,
+                        status, frequency_per_week, fare_leisure, fare_business,
+                        aircraft_type_id, opened_week
+                    ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, 120, 300, 'A320', 1)
+                    """,
+                    (cid, pair, pair, f"{d}-{o}", freq),
+                )
+            freq_map = _airport_freq_map(cid)
+            self.assertEqual(9, int(freq_map.get("ATL", 0)))
+
+    def test_slot_seed_scales_with_summed_hub_frequency(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import _sync_competitor_slots, ensure_competitors_seeded
+            from engine.slots import is_slot_controlled, seed_slot_controlled_airports, slots_held
+
+            seed_slot_controlled_airports()
+            ensure_competitors_seeded()
+            row = db.fetch_one(
+                "SELECT competitor_id FROM competitors WHERE home_hub_iata = 'ICN'"
+            )
+            if not row:
+                self.skipTest("no ICN hub carrier")
+            cid = str(row["competitor_id"])
+            if not is_slot_controlled("ICN"):
+                self.skipTest("ICN not slot controlled")
+            _sync_competitor_slots(cid, 1)
+            held = slots_held("ICN", cid, 1)
+            self.assertGreaterEqual(held, 8)
+
+    def test_require_flown_pnl_blocks_lf_only_close(self):
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.ai import _growth_profile, _update_loss_tracking_and_status, ensure_competitors_seeded
+
+            ensure_competitors_seeded()
+            db.execute("UPDATE game_state SET game_week = 20 WHERE id = 1")
+            self.assertTrue(_growth_profile("AI_MERIDIAN")["require_flown_pnl_to_exit"])
+            self.assertFalse(_growth_profile("AI_TITAN")["require_flown_pnl_to_exit"])
+
+            def _prime_route(cid: str, pair: str) -> None:
+                db.execute(
+                    """
+                    UPDATE competitor_routes
+                    SET status = 'ACTIVE', opened_week = 1, estimated_weekly_profit = 5000,
+                        consecutive_loss_weeks = 0, low_lf_weeks = 6, paper_loss_weeks = 0,
+                        actual_weekly_net_avg = 500.0, actual_lf_avg = 0.20
+                    WHERE competitor_id = ? AND route_pair_id = ?
+                    """,
+                    (cid, pair),
+                )
+
+            row = db.fetch_one(
+                "SELECT route_pair_id FROM competitor_routes WHERE competitor_id = 'AI_MERIDIAN' LIMIT 1"
+            )
+            self.assertIsNotNone(row)
+            pair = str(row["route_pair_id"])
+            _prime_route("AI_MERIDIAN", pair)
+            _update_loss_tracking_and_status("AI_MERIDIAN")
+            st = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = 'AI_MERIDIAN' AND route_pair_id = ?",
+                (pair,),
+            )["status"]
+            self.assertEqual("ACTIVE", str(st))
+
+            row2 = db.fetch_one(
+                "SELECT route_pair_id FROM competitor_routes WHERE competitor_id = 'AI_TITAN' LIMIT 1"
+            )
+            self.assertIsNotNone(row2)
+            pair2 = str(row2["route_pair_id"])
+            _prime_route("AI_TITAN", pair2)
+            _update_loss_tracking_and_status("AI_TITAN")
+            st2 = db.fetch_one(
+                "SELECT status FROM competitor_routes WHERE competitor_id = 'AI_TITAN' AND route_pair_id = ?",
+                (pair2,),
+            )["status"]
+            self.assertEqual("CLOSING", str(st2))
+
+    def test_retry_ai_turn_only_marks_post_ops_when_clean(self):
+        with fresh_game(hub="TPA") as g:
+            from engine.settlement import _retry_ai_turn_only, _settlement_flags
+
+            _settlement_flags(3)
+            g.db.execute(
+                """
+                INSERT INTO week_ledger (
+                    game_week, revenue_gross, excise_tax, segment_fees, security_fees,
+                    pfc_fees, landing_fees, gate_fees, fuel_cost, lease_costs,
+                    maintenance_costs, loan_payments, corporate_tax, net_income,
+                    cash_end_of_week
+                ) VALUES (3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                """
+            )
+            g.db.execute(
+                "UPDATE settlement_flags SET cash_applied = 1, post_ops_done = 0 WHERE game_week = 3"
+            )
+            import unittest.mock as mock
+
+            with mock.patch("engine.ai.ai_weekly_turn", return_value={"errors": 0}):
+                out = _retry_ai_turn_only(3)
+            self.assertEqual(0, int(out.get("ai_errors") or 0))
+            flags = _settlement_flags(3)
+            self.assertEqual(1, flags["post_ops_done"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

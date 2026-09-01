@@ -1836,7 +1836,7 @@ def pop_week_summaries(limit: int = 4) -> dict:
 
 
 def set_clock(body: dict) -> dict:
-    from engine.clock import ALLOWED_SPEED_MULTIPLIERS, get_global_clock
+    from engine.clock import ALLOWED_SPEED_MULTIPLIERS, get_api_clock_status, get_global_clock
 
     clk = get_global_clock()
     if clk is None:
@@ -1850,7 +1850,7 @@ def set_clock(body: dict) -> dict:
     ok, msg = clk.set_speed(speed_i, player_initiated=True)
     if not ok:
         return _err(msg)
-    return _ok({"message": msg, "clock": clk.get_status()})
+    return _ok({"message": msg, "clock": get_api_clock_status()})
 
 
 def flight_map() -> dict:

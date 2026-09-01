@@ -834,7 +834,7 @@ def seed_competitor_slot_capacity(
         if not is_slot_controlled(ap):
             continue
         # Each weekly frequency is one round-trip cycle -> 2 movements per endpoint.
-        need = max(4, 2 * max(1, int(freq)))
+        need = max(8, 2 * max(1, int(freq)))
         for w in range(gw0, gw0 + max(1, int(weeks_ahead))):
             ensure_min_slots_held(ap, cid, w, need)
 

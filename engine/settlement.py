@@ -413,6 +413,55 @@ def missing_settlement_weeks(up_to_week: Optional[int] = None) -> List[int]:
     return [w for w in range(1, cur) if w not in settled]
 
 
+def _incomplete_ai_settlement_weeks() -> List[int]:
+    """Weeks with economics settled but AI post-ops not finished."""
+    try:
+        rows = db.fetch_all(
+            """
+            SELECT sf.game_week
+            FROM settlement_flags sf
+            INNER JOIN week_ledger wl ON wl.game_week = sf.game_week
+            WHERE sf.cash_applied = 1 AND sf.post_ops_done = 0
+            ORDER BY sf.game_week
+            """
+        )
+        return [int(r["game_week"]) for r in (rows or []) if r and r["game_week"] is not None]
+    except Exception:
+        return []
+
+
+def _retry_ai_turn_only(completed_game_week: int) -> Dict[str, Any]:
+    """Re-run AI weekly turn for a week whose cash settlement already completed."""
+    gw = int(completed_game_week)
+    flags = _settlement_flags(gw)
+    if flags["post_ops_done"]:
+        return {"skipped": True, "reason": "post_ops_done", "game_week": gw}
+    if not flags["cash_applied"]:
+        return {"skipped": True, "reason": "cash_not_applied", "game_week": gw}
+    ai_result: Dict[str, Any]
+    try:
+        from engine.ai import ai_weekly_turn
+
+        ai_result = ai_weekly_turn(gw)
+    except Exception as e:
+        import traceback
+
+        ai_result = {"error": str(e), "traceback": traceback.format_exc(), "errors": 1}
+    ai_errors = int((ai_result or {}).get("errors") or 0)
+    if (ai_result or {}).get("error"):
+        ai_errors = max(ai_errors, 1)
+    if ai_errors <= 0:
+        _mark_settlement_flag(gw, "post_ops_done")
+    else:
+        try:
+            from engine.news_feed import push_news
+
+            push_news(f"⚠ Week {gw} AI turn still incomplete ({ai_errors} errors) — will retry")
+        except Exception:
+            pass
+    return {"game_week": gw, "ai_turn": ai_result, "ai_errors": ai_errors}
+
+
 def catch_up_missing_settlements(*, limit: Optional[int] = None) -> Dict[str, Any]:
     """
     Settle any completed weeks missing from week_ledger (idempotent via run_settlement).
@@ -443,6 +492,12 @@ def catch_up_missing_settlements(*, limit: Optional[int] = None) -> Dict[str, An
 
 
 def _catch_up_missing_settlements_body(*, limit: Optional[int] = None) -> Dict[str, Any]:
+    ai_retries: List[Dict[str, Any]] = []
+    for w in _incomplete_ai_settlement_weeks():
+        try:
+            ai_retries.append(_retry_ai_turn_only(w))
+        except Exception as e:
+            ai_retries.append({"game_week": w, "error": str(e)})
     all_missing = missing_settlement_weeks()
     missing = list(all_missing)
     if limit is not None:
@@ -493,6 +548,36 @@ def _catch_up_missing_settlements_body(*, limit: Optional[int] = None) -> Dict[s
         "calendar_week": calendar_week_from_state(),
         "still_missing": missing_settlement_weeks(),
     }
+
+
+def spawn_segments_for_calendar_week(new_calendar_week: int) -> Dict[str, Any]:
+    """
+    Spawn player + AI segments for a calendar week on the clock thread at week flip.
+
+    Idempotent (spawn helpers dedupe). Called synchronously from on_week so the map
+    is not empty while async settlement runs.
+    """
+    from engine.scheduling import (
+        reset_operational_schedule_for_new_calendar_week,
+        spawn_rotation_segments_for_week,
+    )
+    from engine.ai_flights import spawn_ai_segments_for_week
+
+    gw = int(new_calendar_week)
+    out: Dict[str, Any] = {"new_calendar_week": gw}
+    try:
+        out["schedule_reset_to_baseline"] = reset_operational_schedule_for_new_calendar_week(gw)
+    except Exception as e:
+        out["schedule_reset_error"] = str(e)
+    try:
+        out["spawn"] = spawn_rotation_segments_for_week(gw)
+    except Exception as e:
+        out["spawn_error"] = str(e)
+    try:
+        out["spawn_ai"] = spawn_ai_segments_for_week(gw)
+    except Exception as e:
+        out["spawn_ai_error"] = str(e)
+    return out
 
 
 def enqueue_settlement_after_week_boundary(new_calendar_week: int) -> None:
@@ -612,8 +697,11 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
         "SELECT game_week FROM week_ledger WHERE game_week = ?",
         (completed_game_week,),
     )
-    if existing:
+    flags = _settlement_flags(completed_game_week)
+    if existing and flags["post_ops_done"]:
         return {"skipped": True, "reason": "already settled", "game_week": completed_game_week}
+    if existing and not flags["post_ops_done"]:
+        return _retry_ai_turn_only(completed_game_week)
 
     airline = get_airline()
     if not airline:
@@ -810,14 +898,27 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
         except Exception as e:
             import traceback
 
-            ai_result = {"error": str(e), "traceback": traceback.format_exc()}
+            ai_result = {"error": str(e), "traceback": traceback.format_exc(), "errors": 1}
             try:
                 from engine.news_feed import push_news
 
                 push_news(f"⚠ AI weekly turn failed: {e}")
             except Exception:
                 pass
-        _mark_settlement_flag(completed_game_week, "post_ops_done")
+        ai_errors = int((ai_result or {}).get("errors") or 0)
+        if (ai_result or {}).get("error"):
+            ai_errors = max(ai_errors, 1)
+        if ai_errors <= 0:
+            _mark_settlement_flag(completed_game_week, "post_ops_done")
+        else:
+            try:
+                from engine.news_feed import push_news
+
+                push_news(
+                    f"⚠ Week {completed_game_week} AI turn incomplete ({ai_errors} errors) — will retry"
+                )
+            except Exception:
+                pass
 
     db.execute(
         """
@@ -886,6 +987,7 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
         "ai_turn": ai_result,
         "gate_settlement": gate_result,
         "banking": banking_result,
+        "ai_retry_pending": not bool(_settlement_flags(completed_game_week)["post_ops_done"]),
         "auctions_resolved": int((gate_result or {}).get("gate_auctions_resolved") or 0),
         "prev_week": dict(prev) if prev else None,
     }
