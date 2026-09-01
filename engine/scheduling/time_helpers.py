@@ -22,15 +22,20 @@ def week_base_hours(game_week: int) -> float:
 
 def calendar_game_week_from_state() -> int:
     """
-    Return the current calendar game week based on game_hours_elapsed.
+    Return the current calendar game week based on live game hours.
     Week 1 starts at hour 0, week 2 at hour 168, etc.
     """
-    gs = db.fetch_one(
-        "SELECT game_hours_elapsed FROM game_state WHERE id = 1"
-    )
-    if not gs or gs["game_hours_elapsed"] is None:
-        return 1
-    ghe = float(gs["game_hours_elapsed"])
+    try:
+        from engine.clock import get_display_game_hours
+
+        ghe = float(get_display_game_hours())
+    except Exception:
+        gs = db.fetch_one(
+            "SELECT game_hours_elapsed FROM game_state WHERE id = 1"
+        )
+        if not gs or gs["game_hours_elapsed"] is None:
+            return 1
+        ghe = float(gs["game_hours_elapsed"])
     return int(ghe // 168.0) + 1
 
 

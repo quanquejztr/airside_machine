@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS game_state (
     schema_version INTEGER NOT NULL DEFAULT 1,
     game_week INTEGER NOT NULL DEFAULT 1,
     game_hours_elapsed REAL NOT NULL DEFAULT 0.0,
-    speed_multiplier INTEGER NOT NULL DEFAULT 0 CHECK(speed_multiplier IN (0, 1, 2, 4, 20)),
+    speed_multiplier INTEGER NOT NULL DEFAULT 0 CHECK(speed_multiplier IN (0, 1, 2, 4, 20, 60)),
     current_month INTEGER NOT NULL CHECK(current_month >= 1 AND current_month <= 12),
     fuel_price_current REAL NOT NULL,
     fuel_price_trend REAL NOT NULL,

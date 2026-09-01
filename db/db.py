@@ -829,6 +829,61 @@ def ensure_schema_migrations():
             execute("ALTER TABLE game_state_new RENAME TO game_state")
     except Exception:
         pass
+
+    # Allow 60× speed (extends 20× migration).
+    try:
+        ms = fetch_one(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='game_state'"
+        )
+        ddl = str(ms["sql"] or "") if ms else ""
+        if "speed_multiplier" in ddl and "60" not in ddl:
+            execute(
+                """
+                CREATE TABLE IF NOT EXISTS game_state_new (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    game_week INTEGER NOT NULL DEFAULT 1,
+                    game_hours_elapsed REAL NOT NULL DEFAULT 0.0,
+                    speed_multiplier INTEGER NOT NULL DEFAULT 0 CHECK(speed_multiplier IN (0, 1, 2, 4, 20, 60)),
+                    current_month INTEGER NOT NULL CHECK(current_month >= 1 AND current_month <= 12),
+                    fuel_price_current REAL NOT NULL,
+                    fuel_price_trend REAL NOT NULL,
+                    demand_noise_seed INTEGER NOT NULL DEFAULT 1,
+                    pause_on_week_summary INTEGER NOT NULL DEFAULT 0 CHECK(pause_on_week_summary IN (0, 1)),
+                    fuel_shock_pending INTEGER NOT NULL DEFAULT 0 CHECK(fuel_shock_pending IN (0, 1)),
+                    fuel_shock_message TEXT,
+                    ui_blackout INTEGER NOT NULL DEFAULT 0 CHECK(ui_blackout IN (0, 1))
+                )
+                """
+            )
+            execute(
+                """
+                INSERT OR REPLACE INTO game_state_new (
+                    id, schema_version, game_week, game_hours_elapsed, speed_multiplier,
+                    current_month, fuel_price_current, fuel_price_trend,
+                    demand_noise_seed, pause_on_week_summary,
+                    fuel_shock_pending, fuel_shock_message, ui_blackout
+                )
+                SELECT
+                    id, schema_version, game_week, game_hours_elapsed,
+                    CASE
+                        WHEN speed_multiplier IN (0, 1, 2, 4, 20) THEN speed_multiplier
+                        ELSE 0
+                    END AS speed_multiplier,
+                    current_month, fuel_price_current, fuel_price_trend,
+                    COALESCE(demand_noise_seed, 1),
+                    COALESCE(pause_on_week_summary, 0),
+                    COALESCE(fuel_shock_pending, 0),
+                    fuel_shock_message,
+                    COALESCE(ui_blackout, 0)
+                FROM game_state
+                WHERE id = 1
+                """
+            )
+            execute("DROP TABLE game_state")
+            execute("ALTER TABLE game_state_new RENAME TO game_state")
+    except Exception:
+        pass
     # Phase 10: competitor market share display
     _add_column_if_missing("routes", "competitor_share_this_week", "REAL NOT NULL DEFAULT 0.0")
     _add_column_if_missing("routes", "is_active", "INTEGER NOT NULL DEFAULT 1")

@@ -984,8 +984,10 @@ def create_chained_detailed_rotation(
     planned_intervals = [(p["dep_abs"], p["arr_abs"]) for p in planned]
     assert_tail_schedule_accepts_new_intervals(tail_number, game_week, planned_intervals, mtt_hours)
 
-    n_days = len({p["day"] for p in planned}) or 1
-    additional_air = sum(fh_list) * n_days
+    # Count how many times the chain starts per week (operating days), not how many
+    # calendar weekday labels one rotation spans — same rule as quick schedule / standalone detailed.
+    n_rotations = len(operating_days) or 1
+    additional_air = sum(fh_list) * n_rotations
     cap_air = max_weekly_airborne_hours_cap()
     existing_air = sum_airborne_hours_for_tail_week(tail_number, game_week)
     if existing_air + additional_air > cap_air + 1e-6:

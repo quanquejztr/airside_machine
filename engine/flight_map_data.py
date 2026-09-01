@@ -102,14 +102,22 @@ def get_flight_map_payload() -> Dict[str, Any]:
     route polylines for legs that are in the boarding window, in flight, or diverted/holding;
     landed legs are omitted.
     """
-    gs = db.fetch_one("SELECT game_week, game_hours_elapsed, speed_multiplier FROM game_state WHERE id = 1")
-    game_week = int(gs["game_week"]) if gs else 1
+    gs = db.fetch_one("SELECT game_hours_elapsed, speed_multiplier FROM game_state WHERE id = 1")
+    clock_alive = False
     try:
-        from engine.clock import get_display_game_hours
+        from engine.clock import get_api_clock_status, get_display_game_hours
 
-        current_game_hour = float(get_display_game_hours())
+        clock = get_api_clock_status()
+        current_game_hour = float(clock.get("current_game_hour") or get_display_game_hours())
+        game_week = int(clock.get("current_week") or 1)
+        speed = int(clock.get("speed_multiplier") or 0)
+        real_s = float(clock.get("real_seconds_per_game_hour") or 30)
+        clock_alive = bool(clock.get("clock_alive"))
     except Exception:
         current_game_hour = float(gs["game_hours_elapsed"] or 0.0) if gs else 0.0
+        game_week = int(current_game_hour // 168) + 1 if gs else 1
+        speed = 0
+        real_s = 30.0
 
     fleet_rows = db.fetch_all(
         "SELECT tail_number, type_id, status, current_airport_iata FROM fleet ORDER BY tail_number"
@@ -297,26 +305,14 @@ def get_flight_map_payload() -> Dict[str, Any]:
             "home_hub_iata": al["home_hub_iata"],
         }
 
-    speed = 0
-    real_s = 30
-    try:
-        from engine.clock import get_global_clock
-
-        clk = get_global_clock()
-        if clk is not None:
-            speed = int(clk.speed_multiplier or 0)
-            real_s = int(getattr(clk, "real_seconds_per_game_hour", 30) or 30)
-        elif gs:
-            speed = int(gs["speed_multiplier"] or 0)
-    except Exception:
-        pass
-
     return {
         "ok": True,
         "game_week": game_week,
+        "game_hours_elapsed": current_game_hour,
         "current_game_hour": current_game_hour,
         "speed_multiplier": speed,
         "real_seconds_per_game_hour": real_s,
+        "clock_alive": clock_alive,
         "airline": airline,
         "airports": airports,
         "fleet": fleet,

@@ -124,35 +124,11 @@ def get_state() -> dict:
     gs = db.fetch_one("SELECT * FROM game_state WHERE id = 1")
     clock = {}
     try:
-        from engine.clock import get_global_clock, get_display_game_hours
+        from engine.clock import get_api_clock_status
 
-        clk = get_global_clock()
-        if clk is not None and clk.is_alive():
-            clock = clk.get_status()
-        else:
-            ghe = float(get_display_game_hours()) if gs else 0.0
-            sp = int(gs["speed_multiplier"] or 0) if gs else 0
-            week = int(ghe // 168) + 1 if gs else 1
-            hiw = ghe % 168.0
-            day = int(hiw // 24) + 1
-            hod = hiw % 24.0
-            hh = int(hod)
-            mm = int((hod - hh) * 60.0) % 60
-            spd = "paused" if sp == 0 else f"{sp}×"
-            clock = {
-                "game_hours_elapsed": ghe,
-                "current_game_hour": ghe,
-                "current_week": week,
-                "current_day": day,
-                "current_hour": hh,
-                "speed_multiplier": sp,
-                "is_paused": sp == 0,
-                "real_seconds_per_game_hour": 30,
-                "time_display": f"Week {week} · Day {day} · {hh:02d}:{mm:02d} · {spd}",
-                "auto_pause_alert": None,
-            }
+        clock = get_api_clock_status()
     except Exception:
-        clock = {"time_display": "—", "speed_multiplier": 0, "is_paused": True}
+        clock = {"time_display": "—", "speed_multiplier": 0, "is_paused": True, "clock_alive": False}
     news = []
     try:
         from engine.news_feed import recent_lines
@@ -181,7 +157,7 @@ def get_state() -> dict:
         {
             "airline": airline,
             "clock": clock,
-            "game_week": int(gs["game_week"] or 1) if gs else 1,
+            "game_week": int(clock.get("current_week") or (gs["game_week"] if gs else 1) or 1),
             "news": news,
             "finance": finance,
             "notifications": _unread_notifications(),
@@ -1860,7 +1836,7 @@ def pop_week_summaries(limit: int = 4) -> dict:
 
 
 def set_clock(body: dict) -> dict:
-    from engine.clock import get_global_clock
+    from engine.clock import ALLOWED_SPEED_MULTIPLIERS, get_global_clock
 
     clk = get_global_clock()
     if clk is None:
@@ -1869,7 +1845,8 @@ def set_clock(body: dict) -> dict:
     try:
         speed_i = int(speed)
     except (TypeError, ValueError):
-        return _err("speed must be 0, 1, 2, 4, or 20.")
+        allowed = ", ".join(str(x) for x in ALLOWED_SPEED_MULTIPLIERS)
+        return _err(f"speed must be one of: {allowed}.")
     ok, msg = clk.set_speed(speed_i, player_initiated=True)
     if not ok:
         return _err(msg)
