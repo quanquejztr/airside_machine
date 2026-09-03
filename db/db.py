@@ -1343,6 +1343,27 @@ def ensure_schema_migrations():
         """
     )
     _add_column_if_missing("settlement_flags", "loan_collected", "REAL NOT NULL DEFAULT 0")
+
+    # Backfill legacy saves:
+    # `settlement_flags` is a newer table/column, so older saves may already have
+    # completed weeks in `week_ledger` but still show `post_ops_done = 0`.
+    # That causes `--ui` startup to "retry" AI post-ops for every historical week.
+    # If the week has a ledger entry and cash was applied, treat it as completed.
+    try:
+        execute(
+            """
+            UPDATE settlement_flags
+            SET
+                banking_done = 1,
+                cash_applied = 1,
+                post_ops_done = 1
+            WHERE post_ops_done = 0
+              AND cash_applied = 1
+              AND game_week IN (SELECT game_week FROM week_ledger)
+            """
+        )
+    except Exception:
+        pass
     execute(
         """
         CREATE TABLE IF NOT EXISTS loans (
