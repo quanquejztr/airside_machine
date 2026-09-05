@@ -266,6 +266,18 @@ def sync_financial_constants_from_csv():
         rows = load_csv("financial_constants.csv")
     except OSError:
         return
+
+    old_share = None
+    try:
+        prev = fetch_one(
+            "SELECT value FROM financial_constants WHERE key = 'bts_target_market_share'"
+        )
+        if prev is not None and prev["value"] is not None:
+            old_share = float(prev["value"])
+    except Exception:
+        old_share = None
+
+    new_share = None
     for row in rows:
         key = row.get("key")
         if not key:
@@ -274,10 +286,34 @@ def sync_financial_constants_from_csv():
             val = float(row["value"])
         except (KeyError, TypeError, ValueError):
             continue
+        if key == "bts_target_market_share":
+            new_share = val
         execute(
             "INSERT OR REPLACE INTO financial_constants (key, value) VALUES (?, ?)",
             (key, val),
         )
+
+    # Sticky route templates were calibrated under the previous share; rescale
+    # BTS/GRAVITY bases so live saves pick up the new playable market size.
+    if (
+        old_share is not None
+        and new_share is not None
+        and old_share > 0
+        and abs(new_share - old_share) > 1e-9
+    ):
+        ratio = float(new_share) / float(old_share)
+        try:
+            execute(
+                """
+                UPDATE routes
+                SET base_demand_business = MAX(0, ROUND(base_demand_business * ?)),
+                    base_demand_leisure = MAX(0, ROUND(base_demand_leisure * ?))
+                WHERE demand_source IN ('BTS', 'GRAVITY')
+                """,
+                (ratio, ratio),
+            )
+        except Exception:
+            pass
 
 
 def _ensure_bts_demand_anchors_table() -> None:

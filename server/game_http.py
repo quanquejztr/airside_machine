@@ -257,6 +257,9 @@ class _Handler(BaseHTTPRequestHandler):
             ensure_clock_running()
             self._send_json(api.flight_map())
             return
+        if path == "/api/airports-map.json":
+            self._send_json(api.airports_map())
+            return
         if path == "/api/airports":
             self._send_json(api.search_airports(q.get("q", "")))
             return

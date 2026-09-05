@@ -198,7 +198,7 @@ def effective_demand_multiplier() -> float:
 
 
 def calibration_k() -> float:
-    share = _fc("bts_target_market_share", 0.30)
+    share = _fc("bts_target_market_share", 1.30)
     eff = effective_demand_multiplier()
     if eff <= 0:
         return 0.0

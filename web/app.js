@@ -3,7 +3,15 @@ const $ = (sel, root = document) => root.querySelector(sel);
 let mapInst = null;
 let lineLayer = null;
 let acLayer = null;
+let airportLayer = null;
+let airportRenderer = null;
 const flights = {};
+const airportPins = {};
+let airportCatalog = null;
+let airportCatalogPromise = null;
+let airportNetwork = new Set();
+let airportHub = "";
+let airportPinRefreshTimer = null;
 let zTop = 40;
 let winOffset = 0;
 let lastState = null;
@@ -2177,6 +2185,221 @@ function flightDotLabelHtml(seg, p) {
   return lines.join("<br>");
 }
 
+function airportPopupHtml(ap) {
+  const iata = String(ap.iata || "").trim().toUpperCase();
+  const icao = String(ap.icao || "").trim().toUpperCase();
+  const name = String(ap.name || "").trim();
+  const city = String(ap.city || "").trim();
+  const country = String(ap.country || "").trim();
+  const tz = String(ap.timezone || "").trim();
+  const cat = String(ap.category || "").replace(/_/g, " ");
+  const runway = ap.runway_length_ft != null ? Number(ap.runway_length_ft).toLocaleString() + " ft" : "—";
+  const gates = ap.gate_count != null ? Number(ap.gate_count).toLocaleString() : "—";
+  const score = ap.score != null ? Number(ap.score).toLocaleString() : "—";
+  const place = [city, country].filter(Boolean).join(", ");
+  return `
+    <div class="ap-popup">
+      <div class="ap-popup-title">${escapeHtml(name || iata)}</div>
+      <div class="ap-popup-codes">
+        <span>${escapeHtml(iata || "—")}</span>
+        ${icao ? `<span class="ap-popup-icao">${escapeHtml(icao)}</span>` : ""}
+      </div>
+      ${place ? `<div class="ap-popup-place">${escapeHtml(place)}</div>` : ""}
+      <table class="ap-popup-table">
+        <tr><th>Runway</th><td>${escapeHtml(runway)}</td></tr>
+        <tr><th>Gates</th><td>${escapeHtml(gates)}</td></tr>
+        <tr><th>Timezone</th><td>${escapeHtml(tz || "—")}</td></tr>
+        <tr><th>Category</th><td>${escapeHtml(cat || "—")}</td></tr>
+        <tr><th>Score</th><td>${escapeHtml(score)}</td></tr>
+      </table>
+    </div>
+  `;
+}
+
+function ensureAirportCatalog() {
+  if (airportCatalog) return Promise.resolve(airportCatalog);
+  if (!airportCatalogPromise) {
+    airportCatalogPromise = api("/api/airports-map.json")
+      .then((data) => {
+        const list = Array.isArray(data.airports) ? data.airports : [];
+        airportCatalog = list
+          .filter((ap) => ap && ap.iata != null && ap.lat != null && ap.lon != null)
+          .map((ap) => ({
+            iata: String(ap.iata).toUpperCase(),
+            icao: ap.icao,
+            name: ap.name,
+            city: ap.city,
+            country: ap.country,
+            lat: Number(ap.lat),
+            lon: Number(ap.lon),
+            runway_length_ft: ap.runway_length_ft,
+            gate_count: ap.gate_count,
+            timezone: ap.timezone,
+            score: Number(ap.score || 0),
+            category: String(ap.category || ""),
+          }))
+          .sort((a, b) => b.score - a.score || a.iata.localeCompare(b.iata));
+        return airportCatalog;
+      })
+      .catch((err) => {
+        airportCatalogPromise = null;
+        throw err;
+      });
+  }
+  return airportCatalogPromise;
+}
+
+/** Zoom → size floor + geographic separation so metro clusters keep the biggest hub. */
+function airportZoomPolicy(zoom) {
+  const z = Number(zoom) || 0;
+  if (z <= 2) return { minScore: 1450000, minSepKm: 900, cats: ["large_airport"] };
+  if (z <= 3) return { minScore: 1200000, minSepKm: 520, cats: ["large_airport"] };
+  if (z <= 4) return { minScore: 1000000, minSepKm: 300, cats: ["large_airport"] };
+  if (z <= 5) return { minScore: 850000, minSepKm: 180, cats: ["large_airport"] };
+  if (z <= 6) return { minScore: 600000, minSepKm: 110, cats: ["large_airport", "medium_airport"] };
+  if (z <= 7) return { minScore: 350000, minSepKm: 70, cats: ["large_airport", "medium_airport"] };
+  if (z <= 8) return { minScore: 150000, minSepKm: 28, cats: null };
+  if (z <= 9) return { minScore: 50000, minSepKm: 16, cats: null };
+  return { minScore: 0, minSepKm: 8, cats: null };
+}
+
+function airportPinStyle(iata) {
+  const onNetwork = airportNetwork.has(iata);
+  const isHub = airportHub && iata === airportHub;
+  if (isHub) {
+    return { radius: 7, color: "#5b21b6", weight: 2, fillColor: "#8b5cf6", fillOpacity: 0.95 };
+  }
+  if (onNetwork) {
+    return { radius: 6, color: "#1e40af", weight: 1.5, fillColor: "#3b82f6", fillOpacity: 0.95 };
+  }
+  return { radius: 4.5, color: "#6b7280", weight: 1.1, fillColor: "#9ca3af", fillOpacity: 0.92 };
+}
+
+/** Approx great-circle distance in km (good enough for metro declutter). */
+function airportSepKm(a, b) {
+  const toRad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * toRad;
+  const dLon = (b.lon - a.lon) * toRad;
+  const lat1 = a.lat * toRad;
+  const lat2 = b.lat * toRad;
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function selectAirportsForZoom(catalog, zoom) {
+  const policy = airportZoomPolicy(zoom);
+  // Fully zoomed in: show the whole catalog (canvas renderer handles the load).
+  if (policy.minScore <= 0 && policy.minSepKm <= 8) {
+    return catalog;
+  }
+  const accepted = [];
+
+  function tooClose(ap) {
+    for (let i = 0; i < accepted.length; i++) {
+      if (airportSepKm(ap, accepted[i]) < policy.minSepKm) return true;
+    }
+    return false;
+  }
+
+  function tryAccept(ap, force) {
+    if (!force && tooClose(ap)) return false;
+    accepted.push(ap);
+    return true;
+  }
+
+  // Network airports always win (even if clustered), then fill with largest others.
+  const network = [];
+  const others = [];
+  for (let i = 0; i < catalog.length; i++) {
+    const ap = catalog[i];
+    if (airportNetwork.has(ap.iata)) network.push(ap);
+    else others.push(ap);
+  }
+  network.sort((a, b) => b.score - a.score || a.iata.localeCompare(b.iata));
+  network.forEach((ap) => tryAccept(ap, true));
+
+  for (let i = 0; i < others.length; i++) {
+    const ap = others[i];
+    if (ap.score < policy.minScore) continue;
+    if (policy.cats && policy.cats.indexOf(ap.category) < 0) continue;
+    tryAccept(ap, false);
+  }
+  return accepted;
+}
+
+function syncAirportPin(ap) {
+  const iata = ap.iata;
+  const style = airportPinStyle(iata);
+  if (!airportPins[iata]) {
+    const marker = L.circleMarker([ap.lat, ap.lon], {
+      ...style,
+      pane: "airports",
+      renderer: airportRenderer || undefined,
+      className: "ap-pin",
+    }).addTo(airportLayer);
+    marker.bindTooltip(iata, {
+      permanent: false,
+      direction: "top",
+      offset: [0, -6],
+      className: "ap-pin-tip",
+    });
+    marker.bindPopup(() => airportPopupHtml(airportPins[iata].ap), {
+      maxWidth: 280,
+      className: "ap-pin-popup",
+    });
+    marker.on("click", () => {
+      marker.setPopupContent(airportPopupHtml(airportPins[iata].ap));
+    });
+    airportPins[iata] = { marker, ap };
+  } else {
+    airportPins[iata].ap = ap;
+    airportPins[iata].marker.setLatLng([ap.lat, ap.lon]);
+    airportPins[iata].marker.setStyle(style);
+    if (!airportLayer.hasLayer(airportPins[iata].marker)) {
+      airportLayer.addLayer(airportPins[iata].marker);
+    }
+  }
+}
+
+function refreshAirportPins() {
+  if (!airportLayer || !mapInst || !airportCatalog) return;
+  const visible = selectAirportsForZoom(airportCatalog, mapInst.getZoom());
+  const seen = {};
+  visible.forEach((ap) => {
+    seen[ap.iata] = true;
+    syncAirportPin(ap);
+  });
+  Object.keys(airportPins).forEach((iata) => {
+    if (!seen[iata]) {
+      airportLayer.removeLayer(airportPins[iata].marker);
+      delete airportPins[iata];
+    }
+  });
+}
+
+function scheduleAirportPinRefresh() {
+  if (airportPinRefreshTimer) clearTimeout(airportPinRefreshTimer);
+  airportPinRefreshTimer = setTimeout(() => {
+    airportPinRefreshTimer = null;
+    refreshAirportPins();
+  }, 80);
+}
+
+function updateAirports(data) {
+  airportHub = String((data.airline && data.airline.home_hub_iata) || "").toUpperCase();
+  const net = new Set();
+  if (airportHub) net.add(airportHub);
+  (data.network_iatas || []).forEach((code) => {
+    const c = String(code || "").toUpperCase();
+    if (c) net.add(c);
+  });
+  airportNetwork = net;
+  ensureAirportCatalog()
+    .then(() => refreshAirportPins())
+    .catch((err) => toast(err.message || "Airport map failed to load"));
+}
+
 function updateFlights(data) {
   const seen = {};
   const bounds = [];
@@ -2289,6 +2512,8 @@ function initMap() {
     toast("Geodesic plugin failed to load — Pacific routes may draw the long way.");
   }
   mapInst = L.map("map", { worldCopyJump: true, zoomControl: false });
+  mapInst.createPane("airports");
+  mapInst.getPane("airports").style.zIndex = 405;
   mapInst.createPane("routes");
   mapInst.getPane("routes").style.zIndex = 410;
   mapInst.createPane("aircraft");
@@ -2299,9 +2524,12 @@ function initMap() {
     noWrap: false,
     attribution: "&copy; OpenStreetMap",
   }).addTo(mapInst);
+  airportRenderer = L.canvas({ pane: "airports" });
+  airportLayer = L.layerGroup().addTo(mapInst);
   lineLayer = L.layerGroup().addTo(mapInst);
   acLayer = L.layerGroup().addTo(mapInst);
   mapInst.setView([20, 10], 3);
+  mapInst.on("zoomend", scheduleAirportPinRefresh);
   requestAnimationFrame(() => mapInst.invalidateSize());
   animate();
 }
@@ -2314,6 +2542,7 @@ async function loadMap() {
     const data = await api("/api/flight-map.json");
     if (seq !== mapLoadSeq) return;
     syncMapClock(data);
+    updateAirports(data);
     updateFlights(data);
   } catch (err) {
     // Don't let the HUD keep racing while the sim/API is stuck.

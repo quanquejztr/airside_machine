@@ -223,6 +223,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = (self.path or "").split("?", 1)[0].rstrip("/") or "/"
+        if path == "/api/airports-map.json":
+            from engine.airports import list_airports_for_map
+
+            try:
+                payload = {"ok": True, "airports": list_airports_for_map()}
+            except Exception as e:
+                payload = {"ok": False, "error": str(e)}
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if path == "/api/flight-map.json":
             from engine.flight_map_data import get_flight_map_payload
 

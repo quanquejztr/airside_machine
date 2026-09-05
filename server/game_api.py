@@ -267,6 +267,14 @@ def search_airports(q: str) -> dict:
     return _ok({"airports": slim})
 
 
+def airports_map() -> dict:
+    """Full airport geo catalog for zoom-dependent map pins."""
+    try:
+        return _ok({"airports": airports.list_airports_for_map()})
+    except Exception as e:
+        return _err(str(e))
+
+
 def list_catalog(category: Optional[str] = None) -> dict:
     cat = (category or "").strip().upper() or None
     rows = aircraft.list_catalog(category=cat, sort_by="range_nm")

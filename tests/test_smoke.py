@@ -881,6 +881,7 @@ class TestOverlayAPI(unittest.TestCase):
             cases = {
                 "get_state": lambda: api.get_state(),
                 "flight_map": lambda: api.flight_map(),
+                "airports_map": lambda: api.airports_map(),
                 "search_airports": lambda: api.search_airports("SF"),
                 "list_catalog": lambda: api.list_catalog(None),
                 "cabin_layout": lambda: api.cabin_layout("A320"),
