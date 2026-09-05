@@ -1027,6 +1027,63 @@ class TestAIWiring(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 8a2. Player hub starter capacity + raised runway hourly caps.
+# ---------------------------------------------------------------------------
+class TestPlayerHubStarters(unittest.TestCase):
+    def test_create_airline_at_slot_hub_gets_free_gates_and_slots(self):
+        from tests.helpers import fresh_game
+        from engine.gates import is_auctioned_airport
+        from engine.slots import declared_hourly_cap, is_slot_controlled, slots_held
+
+        with fresh_game(hub="ICN", name="Test Air", callsign="TST"):
+            from db import db
+
+            self.assertTrue(is_auctioned_airport("ICN"))
+            self.assertTrue(is_slot_controlled("ICN"))
+            gates = db.fetch_one(
+                """
+                SELECT gate_units FROM airport_gate_allocations
+                WHERE airport_iata = 'ICN' AND holder_id = 'PLAYER' AND status = 'ACTIVE'
+                """
+            )
+            self.assertIsNotNone(gates)
+            self.assertEqual(int(gates["gate_units"] or 0), 2)
+            self.assertEqual(slots_held("ICN", "PLAYER", 1), 12)
+            self.assertEqual(slots_held("ICN", "PLAYER", 12), 12)
+            self.assertGreaterEqual(declared_hourly_cap("ICN"), 26)
+
+    def test_create_airline_at_non_slot_hub_skips_slots(self):
+        from tests.helpers import fresh_game
+        from engine.slots import is_slot_controlled
+
+        with fresh_game(hub="SGN", name="VNA Test", callsign="VNT"):
+            from db import db
+
+            self.assertFalse(is_slot_controlled("SGN"))
+            slots = db.fetch_one(
+                """
+                SELECT slots_held FROM slot_allocations
+                WHERE airport_iata = 'SGN' AND holder_id = 'PLAYER' AND game_week = 1
+                """
+            )
+            self.assertIsNone(slots)
+
+    def test_slot_hourly_caps_raise_on_existing_rows(self):
+        from tests.helpers import fresh_game
+        from engine.slots import STAGE1_SLOT_AIRPORTS, declared_hourly_cap, seed_slot_controlled_airports
+
+        with fresh_game(hub="ATL", name="Cap Test", callsign="CAP"):
+            from db import db
+
+            db.execute(
+                "UPDATE slot_controlled_airports SET declared_hourly_cap = 3 WHERE iata = 'LHR'"
+            )
+            self.assertEqual(declared_hourly_cap("LHR"), 3)
+            seed_slot_controlled_airports()
+            self.assertEqual(declared_hourly_cap("LHR"), int(STAGE1_SLOT_AIRPORTS["LHR"]))
+
+
+# ---------------------------------------------------------------------------
 # 8b. AI Phase 1 — load streak column, gate planning, distress reactivation.
 # ---------------------------------------------------------------------------
 class TestAiPhase1(unittest.TestCase):
@@ -1192,6 +1249,28 @@ class TestAiPhase1(unittest.TestCase):
                 (cid, pair),
             )["status"]
             self.assertEqual("ACTIVE", str(st))
+
+
+# ---------------------------------------------------------------------------
+# 8b2. AI departure banks — 7-day / 24-hour spread.
+# ---------------------------------------------------------------------------
+class TestAiFlightBanks(unittest.TestCase):
+    def test_frequency_seven_covers_every_weekday(self):
+        from engine.ai_flights import bank_dep_hours
+
+        hours = bank_dep_hours(7, "HUBSPOKE", 0.0, pair_id="ATL-JFK")
+        days = sorted({int(h // 24.0) % 7 for h in hours})
+        self.assertEqual(days, [0, 1, 2, 3, 4, 5, 6])
+        clock_hours = [h % 24.0 for h in hours]
+        self.assertGreater(max(clock_hours) - min(clock_hours), 6.0)
+
+    def test_hubspoke_is_not_monday_morning_only(self):
+        from engine.ai_flights import bank_dep_hours
+
+        hours = bank_dep_hours(5, "HUBSPOKE", 336.0, pair_id="ICN-NRT")
+        offsets = [h - 336.0 for h in hours]
+        self.assertGreater(max(offsets), 96.0, "should reach later weekdays, not Mon–Tue banks")
+        self.assertFalse(all(abs((h % 24.0) - 7.0) < 0.5 or abs((h % 24.0) - 15.0) < 0.5 for h in hours))
 
 
 # ---------------------------------------------------------------------------

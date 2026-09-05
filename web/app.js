@@ -9,7 +9,15 @@ let winOffset = 0;
 let lastState = null;
 let hudSeq = 0;
 let didFitFlights = false;
-const mapClock = { hour: 0, speed: 0, realSecPerHour: 30, at: 0, alive: true };
+const mapClock = {
+  hour: 0,
+  speed: 0,
+  realSecPerHour: 30,
+  at: 0,
+  alive: true,
+  serverHour: 0,
+  serverAt: 0,
+};
 const seenNoticeIds = new Set();
 let mapLoadSeq = 0;
 let mapPollTimer = null;
@@ -19,11 +27,11 @@ function syncMapClock(src) {
   const incoming = src.current_game_hour != null ? Number(src.current_game_hour)
     : src.game_hours_elapsed != null ? Number(src.game_hours_elapsed)
     : null;
+  // Always trust the server stamp — never keep a raced-ahead extrapolated hour.
   if (incoming != null && Number.isFinite(incoming)) {
-    const extrapolated = mapClock.at ? liveGameHour() : mapClock.hour;
-    if (!Number.isFinite(extrapolated) || Math.abs(incoming - extrapolated) > 0.05) {
-      mapClock.hour = incoming;
-    }
+    mapClock.hour = incoming;
+    mapClock.serverHour = incoming;
+    mapClock.serverAt = performance.now();
   }
   if (src.speed_multiplier != null) mapClock.speed = Number(src.speed_multiplier);
   if (src.real_seconds_per_game_hour) mapClock.realSecPerHour = Number(src.real_seconds_per_game_hour);
@@ -34,8 +42,26 @@ function syncMapClock(src) {
 
 function liveGameHour() {
   if (mapClock.alive === false) return mapClock.hour;
-  const elapsed = (performance.now() - (mapClock.at || performance.now())) / 1000;
-  return mapClock.hour + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  const now = performance.now();
+  const elapsed = (now - (mapClock.at || now)) / 1000;
+  const raw = mapClock.hour + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  // Cap runaway extrapolation while a poll is hung (common at 60× + DB lock).
+  // Allow at most ~2 real seconds of predicted advance beyond the last server stamp.
+  if (mapClock.serverAt) {
+    const sinceServer = (now - mapClock.serverAt) / 1000;
+    const maxAhead = ((Math.min(sinceServer, 2.0) / (mapClock.realSecPerHour || 30))
+      * (mapClock.speed || 0));
+    const ceiling = mapClock.serverHour + maxAhead;
+    if (Number.isFinite(ceiling)) return Math.min(raw, ceiling);
+  }
+  return raw;
+}
+
+function freezeMapClock() {
+  mapClock.hour = liveGameHour();
+  mapClock.speed = 0;
+  mapClock.alive = false;
+  mapClock.at = performance.now();
 }
 
 function applyClockSpeed(speed) {
@@ -170,7 +196,13 @@ function closeWindow(id) {
 
 async function refreshHud() {
   const seq = ++hudSeq;
-  const s = await api("/api/state");
+  let s;
+  try {
+    s = await api("/api/state");
+  } catch (err) {
+    freezeMapClock();
+    throw err;
+  }
   if (seq !== hudSeq) return;
   lastState = s;
   const a = s.airline;
@@ -2278,15 +2310,22 @@ async function loadMap() {
   try { initMap(); } catch (err) { toast(err.message); return; }
   if (!mapInst) return;
   const seq = ++mapLoadSeq;
-  const data = await api("/api/flight-map.json");
-  if (seq !== mapLoadSeq) return;
-  syncMapClock(data);
-  updateFlights(data);
+  try {
+    const data = await api("/api/flight-map.json");
+    if (seq !== mapLoadSeq) return;
+    syncMapClock(data);
+    updateFlights(data);
+  } catch (err) {
+    // Don't let the HUD keep racing while the sim/API is stuck.
+    freezeMapClock();
+    throw err;
+  }
 }
 
 function mapPollIntervalMs() {
   const sp = mapClock.speed || 0;
-  if (sp >= 20) return 500;
+  if (sp >= 60) return 250;
+  if (sp >= 20) return 400;
   if (sp >= 4) return 800;
   return 1500;
 }

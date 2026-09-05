@@ -3,8 +3,9 @@ Runway slot caps (hourly movements), independent of apron/gate concurrency.
 
 Stage 1: JFK, LHR, HND, IAD, DCA, DXB, PEK, ICN, LAX, SIN, SYD, TPE, HKG, CDG.
 
-Game-scale declared_hourly_cap (4–7 movements/hour). Real IATA Level-3 caps
-(60–90/hr) would never bind with this sim's traffic.
+Game-scale declared_hourly_cap (all Stage-1 airports start at 26 movements/hour).
+Real IATA Level-3 caps (60–90/hr) would rarely bind with this sim's traffic; 26/hr
+still allows congestion at peak banks without locking starters out of their hub.
 """
 
 from __future__ import annotations
@@ -17,20 +18,20 @@ from db import db
 
 
 STAGE1_SLOT_AIRPORTS: Dict[str, int] = {
-    "JFK": 6,
-    "LHR": 6,
-    "HND": 5,
-    "IAD": 5,
-    "DCA": 4,
-    "DXB": 7,
-    "PEK": 6,
-    "ICN": 6,
-    "LAX": 6,
-    "SIN": 6,
-    "SYD": 5,
-    "TPE": 5,
-    "HKG": 6,
-    "CDG": 6,
+    "JFK": 26,
+    "LHR": 26,
+    "HND": 26,
+    "IAD": 26,
+    "DCA": 26,
+    "DXB": 26,
+    "PEK": 26,
+    "ICN": 26,
+    "LAX": 26,
+    "SIN": 26,
+    "SYD": 26,
+    "TPE": 26,
+    "HKG": 26,
+    "CDG": 26,
 }
 
 _MISSING_AIRPORTS = {
@@ -189,6 +190,18 @@ def seed_slot_controlled_airports() -> None:
             VALUES (?, ?, 'IATA', 1)
             """,
             (iata, int(cap)),
+        )
+        # Raise caps on existing saves when STAGE1 values increase (INSERT OR IGNORE
+        # alone would leave stale low caps forever).
+        db.execute(
+            """
+            UPDATE slot_controlled_airports
+            SET declared_hourly_cap = ?
+            WHERE iata = ?
+              AND COALESCE(declared_hourly_cap, 0) < ?
+              AND slot_season != 'OPEN'
+            """,
+            (int(cap), iata, int(cap)),
         )
 
 

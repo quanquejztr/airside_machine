@@ -19,12 +19,63 @@ DEFAULT_CREDIT_SCORE = 720
 DEFAULT_REPUTATION = 50.0
 DEFAULT_BRAND_POWER = 1.0
 DEFAULT_XP = 0
+# Hub bootstrap when the home airport is capacity-controlled.
+PLAYER_STARTER_HUB_GATES = 2
+# Weekly runway movements at a slot-controlled hub (2 movements per round-trip).
+# 12 ≈ six weekly cycles — enough to open a small hub network without skipping auctions.
+PLAYER_STARTER_HUB_SLOTS = 12
 
 
 def airline_exists():
     """Check if airline already exists."""
     airline = db.fetch_one("SELECT id FROM airline WHERE id = 1")
     return airline is not None
+
+
+def grant_player_hub_starter_capacity(home_hub_iata: str) -> dict:
+    """
+    Give the new player free hub capacity so week-1 ops are possible.
+
+    - 2 gate stands if the hub is an auctioned airport
+    - 12 weekly runway movements if the hub is slot-controlled (seeded across
+      the same horizon AI uses for slot bootstrap)
+    """
+    hub = str(home_hub_iata or "").upper().strip()
+    out = {"hub": hub, "gates": 0, "slots": 0, "slot_weeks": 0}
+    if not hub:
+        return out
+
+    try:
+        from engine.gates import _upsert_allocation, is_auctioned_airport
+
+        if is_auctioned_airport(hub):
+            _upsert_allocation(hub, "PLAYER", PLAYER_STARTER_HUB_GATES, effective_week=1)
+            out["gates"] = PLAYER_STARTER_HUB_GATES
+    except Exception:
+        pass
+
+    try:
+        from engine.slots import (
+            ensure_min_slots_held,
+            is_slot_controlled,
+            seed_slot_controlled_airports,
+        )
+
+        seed_slot_controlled_airports()
+        if is_slot_controlled(hub):
+            weeks = 24
+            try:
+                weeks = max(1, int(float(db.get_financial_constant("ai_slot_seed_weeks") or 24)))
+            except Exception:
+                weeks = 24
+            for w in range(1, weeks + 1):
+                ensure_min_slots_held(hub, "PLAYER", w, PLAYER_STARTER_HUB_SLOTS)
+            out["slots"] = PLAYER_STARTER_HUB_SLOTS
+            out["slot_weeks"] = weeks
+    except Exception:
+        pass
+
+    return out
 
 
 def _airport_dict(iata: str) -> Optional[Dict[str, Any]]:
@@ -146,6 +197,8 @@ def create_airline(name=None, callsign=None, home_hub_iata=None):
                 demand_noise_seed, pause_on_week_summary
             ) VALUES (1, 1, 1, 0.0, 0, 1, ?, 0.0, 1, 0)
         """, (fuel0,))
+
+        starter = grant_player_hub_starter_capacity(home_hub_iata)
         
         # Return created airline data
         airline = {
@@ -157,7 +210,9 @@ def create_airline(name=None, callsign=None, home_hub_iata=None):
             'credit_score': DEFAULT_CREDIT_SCORE,
             'reputation_score': DEFAULT_REPUTATION,
             'brand_power': DEFAULT_BRAND_POWER,
-            'xp': DEFAULT_XP
+            'xp': DEFAULT_XP,
+            'starter_hub_gates': int(starter.get("gates") or 0),
+            'starter_hub_slots': int(starter.get("slots") or 0),
         }
         
         print("\n" + "=" * 60)
@@ -169,6 +224,13 @@ def create_airline(name=None, callsign=None, home_hub_iata=None):
         print(f"Starting Cash: ${STARTING_CASH:,}")
         print(f"Credit Score: {DEFAULT_CREDIT_SCORE}")
         print(f"Reputation: {DEFAULT_REPUTATION:.1f}/100")
+        if starter.get("gates"):
+            print(f"Starter hub gates: {starter['gates']} (free at {home_hub_iata})")
+        if starter.get("slots"):
+            print(
+                f"Starter hub slots: {starter['slots']} movements/week "
+                f"for {starter.get('slot_weeks', 0)} weeks at {home_hub_iata}"
+            )
         print("=" * 60 + "\n")
         
         return airline
