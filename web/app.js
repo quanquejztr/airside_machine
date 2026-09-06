@@ -18,6 +18,7 @@ let selectedAirportIata = "";
 let selectedAirportRoutesSeq = 0;
 /** @type {null | { origin: string, dest: string | null, phase: 'pick_dest' | 'confirm' }} */
 let routeDraft = null;
+let routeDraftPreviewSeq = 0;
 let zTop = 40;
 let winOffset = 0;
 let lastState = null;
@@ -2297,6 +2298,43 @@ function startNewRouteDraft(originIata) {
   toast("Click a destination airport");
 }
 
+/** Compact demand block — same numbers as Routes → Preview. */
+function routeDraftStatsInner(preview) {
+  if (preview == null) {
+    return `<div class="muted">Loading demand…</div>`;
+  }
+  if (preview.__error) {
+    return `<div class="err">${escapeHtml(preview.__error)}</div>`;
+  }
+  const dem = preview.demand || {};
+  const market = Number(dem.weekly_market_total != null ? dem.weekly_market_total : dem.total_pax || 0);
+  const src = dem.demand_source_badge || "Demand";
+  const floorNote = dem.market_floor_applied ? " · min market" : "";
+  const already = preview.already_operated
+    ? `<div class="ap-open-route-note">You already operate this</div>`
+    : "";
+  return `
+    <div class="ap-open-route-demand"><b>${market.toLocaleString()}</b> pax/wk
+      <span class="muted">· ${escapeHtml(src)}${escapeHtml(floorNote)}</span></div>
+    <div class="muted">${Number(dem.business_pax || 0).toLocaleString()} business ·
+      ${Number(dem.leisure_pax || 0).toLocaleString()} leisure</div>
+    <div class="muted">Y${Number(dem.economy_pax || 0)} / W${Number(dem.premium_economy_pax || 0)} /
+      J${Number(dem.business_cabin_pax || 0)} / F${Number(dem.first_pax || 0)}</div>
+    <div class="muted">${Number(preview.distance_nm || 0).toLocaleString()} nm ·
+      Cost ~ <b>${money(preview.total_new_cost)}</b></div>
+    ${already}`;
+}
+
+function openRouteBoxHtml(origin, dest, preview) {
+  return `
+    <div class="ap-open-route-box">
+      <div class="ap-open-route-pair">${escapeHtml(origin)} → ${escapeHtml(dest)}</div>
+      <div class="ap-open-route-stats">${routeDraftStatsInner(preview)}</div>
+      <button type="button" class="ap-open-route-btn">Open route</button>
+      <button type="button" class="ap-open-route-cancel" aria-label="Cancel">×</button>
+    </div>`;
+}
+
 function drawRouteDraftPreview() {
   if (!airportDraftLayer || !mapInst || !routeDraft || !routeDraft.dest) return;
   airportDraftLayer.clearLayers();
@@ -2338,18 +2376,14 @@ function drawRouteDraftPreview() {
     L.polyline(pts, lineOpts).addTo(airportDraftLayer);
   }
 
-  const html = `
-    <div class="ap-open-route-box">
-      <div class="ap-open-route-pair">${escapeHtml(routeDraft.origin)} → ${escapeHtml(routeDraft.dest)}</div>
-      <button type="button" class="ap-open-route-btn">Open route</button>
-      <button type="button" class="ap-open-route-cancel" aria-label="Cancel">×</button>
-    </div>`;
+  const origin = routeDraft.origin;
+  const dest = routeDraft.dest;
   const marker = L.marker([d.lat, d.lon], {
     icon: L.divIcon({
       className: "ap-open-route-anchor",
-      html,
-      iconSize: [148, 64],
-      iconAnchor: [74, 72],
+      html: openRouteBoxHtml(origin, dest, null),
+      iconSize: [196, 150],
+      iconAnchor: [98, 158],
     }),
     interactive: true,
     keyboard: false,
@@ -2381,6 +2415,24 @@ function drawRouteDraftPreview() {
   };
   marker.on("add", wireOpenRouteBox);
   requestAnimationFrame(wireOpenRouteBox);
+
+  const seq = ++routeDraftPreviewSeq;
+  routeDraft.previewSeq = seq;
+  api(`/api/routes/preview?origin=${encodeURIComponent(origin)}&dest=${encodeURIComponent(dest)}`)
+    .then((p) => {
+      if (!routeDraft || routeDraft.previewSeq !== seq) return;
+      const el = marker.getElement();
+      const slot = el && el.querySelector(".ap-open-route-stats");
+      if (slot) slot.innerHTML = routeDraftStatsInner(p);
+    })
+    .catch((err) => {
+      if (!routeDraft || routeDraft.previewSeq !== seq) return;
+      const el = marker.getElement();
+      const slot = el && el.querySelector(".ap-open-route-stats");
+      if (slot) {
+        slot.innerHTML = routeDraftStatsInner({ __error: err.message || "Demand unavailable" });
+      }
+    });
 }
 
 async function confirmOpenDraftRoute() {
