@@ -110,6 +110,16 @@ html, body {
   right: 14px;
   z-index: 22;
   pointer-events: auto;
+  opacity: 0.3;
+  transition:
+    opacity 0.28s ease,
+    box-shadow 0.7s var(--ease-glass),
+    transform 0.7s var(--ease-glass);
+}
+
+#hud:hover,
+#hud:focus-within {
+  opacity: 1;
 }
 
 #hud.glass-panel.lift:hover {
@@ -225,6 +235,16 @@ html, body {
   bottom: 42px;
   z-index: 22;
   max-width: 78%;
+  opacity: 0.3;
+  transition:
+    opacity 0.28s ease,
+    box-shadow 0.7s var(--ease-glass),
+    transform 0.7s var(--ease-glass);
+}
+
+#dock:hover,
+#dock:focus-within {
+  opacity: 1;
 }
 
 .dock-inner {
