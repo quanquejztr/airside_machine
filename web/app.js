@@ -354,11 +354,17 @@ function openAirline() {
         callsign: String(fd.get("callsign") || "").toUpperCase(),
         home_hub_iata: await resolveAirportCode(fd.get("home_hub_iata")),
       } };
+      const hubIata = String(
+        (lastState.airline && lastState.airline.home_hub_iata) || ""
+      ).toUpperCase();
       toast("Airline created");
       closeWindow("airline");
       resetClientWorld();
+      // Skip the first world-wide flight fit so the hub zoom isn't overridden.
+      didFitFlights = true;
       await refreshHud();
-      loadMap().catch(() => {});
+      await loadMap();
+      await focusMapOnHub(hubIata);
     } catch (err) { setMsg(form, err.message, false); }
   };
 }
@@ -2232,6 +2238,29 @@ function airportLatLon(iata) {
   const ap = (airportCatalog || []).find((a) => a.iata === code);
   if (ap) return { lat: Number(ap.lat), lon: Number(ap.lon) };
   return null;
+}
+
+/** Animate the map onto the player's home hub after founding (or on demand). */
+async function focusMapOnHub(iata, opts = {}) {
+  const code = String(iata || "").toUpperCase();
+  if (!code) return;
+  try { initMap(); } catch (_) { return; }
+  if (!mapInst) return;
+  try {
+    await ensureAirportCatalog();
+  } catch (_) { /* still try pin / catalog below */ }
+  const ll = airportLatLon(code);
+  if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lon)) return;
+  // Keep the hub pin on-screen at this zoom, then fly in.
+  refreshAirportPins();
+  const zoom = opts.zoom != null ? Number(opts.zoom) : 6;
+  const duration = opts.duration != null ? Number(opts.duration) : 1.35;
+  didFitFlights = true;
+  mapInst.flyTo([ll.lat, ll.lon], zoom, {
+    animate: true,
+    duration: Math.max(0.4, duration),
+    easeLinearity: 0.25,
+  });
 }
 
 function clearRouteDraft() {
