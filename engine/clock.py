@@ -557,5 +557,7 @@ def stop_game_clock():
     global _global_clock
     if _global_clock:
         _global_clock.stop()
-        _global_clock.join(timeout=2)
+        # join() raises RuntimeError if start() never ran (e.g. failed boot / test teardown).
+        if getattr(_global_clock, "ident", None) is not None:
+            _global_clock.join(timeout=2)
         _global_clock = None

@@ -459,6 +459,18 @@ def _apply_competitor_personality(spec: Dict[str, Any]) -> None:
             cid,
         ),
     )
+    # Repair absurd cash typos left in live saves (e.g. Titan at $16T).
+    try:
+        roster_cash = float(spec.get("cash") or 0.0)
+        row = db.fetch_one("SELECT cash FROM competitors WHERE competitor_id = ?", (cid,))
+        live = float(row["cash"] or 0.0) if row else 0.0
+        if roster_cash > 0 and live > max(2_000_000_000.0, roster_cash * 20.0):
+            db.execute(
+                "UPDATE competitors SET cash = ? WHERE competitor_id = ?",
+                (roster_cash, cid),
+            )
+    except Exception:
+        pass
 
 
 _competitors_seed_lock = threading.Lock()
@@ -935,7 +947,7 @@ def ai_generate_candidates(competitor_id: str) -> List[str]:
     spec = _spec_for(cid)
 
     # Filter airports by radius and strategy gates.
-    arows = db.fetch_all("SELECT iata, lat, lon, score, category FROM airports")
+    arows = db.fetch_all("SELECT iata, lat, lon, score, category, country FROM airports")
     scored_allowed: List[tuple[float, str]] = []
     allowed: List[str] = []
     for a in arows:
@@ -1029,7 +1041,26 @@ def ai_generate_candidates(competitor_id: str) -> List[str]:
     pool = max(5, _ai_candidate_pool_size())
     # International carriers bid on trophy airports; give gated pairs more pool slots.
     n_free = max(2, pool // 5) if spec.get("international") else max(4, pool // 3)
-    top = gated[: max(0, pool - n_free)] + ungated[:n_free]
+    gated_slots = max(0, pool - n_free)
+    if spec.get("international") and gated_slots > 0:
+        # Round-robin by destination region so Asia mega-hubs don't crowd out LHR/CDG.
+        from engine.route_demand import _region as _ap_region
+
+        buckets: Dict[str, List[str]] = {}
+        for p in gated:
+            oa, ob = _route_pair_components(p)
+            other = ob if oa == hub else oa if ob == hub else (oa if oa != hub else ob)
+            meta = by_iata.get(other) or {}
+            reg = _ap_region(meta.get("country"), meta.get("lon"))
+            buckets.setdefault(reg, []).append(p)
+        gated_pick: List[str] = []
+        while len(gated_pick) < gated_slots and any(buckets.values()):
+            for reg in sorted(buckets.keys()):
+                if buckets[reg] and len(gated_pick) < gated_slots:
+                    gated_pick.append(buckets[reg].pop(0))
+    else:
+        gated_pick = gated[:gated_slots]
+    top = gated_pick + ungated[:n_free]
     # de-dupe, preserve order
     seen = set()
     ordered = []
@@ -1201,7 +1232,11 @@ def ai_score_candidate(competitor_id: str, route_pair_id: str, game_week: int) -
 
     import math
     mp = _ai_min_profit_to_open()
-    profit_score = 1.0 / (1.0 + math.exp(-((est_profit - mp) / max(1.0, mp))))
+    # Clamp the logit argument — ultra-unprofitable long-haul estimates (and cash
+    # typos that inflate gate/lease charges) can push exp() past float range.
+    z = -((est_profit - mp) / max(1.0, mp))
+    z = max(-60.0, min(60.0, float(z)))
+    profit_score = 1.0 / (1.0 + math.exp(z))
 
     hub_bonus = 0.3 if (a == hub or b == hub) else 0.0
     if db.fetch_one(

@@ -5,6 +5,7 @@ let lineLayer = null;
 let acLayer = null;
 let airportLayer = null;
 let airportRenderer = null;
+let airportRouteLayer = null;
 const flights = {};
 const airportPins = {};
 let airportCatalog = null;
@@ -12,6 +13,8 @@ let airportCatalogPromise = null;
 let airportNetwork = new Set();
 let airportHub = "";
 let airportPinRefreshTimer = null;
+let selectedAirportIata = "";
+let selectedAirportRoutesSeq = 0;
 let zTop = 40;
 let winOffset = 0;
 let lastState = null;
@@ -2216,6 +2219,121 @@ function airportPopupHtml(ap) {
   `;
 }
 
+function clearAirportRouteSelection() {
+  selectedAirportIata = "";
+  if (airportRouteLayer) airportRouteLayer.clearLayers();
+  // Restore live flight line opacity after a selection fade.
+  Object.values(flights).forEach((f) => {
+    if (!f || !f.line) return;
+    const flying = liveProgress(f) > 0.002 && liveProgress(f) < 0.998;
+    f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
+  });
+}
+
+function airportSpokeStyle(hasPlayer, hasAi, suspendedOnly) {
+  if (hasPlayer) {
+    return {
+      color: "#2563eb",
+      weight: hasAi ? 3.5 : 3,
+      opacity: 0.95,
+      dashArray: null,
+    };
+  }
+  if (suspendedOnly) {
+    return { color: "#94a3b8", weight: 1.5, opacity: 0.55, dashArray: "4 6" };
+  }
+  return { color: "#f59e0b", weight: 2.25, opacity: 0.85, dashArray: null };
+}
+
+function drawAirportRouteSpokes(hubIata, routes) {
+  if (!airportRouteLayer || !mapInst) return;
+  airportRouteLayer.clearLayers();
+  const hub = String(hubIata || "").toUpperCase();
+  const byOther = {};
+  (routes || []).forEach((r) => {
+    const other = String(r.other_iata || "").toUpperCase();
+    if (!other || other === hub) return;
+    if (!byOther[other]) {
+      byOther[other] = {
+        other,
+        hasPlayer: false,
+        hasAi: false,
+        suspendedOnly: true,
+        lat: null,
+        lon: null,
+        labels: [],
+      };
+    }
+    const bucket = byOther[other];
+    const op = String(r.operator || "");
+    if (op === "PLAYER") bucket.hasPlayer = true;
+    else bucket.hasAi = true;
+    if (String(r.status || "").toUpperCase() !== "SUSPENDED") bucket.suspendedOnly = false;
+    // Endpoint coords: the non-hub end of this directed leg.
+    if (String(r.origin_iata || "").toUpperCase() === hub) {
+      bucket.lat = Number(r.dest_lat);
+      bucket.lon = Number(r.dest_lon);
+    } else {
+      bucket.lat = Number(r.origin_lat);
+      bucket.lon = Number(r.origin_lon);
+    }
+    const label = String(r.operator_label || op);
+    if (label && bucket.labels.indexOf(label) < 0) bucket.labels.push(label);
+  });
+
+  const hubPin = airportPins[hub];
+  const hubLat = hubPin && hubPin.ap ? Number(hubPin.ap.lat) : null;
+  const hubLon = hubPin && hubPin.ap ? Number(hubPin.ap.lon) : null;
+  if (hubLat == null || hubLon == null) return;
+
+  // Soften background flight lines while a network is selected.
+  Object.values(flights).forEach((f) => {
+    if (f && f.line) f.line.setStyle({ opacity: f.player ? 0.18 : 0.08 });
+  });
+
+  Object.values(byOther).forEach((spoke) => {
+    if (spoke.lat == null || spoke.lon == null || !Number.isFinite(spoke.lat) || !Number.isFinite(spoke.lon)) {
+      return;
+    }
+    const style = airportSpokeStyle(spoke.hasPlayer, spoke.hasAi, spoke.suspendedOnly && !spoke.hasPlayer);
+    const endpoints = [[hubLat, hubLon], [spoke.lat, spoke.lon]];
+    const lineOpts = {
+      ...style,
+      pane: "routes",
+      steps: 5,
+      wrap: false,
+      className: "ap-route-spoke",
+    };
+    const pts = interpolateGreatCircle(hubLat, hubLon, spoke.lat, spoke.lon, 64);
+    const line = (typeof L.Geodesic === "function")
+      ? new L.Geodesic(endpoints, lineOpts).addTo(airportRouteLayer)
+      : L.polyline(pts, lineOpts).addTo(airportRouteLayer);
+    const tip = `${hub}–${spoke.other}`;
+    line.bindTooltip(tip, { sticky: true, direction: "top", className: "ap-pin-tip" });
+  });
+}
+
+async function selectAirportRoutes(iata, marker) {
+  const code = String(iata || "").toUpperCase();
+  if (!code || !marker) return;
+  if (selectedAirportIata === code) {
+    // Toggle off if clicking the same pin again.
+    clearAirportRouteSelection();
+    return;
+  }
+  selectedAirportIata = code;
+  const seq = ++selectedAirportRoutesSeq;
+  try {
+    const data = await api("/api/airports/routes?iata=" + encodeURIComponent(code));
+    if (seq !== selectedAirportRoutesSeq || selectedAirportIata !== code) return;
+    drawAirportRouteSpokes(code, data.routes || []);
+  } catch (err) {
+    if (seq !== selectedAirportRoutesSeq || selectedAirportIata !== code) return;
+    clearAirportRouteSelection();
+    toast(err.message || "Failed to load routes");
+  }
+}
+
 function ensureAirportCatalog() {
   if (airportCatalog) return Promise.resolve(airportCatalog);
   if (!airportCatalogPromise) {
@@ -2347,9 +2465,14 @@ function syncAirportPin(ap) {
     marker.bindPopup(() => airportPopupHtml(airportPins[iata].ap), {
       maxWidth: 280,
       className: "ap-pin-popup",
+      autoPan: true,
     });
-    marker.on("click", () => {
-      marker.setPopupContent(airportPopupHtml(airportPins[iata].ap));
+    marker.on("click", (ev) => {
+      if (ev && ev.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+      selectAirportRoutes(iata, marker);
+    });
+    marker.on("popupclose", () => {
+      if (selectedAirportIata === iata) clearAirportRouteSelection();
     });
     airportPins[iata] = { marker, ap };
   } else {
@@ -2497,7 +2620,11 @@ function animate() {
     if (pos) f.marker.setLatLng(pos);
     const flying = p > 0.002 && p < 0.998;
     f.marker.setStyle({ fillOpacity: flying || f.player ? 1 : 0.45, radius: f.player ? (flying ? 9 : 7) : 5 });
-    f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
+    if (selectedAirportIata) {
+      f.line.setStyle({ opacity: f.player ? 0.18 : 0.08 });
+    } else {
+      f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
+    }
   });
   requestAnimationFrame(animate);
 }
@@ -2527,9 +2654,13 @@ function initMap() {
   airportRenderer = L.canvas({ pane: "airports" });
   airportLayer = L.layerGroup().addTo(mapInst);
   lineLayer = L.layerGroup().addTo(mapInst);
+  airportRouteLayer = L.layerGroup().addTo(mapInst);
   acLayer = L.layerGroup().addTo(mapInst);
   mapInst.setView([20, 10], 3);
   mapInst.on("zoomend", scheduleAirportPinRefresh);
+  mapInst.on("click", () => {
+    if (selectedAirportIata) clearAirportRouteSelection();
+  });
   requestAnimationFrame(() => mapInst.invalidateSize());
   animate();
 }

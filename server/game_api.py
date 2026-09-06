@@ -275,6 +275,195 @@ def airports_map() -> dict:
         return _err(str(e))
 
 
+def airport_routes(iata: str) -> dict:
+    """
+    All open routes touching an airport: player network + AI competitor routes.
+
+    Used by the live map when a pin is clicked — returns directed city-pairs with
+    endpoint coordinates so the client can draw spokes.
+    """
+    code = str(iata or "").strip().upper()
+    if len(code) < 3:
+        return _err("iata is required.")
+
+    ap = airports.get_airport(code)
+    if not ap:
+        return _err(f"Airport '{code}' not found.")
+
+    try:
+        from engine.ai import ensure_competitors_seeded
+
+        ensure_competitors_seeded()
+    except Exception:
+        pass
+
+    al = db.fetch_one("SELECT name, callsign FROM airline WHERE id = 1")
+    player_label = "You"
+    if al:
+        player_label = str(al["name"] or al["callsign"] or "You").strip() or "You"
+
+    out = []
+    seen = set()
+
+    def _push(row: dict) -> None:
+        key = (
+            str(row.get("operator") or ""),
+            str(row.get("origin_iata") or ""),
+            str(row.get("dest_iata") or ""),
+        )
+        if key in seen:
+            return
+        if row.get("origin_lat") is None or row.get("dest_lat") is None:
+            return
+        seen.add(key)
+        out.append(row)
+
+    for r in db.fetch_all(
+        """
+        SELECT r.route_id, r.origin_iata, r.dest_iata, r.distance_nm,
+               ao.lat AS origin_lat, ao.lon AS origin_lon,
+               ad.lat AS dest_lat, ad.lon AS dest_lon
+        FROM player_routes pr
+        JOIN routes r ON r.route_id = pr.route_id
+        JOIN airports ao ON ao.iata = r.origin_iata
+        JOIN airports ad ON ad.iata = r.dest_iata
+        WHERE r.origin_iata = ? OR r.dest_iata = ?
+        ORDER BY r.origin_iata, r.dest_iata
+        """,
+        (code, code),
+    ) or []:
+        o = str(r["origin_iata"] or "").upper()
+        d = str(r["dest_iata"] or "").upper()
+        _push(
+            {
+                "operator": "PLAYER",
+                "operator_label": player_label,
+                "route_id": r["route_id"],
+                "origin_iata": o,
+                "dest_iata": d,
+                "other_iata": d if o == code else o,
+                "direction": "out" if o == code else "in",
+                "distance_nm": float(r["distance_nm"] or 0),
+                "frequency_per_week": None,
+                "status": "ACTIVE",
+                "aircraft_type_id": None,
+                "origin_lat": float(r["origin_lat"]),
+                "origin_lon": float(r["origin_lon"]),
+                "dest_lat": float(r["dest_lat"]),
+                "dest_lon": float(r["dest_lon"]),
+            }
+        )
+
+    for r in db.fetch_all(
+        """
+        SELECT cr.competitor_id, c.name AS competitor_name,
+               cr.route_pair_id, cr.outbound_route_id, cr.inbound_route_id,
+               cr.frequency_per_week, cr.aircraft_type_id, cr.status,
+               ro.origin_iata AS out_origin, ro.dest_iata AS out_dest,
+               ro.distance_nm AS out_distance_nm,
+               oo.lat AS out_origin_lat, oo.lon AS out_origin_lon,
+               od.lat AS out_dest_lat, od.lon AS out_dest_lon,
+               ri.origin_iata AS in_origin, ri.dest_iata AS in_dest,
+               ri.distance_nm AS in_distance_nm,
+               io.lat AS in_origin_lat, io.lon AS in_origin_lon,
+               idd.lat AS in_dest_lat, idd.lon AS in_dest_lon
+        FROM competitor_routes cr
+        JOIN competitors c ON c.competitor_id = cr.competitor_id
+        JOIN routes ro ON ro.route_id = cr.outbound_route_id
+        JOIN routes ri ON ri.route_id = cr.inbound_route_id
+        JOIN airports oo ON oo.iata = ro.origin_iata
+        JOIN airports od ON od.iata = ro.dest_iata
+        JOIN airports io ON io.iata = ri.origin_iata
+        JOIN airports idd ON idd.iata = ri.dest_iata
+        WHERE cr.status IN ('ACTIVE', 'SUSPENDED')
+          AND (
+            ro.origin_iata = ? OR ro.dest_iata = ?
+            OR ri.origin_iata = ? OR ri.dest_iata = ?
+          )
+        ORDER BY c.name, cr.route_pair_id
+        """,
+        (code, code, code, code),
+    ) or []:
+        cid = str(r["competitor_id"] or "")
+        label = str(r["competitor_name"] or cid).strip() or cid
+        status = str(r["status"] or "ACTIVE")
+        freq = int(r["frequency_per_week"] or 0)
+        ac_type = r["aircraft_type_id"]
+
+        out_o = str(r["out_origin"] or "").upper()
+        out_d = str(r["out_dest"] or "").upper()
+        in_o = str(r["in_origin"] or "").upper()
+        in_d = str(r["in_dest"] or "").upper()
+
+        legs = []
+        if out_o == code or out_d == code:
+            legs.append(
+                (
+                    str(r["outbound_route_id"]),
+                    out_o,
+                    out_d,
+                    float(r["out_distance_nm"] or 0),
+                    float(r["out_origin_lat"]),
+                    float(r["out_origin_lon"]),
+                    float(r["out_dest_lat"]),
+                    float(r["out_dest_lon"]),
+                )
+            )
+        if in_o == code or in_d == code:
+            legs.append(
+                (
+                    str(r["inbound_route_id"]),
+                    in_o,
+                    in_d,
+                    float(r["in_distance_nm"] or 0),
+                    float(r["in_origin_lat"]),
+                    float(r["in_origin_lon"]),
+                    float(r["in_dest_lat"]),
+                    float(r["in_dest_lon"]),
+                )
+            )
+
+        for route_id, o, d, dist, olat, olon, dlat, dlon in legs:
+            _push(
+                {
+                    "operator": cid,
+                    "operator_label": label,
+                    "route_id": route_id,
+                    "route_pair_id": r["route_pair_id"],
+                    "origin_iata": o,
+                    "dest_iata": d,
+                    "other_iata": d if o == code else o,
+                    "direction": "out" if o == code else "in",
+                    "distance_nm": dist,
+                    "frequency_per_week": freq,
+                    "status": status,
+                    "aircraft_type_id": ac_type,
+                    "origin_lat": olat,
+                    "origin_lon": olon,
+                    "dest_lat": dlat,
+                    "dest_lon": dlon,
+                }
+            )
+
+    out.sort(
+        key=lambda x: (
+            0 if x["operator"] == "PLAYER" else 1,
+            str(x.get("operator_label") or ""),
+            str(x.get("other_iata") or ""),
+            0 if x.get("direction") == "out" else 1,
+        )
+    )
+    return _ok(
+        {
+            "iata": code,
+            "name": ap.get("name"),
+            "city": ap.get("city"),
+            "routes": out,
+            "route_count": len(out),
+        }
+    )
+
+
 def list_catalog(category: Optional[str] = None) -> dict:
     cat = (category or "").strip().upper() or None
     rows = aircraft.list_catalog(category=cat, sort_by="range_nm")

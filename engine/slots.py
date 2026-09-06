@@ -293,11 +293,16 @@ def check_slot_available(
     return (current < cap, current, cap)
 
 
-def assert_player_slots_for_new_segments(game_week: int, segments: list[dict]) -> None:
+def assert_player_slots_for_new_segments(
+    game_week: int, segments: list[dict], *, ferry: bool = False
+) -> None:
     """
     Pre-insert check: existing live movements + these planned extras must stay under
     the hourly cap AND the player's weekly purchased quota at slot-controlled airports.
     segments: origin_iata, dest_iata, dep_abs, arr_abs.
+
+    ferry=True skips the weekly purchased-quota check (repositioning is not commercial
+    service) but still enforces the airport's declared hourly movement cap.
     """
     gw = int(game_week)
     grandfather_historic_slot_holdings(gw)
@@ -323,6 +328,8 @@ def assert_player_slots_for_new_segments(game_week: int, segments: list[dict]) -
                 f"{ap} is full at hour {ch} ({cur}/{cap} movements; this schedule adds {n}). "
                 f"Pick a different departure time."
             )
+    if ferry:
+        return
     for ap, n in extra_ap.items():
         held = slots_held(ap, "PLAYER", gw)
         used = int(sum(hourly_movements_at(ap, gw, holder_id="PLAYER").values()))

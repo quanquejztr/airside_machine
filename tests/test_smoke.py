@@ -882,6 +882,9 @@ class TestOverlayAPI(unittest.TestCase):
                 "get_state": lambda: api.get_state(),
                 "flight_map": lambda: api.flight_map(),
                 "airports_map": lambda: api.airports_map(),
+                "airport_routes": lambda: api.airport_routes(
+                    prow["origin_iata"] if prow else (rt["origin_iata"] if rt else "ATL")
+                ),
                 "search_airports": lambda: api.search_airports("SF"),
                 "list_catalog": lambda: api.list_catalog(None),
                 "cabin_layout": lambda: api.cabin_layout("A320"),
@@ -1032,7 +1035,7 @@ class TestAIWiring(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestPlayerHubStarters(unittest.TestCase):
     def test_create_airline_at_slot_hub_gets_free_gates_and_slots(self):
-        from tests.helpers import fresh_game
+        from helpers import fresh_game
         from engine.gates import is_auctioned_airport
         from engine.slots import declared_hourly_cap, is_slot_controlled, slots_held
 
@@ -1054,7 +1057,7 @@ class TestPlayerHubStarters(unittest.TestCase):
             self.assertGreaterEqual(declared_hourly_cap("ICN"), 26)
 
     def test_create_airline_at_non_slot_hub_skips_slots(self):
-        from tests.helpers import fresh_game
+        from helpers import fresh_game
         from engine.slots import is_slot_controlled
 
         with fresh_game(hub="SGN", name="VNA Test", callsign="VNT"):
@@ -1070,7 +1073,7 @@ class TestPlayerHubStarters(unittest.TestCase):
             self.assertIsNone(slots)
 
     def test_slot_hourly_caps_raise_on_existing_rows(self):
-        from tests.helpers import fresh_game
+        from helpers import fresh_game
         from engine.slots import STAGE1_SLOT_AIRPORTS, declared_hourly_cap, seed_slot_controlled_airports
 
         with fresh_game(hub="ATL", name="Cap Test", callsign="CAP"):

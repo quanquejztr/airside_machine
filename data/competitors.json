@@ -638,7 +638,7 @@
       "name": "Titan Air",
       "callsign": "TTN",
       "home_hub_iata": "ATL",
-      "cash": 16000000000000,
+      "cash": 600000000,
       "strategy": "HUBSPOKE",
       "aggressiveness": 2.0,
       "risk_tolerance": 0.85,
