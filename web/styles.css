@@ -670,3 +670,94 @@ table.sched-grid .overlap { color: #9a6208; }
   padding: 3px 8px 3px 0; white-space: nowrap;
 }
 .ap-popup-table td { text-align: right; padding: 3px 0; color: #e2e8f0; }
+.ap-new-route-btn {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  border-radius: 8px;
+  background: rgba(14, 165, 233, 0.18);
+  color: #e0f2fe;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.ap-new-route-btn:hover {
+  background: rgba(14, 165, 233, 0.32);
+}
+#map.ap-picking-dest {
+  cursor: crosshair;
+}
+.ap-draft-line path,
+.ap-draft-line {
+  stroke: #38bdf8 !important;
+  animation: ap-draft-pulse 1.15s ease-in-out infinite;
+}
+.ap-draft-line-glow path,
+.ap-draft-line-glow {
+  stroke: #0ea5e9 !important;
+  animation: ap-draft-glow 1.15s ease-in-out infinite;
+}
+@keyframes ap-draft-pulse {
+  0%, 100% { stroke-opacity: 0.35; stroke-width: 2.5px; }
+  50% { stroke-opacity: 1; stroke-width: 5px; }
+}
+@keyframes ap-draft-glow {
+  0%, 100% { stroke-opacity: 0.12; stroke-width: 7px; }
+  50% { stroke-opacity: 0.32; stroke-width: 12px; }
+}
+.ap-open-route-anchor {
+  background: transparent !important;
+  border: none !important;
+}
+.ap-open-route-box {
+  position: relative;
+  min-width: 132px;
+  padding: 8px 10px 10px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.96);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+  color: #e2e8f0;
+  text-align: center;
+  pointer-events: auto;
+}
+.ap-open-route-pair {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: #7dd3fc;
+  margin-bottom: 6px;
+}
+.ap-open-route-btn {
+  display: block;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: #0ea5e9;
+  color: #0f172a;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.ap-open-route-btn:hover { background: #38bdf8; }
+.ap-open-route-cancel {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ap-open-route-cancel:hover { color: #e2e8f0; }

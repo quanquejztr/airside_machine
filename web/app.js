@@ -6,6 +6,7 @@ let acLayer = null;
 let airportLayer = null;
 let airportRenderer = null;
 let airportRouteLayer = null;
+let airportDraftLayer = null;
 const flights = {};
 const airportPins = {};
 let airportCatalog = null;
@@ -15,6 +16,8 @@ let airportHub = "";
 let airportPinRefreshTimer = null;
 let selectedAirportIata = "";
 let selectedAirportRoutesSeq = 0;
+/** @type {null | { origin: string, dest: string | null, phase: 'pick_dest' | 'confirm' }} */
+let routeDraft = null;
 let zTop = 40;
 let winOffset = 0;
 let lastState = null;
@@ -2215,19 +2218,186 @@ function airportPopupHtml(ap) {
         <tr><th>Category</th><td>${escapeHtml(cat || "—")}</td></tr>
         <tr><th>Score</th><td>${escapeHtml(score)}</td></tr>
       </table>
+      <button type="button" class="ap-new-route-btn" data-origin="${escapeHtml(iata)}">New route</button>
     </div>
   `;
+}
+
+function airportLatLon(iata) {
+  const code = String(iata || "").toUpperCase();
+  const pin = airportPins[code];
+  if (pin && pin.ap && pin.ap.lat != null && pin.ap.lon != null) {
+    return { lat: Number(pin.ap.lat), lon: Number(pin.ap.lon) };
+  }
+  const ap = (airportCatalog || []).find((a) => a.iata === code);
+  if (ap) return { lat: Number(ap.lat), lon: Number(ap.lon) };
+  return null;
+}
+
+function clearRouteDraft() {
+  routeDraft = null;
+  if (airportDraftLayer) airportDraftLayer.clearLayers();
+  if (mapInst && mapInst.getContainer()) {
+    mapInst.getContainer().classList.remove("ap-picking-dest");
+  }
 }
 
 function clearAirportRouteSelection() {
   selectedAirportIata = "";
   if (airportRouteLayer) airportRouteLayer.clearLayers();
-  // Restore live flight line opacity after a selection fade.
   Object.values(flights).forEach((f) => {
     if (!f || !f.line) return;
     const flying = liveProgress(f) > 0.002 && liveProgress(f) < 0.998;
     f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
   });
+}
+
+function startNewRouteDraft(originIata) {
+  const origin = String(originIata || "").toUpperCase();
+  if (!origin || !airportLatLon(origin)) {
+    toast("Airport location unavailable");
+    return;
+  }
+  clearAirportRouteSelection();
+  clearRouteDraft();
+  routeDraft = { origin, dest: null, phase: "pick_dest" };
+  if (mapInst) {
+    mapInst.closePopup();
+    if (mapInst.getContainer()) mapInst.getContainer().classList.add("ap-picking-dest");
+  }
+  toast("Click a destination airport");
+}
+
+function drawRouteDraftPreview() {
+  if (!airportDraftLayer || !mapInst || !routeDraft || !routeDraft.dest) return;
+  airportDraftLayer.clearLayers();
+  const o = airportLatLon(routeDraft.origin);
+  const d = airportLatLon(routeDraft.dest);
+  if (!o || !d) return;
+
+  const endpoints = [[o.lat, o.lon], [d.lat, d.lon]];
+  const pts = interpolateGreatCircle(o.lat, o.lon, d.lat, d.lon, 64);
+  // Soft underlay first so the pulse stroke sits on top.
+  const underOpts = {
+    color: "#0ea5e9",
+    weight: 8,
+    opacity: 0.22,
+    pane: "routes",
+    steps: 5,
+    wrap: false,
+    interactive: false,
+    className: "ap-draft-line-glow",
+  };
+  if (typeof L.Geodesic === "function") {
+    new L.Geodesic(endpoints, underOpts).addTo(airportDraftLayer);
+  } else {
+    L.polyline(pts, underOpts).addTo(airportDraftLayer);
+  }
+  const lineOpts = {
+    color: "#38bdf8",
+    weight: 3.5,
+    opacity: 0.95,
+    pane: "routes",
+    steps: 5,
+    wrap: false,
+    interactive: false,
+    className: "ap-draft-line",
+  };
+  if (typeof L.Geodesic === "function") {
+    new L.Geodesic(endpoints, lineOpts).addTo(airportDraftLayer);
+  } else {
+    L.polyline(pts, lineOpts).addTo(airportDraftLayer);
+  }
+
+  const html = `
+    <div class="ap-open-route-box">
+      <div class="ap-open-route-pair">${escapeHtml(routeDraft.origin)} → ${escapeHtml(routeDraft.dest)}</div>
+      <button type="button" class="ap-open-route-btn">Open route</button>
+      <button type="button" class="ap-open-route-cancel" aria-label="Cancel">×</button>
+    </div>`;
+  const marker = L.marker([d.lat, d.lon], {
+    icon: L.divIcon({
+      className: "ap-open-route-anchor",
+      html,
+      iconSize: [148, 64],
+      iconAnchor: [74, 72],
+    }),
+    interactive: true,
+    keyboard: false,
+    zIndexOffset: 800,
+  }).addTo(airportDraftLayer);
+
+  const wireOpenRouteBox = () => {
+    const el = marker.getElement();
+    if (!el || el.dataset.wired === "1") return;
+    el.dataset.wired = "1";
+    L.DomEvent.disableClickPropagation(el);
+    L.DomEvent.disableScrollPropagation(el);
+    const openBtn = el.querySelector(".ap-open-route-btn");
+    const cancelBtn = el.querySelector(".ap-open-route-cancel");
+    if (openBtn) {
+      openBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        confirmOpenDraftRoute();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        clearRouteDraft();
+      });
+    }
+  };
+  marker.on("add", wireOpenRouteBox);
+  requestAnimationFrame(wireOpenRouteBox);
+}
+
+async function confirmOpenDraftRoute() {
+  if (!routeDraft || !routeDraft.origin || !routeDraft.dest) return;
+  const origin = routeDraft.origin;
+  const dest = routeDraft.dest;
+  try {
+    await api("/api/routes", {
+      method: "POST",
+      body: JSON.stringify({ origin, dest }),
+    });
+    toast(`Opened ${origin}–${dest}`);
+    clearRouteDraft();
+    await refreshHud();
+    // Refresh network coloring + show spokes from the new origin.
+    try {
+      const data = await api("/api/flight-map.json");
+      updateAirports(data);
+    } catch (_) { /* ignore */ }
+    if (airportPins[origin]) {
+      selectAirportRoutes(origin, airportPins[origin].marker);
+    }
+  } catch (err) {
+    toast(err.message || "Could not open route");
+  }
+}
+
+function pickDraftDestination(destIata) {
+  if (!routeDraft || routeDraft.phase !== "pick_dest") return false;
+  const dest = String(destIata || "").toUpperCase();
+  if (!dest || dest === routeDraft.origin) {
+    toast("Pick a different airport");
+    return true;
+  }
+  if (!airportLatLon(dest)) {
+    toast("Destination location unavailable");
+    return true;
+  }
+  routeDraft.dest = dest;
+  routeDraft.phase = "confirm";
+  if (mapInst && mapInst.getContainer()) {
+    mapInst.getContainer().classList.remove("ap-picking-dest");
+  }
+  if (mapInst) mapInst.closePopup();
+  drawRouteDraftPreview();
+  return true;
 }
 
 function airportSpokeStyle(hasPlayer, hasAi, suspendedOnly) {
@@ -2316,8 +2486,15 @@ function drawAirportRouteSpokes(hubIata, routes) {
 async function selectAirportRoutes(iata, marker) {
   const code = String(iata || "").toUpperCase();
   if (!code || !marker) return;
+  if (routeDraft && routeDraft.phase === "pick_dest") {
+    pickDraftDestination(code);
+    return;
+  }
+  if (routeDraft && routeDraft.phase === "confirm") {
+    // Starting a fresh inspection cancels an unfinished draft.
+    clearRouteDraft();
+  }
   if (selectedAirportIata === code) {
-    // Toggle off if clicking the same pin again.
     clearAirportRouteSelection();
     return;
   }
@@ -2467,11 +2644,31 @@ function syncAirportPin(ap) {
       className: "ap-pin-popup",
       autoPan: true,
     });
+    marker.on("popupopen", () => {
+      if (routeDraft && routeDraft.phase === "pick_dest") {
+        marker.closePopup();
+        return;
+      }
+      const root = marker.getPopup() && marker.getPopup().getElement();
+      const btn = root && root.querySelector(".ap-new-route-btn");
+      if (!btn) return;
+      btn.onclick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startNewRouteDraft(btn.getAttribute("data-origin") || iata);
+      };
+    });
     marker.on("click", (ev) => {
       if (ev && ev.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+      if (routeDraft && routeDraft.phase === "pick_dest") {
+        pickDraftDestination(iata);
+        marker.closePopup();
+        return;
+      }
       selectAirportRoutes(iata, marker);
     });
     marker.on("popupclose", () => {
+      if (routeDraft) return;
       if (selectedAirportIata === iata) clearAirportRouteSelection();
     });
     airportPins[iata] = { marker, ap };
@@ -2655,11 +2852,23 @@ function initMap() {
   airportLayer = L.layerGroup().addTo(mapInst);
   lineLayer = L.layerGroup().addTo(mapInst);
   airportRouteLayer = L.layerGroup().addTo(mapInst);
+  airportDraftLayer = L.layerGroup().addTo(mapInst);
   acLayer = L.layerGroup().addTo(mapInst);
   mapInst.setView([20, 10], 3);
   mapInst.on("zoomend", scheduleAirportPinRefresh);
   mapInst.on("click", () => {
+    if (routeDraft && routeDraft.phase === "pick_dest") {
+      clearRouteDraft();
+      toast("New route cancelled");
+      return;
+    }
     if (selectedAirportIata) clearAirportRouteSelection();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && routeDraft) {
+      clearRouteDraft();
+      toast("New route cancelled");
+    }
   });
   requestAnimationFrame(() => mapInst.invalidateSize());
   animate();
