@@ -1257,6 +1257,15 @@ function openRouteDetail(preselect) {
       const p = d.performance;
       const ops = d.ops;
       const rc = (ops && ops.remaining_cabin) || {};
+      const origin = String(r.origin_iata || "").toUpperCase();
+      const dest = String(r.dest_iata || "").toUpperCase();
+      const reverseId = origin && dest ? `${dest}-${origin}` : "";
+      const reverse = reverseId
+        ? overview.find((row) => String(row.route_id || "").toUpperCase() === reverseId)
+        : null;
+      const reverseBtn = reverse
+        ? `<button type="button" id="rd-apply-reverse">Apply to ${escapeHtml(reverse.route_id)}</button>`
+        : "";
       panel.innerHTML = `
         <div class="rd-panel-head">
           <div>
@@ -1283,28 +1292,47 @@ function openRouteDetail(preselect) {
             <div><label>First / F</label><input name="price_first" type="number" min="0.01" step="0.01" value="${r.price_first}" /></div>
           </div>
           <p class="muted">Y and J bases feed demand vs distance reference fares. W and F are list tickets.</p>
-          <button type="submit">Save fares</button>
+          <div class="row2" style="align-items:center;gap:8px">
+            <button type="submit">Save fares</button>
+            ${reverseBtn}
+          </div>
+          ${reverse ? `<p class="muted">Copies the fares above onto ${escapeHtml(reverse.route_id)} (already opened).</p>` : ""}
         </form>`;
       $("#rd-close-panel", el).onclick = () => { panel.hidden = true; panel.innerHTML = ""; };
+      const fareBody = (targetRouteId) => {
+        const fd = new FormData($("#rd-fares", el));
+        return {
+          route_id: targetRouteId,
+          price_leisure: Number(fd.get("price_leisure")),
+          price_premium_economy: Number(fd.get("price_premium_economy")),
+          price_business: Number(fd.get("price_business")),
+          price_first: Number(fd.get("price_first")),
+        };
+      };
       $("#rd-fares", el).onsubmit = async (e) => {
         e.preventDefault();
-        const fd = new FormData($("#rd-fares", el));
         try {
           await api("/api/routes/prices", {
             method: "POST",
-            body: JSON.stringify({
-              route_id: r.route_id,
-              price_leisure: Number(fd.get("price_leisure")),
-              price_premium_economy: Number(fd.get("price_premium_economy")),
-              price_business: Number(fd.get("price_business")),
-              price_first: Number(fd.get("price_first")),
-            }),
+            body: JSON.stringify(fareBody(r.route_id)),
           });
           toast("Fares updated");
           await showFares(r.route_id);
           await loadTable();
         } catch (err) { toast(err.message); }
       };
+      const applyRev = $("#rd-apply-reverse", el);
+      if (applyRev && reverse) {
+        applyRev.onclick = async () => {
+          try {
+            await api("/api/routes/prices", {
+              method: "POST",
+              body: JSON.stringify(fareBody(reverse.route_id)),
+            });
+            toast(`Fares applied to ${reverse.route_id}`);
+          } catch (err) { toast(err.message); }
+        };
+      }
     } catch (err) {
       panel.innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
     }
