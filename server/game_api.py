@@ -1220,6 +1220,40 @@ def preview_schedule(body: dict) -> dict:
     )
 
 
+def suggest_schedule_times(body: dict) -> dict:
+    """Departure times at which the drafted chain can actually be scheduled.
+
+    Ranked by closeness to the time the player asked for, so a rejected 09:00 comes back
+    as "07:00 or 11:00 work" rather than a bare failure.
+    """
+    from engine.scheduling import suggest_departure_times
+
+    tail = str(body.get("tail_number") or "").strip().upper()
+    plan = str(body.get("chain") or body.get("plan") or "").strip()
+    if not tail:
+        return _err("tail_number is required.")
+    try:
+        rids = _parse_route_plan(plan)
+        days_of_week = _days_of_week_from_body(body)
+        preferred = _departure_time_from_body(body) if body.get("departure_time") else None
+        limit = max(1, min(12, int(body.get("limit") or 5)))
+        step = max(5, min(120, int(body.get("step_minutes") or 30)))
+    except Exception as e:
+        return _err(str(e))
+    try:
+        out = suggest_departure_times(
+            tail,
+            rids,
+            days_of_week,
+            preferred_time=preferred,
+            limit=limit,
+            step_minutes=step,
+        )
+    except Exception as e:
+        return _err(str(e))
+    return _ok(out)
+
+
 def assign_schedule(body: dict) -> dict:
     from engine.scheduling import (
         assign_rotation,
@@ -1289,7 +1323,12 @@ def assign_schedule(body: dict) -> dict:
                 n = int(rot.get("segments_planned") or 0)
             else:
                 from engine.gates import current_game_week as _gw
+                from engine.scheduling import assert_detailed_line_addable
 
+                # Check compatibility BEFORE create_flight_schedule writes rows: it
+                # inserts into flight_schedules and flight_segments, so a merge that
+                # rejected afterwards left an orphaned segment holding the slot.
+                assert_detailed_line_addable(tail)
                 sched = create_flight_schedule(tail, rids[0], fns[0], days_of_week, dep)
                 merge_detailed_weekly_template(tail, [sched["template_item"]], _gw())
                 n = 1

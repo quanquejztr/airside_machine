@@ -51,13 +51,28 @@ def hhmm_from_absolute_game_hour(absolute_game_hour: float) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+def game_week_from_abs_hour(absolute_game_hour: float) -> int:
+    """1-based game week containing this absolute hour (week 1 starts at hour 0).
+
+    Legs of a long chain can land in a later week than the one the chain was anchored
+    in, so every segment must take its week from its own departure rather than from the
+    chain's anchor.
+    """
+    return int(float(absolute_game_hour) // 168.0) + 1
+
+
 def _day_of_week_label(game_week: int, dep_abs: float) -> str:
-    """Map absolute dep time to MON..SUN within that game week (for segment day_of_week column)."""
-    w_base = week_base_hours(game_week)
-    h = dep_abs - w_base
-    idx = int(h // 24.0)
-    idx = max(0, min(6, idx))
+    """Map an absolute hour to MON..SUN (for the segment day_of_week column).
+
+    Derived from the hour itself, so a leg that runs past the end of its anchor week
+    gets its real weekday. This previously subtracted the passed week's base and clamped
+    the index to 0..6, which silently labelled every overflowing leg "SUN".
+
+    `game_week` is kept for call-site compatibility and is no longer consulted.
+    """
+    hours_into_week = float(dep_abs) % 168.0
+    idx = int(hours_into_week // 24.0)
     order = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-    return order[idx]
+    return order[max(0, min(6, idx))]
 
 

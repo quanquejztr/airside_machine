@@ -558,6 +558,9 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
         _assert_incremental_spawn_airport_limits(int(target_game_week), gate_segs)
 
     for p in planned:
+        # A chain anchored late in the week finishes in the next one; tag each leg with
+        # the week its own departure falls in, not the week the chain was spawned for.
+        leg_week = int(p.get("game_week") or target_game_week)
         dup = db.fetch_one(
             """
             SELECT 1 FROM flight_segments
@@ -565,7 +568,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
             AND ABS(scheduled_dep_game_hour - ?) < 0.001
             AND status != 'CANCELLED'
             """,
-            (tail_number, target_game_week, p["route_id"], p["dep_abs"]),
+            (tail_number, leg_week, p["route_id"], p["dep_abs"]),
         )
         if dup:
             continue
@@ -574,7 +577,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
 
         dep_time_str = hhmm_from_absolute_game_hour(p["dep_abs"])
         arr_time_str = hhmm_from_absolute_game_hour(p["arr_abs"])
-        segment_id = f"{tail_number}-{p['route_id']}-W{target_game_week}-{p['day']}-{uuid.uuid4().hex[:8]}"
+        segment_id = f"{tail_number}-{p['route_id']}-W{leg_week}-{p['day']}-{uuid.uuid4().hex[:8]}"
 
         db.execute(
             """
@@ -592,7 +595,7 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
             """,
             (
                 segment_id,
-                target_game_week,
+                leg_week,
                 p["day"],
                 tail_number,
                 p["route_id"],
@@ -615,7 +618,14 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
 
 
 def _spawn_detailed_chained_template_week(tail_number, target_game_week, raw_blob: dict):
-    """Spawn segments for mode=detailed_chained (all stored chains)."""
+    """Spawn segments for mode=detailed_chained: every stored chain, plus any standalone
+    detailed lines stacked onto the same tail.
+
+    The chained blob carries both `chains` and `items` so a player can add a single
+    flight to an aircraft that already flies a chained rotation. Spawning only the
+    chains here would let those stacked lines fly for the week they were created and
+    then silently disappear at the next weekly respawn.
+    """
     from engine.scheduling.rotation import _detailed_chained_chains_list_from_blob
     from engine.scheduling.shared import _assert_incremental_spawn_airport_limits, get_financial_constant
 
@@ -641,6 +651,14 @@ def _spawn_detailed_chained_template_week(tail_number, target_game_week, raw_blo
         )
         inserted += n
         tails_touched |= ts
+
+    # Standalone detailed lines stacked onto this tail alongside its chains.
+    items = list((raw_blob or {}).get("items") or [])
+    if items:
+        n, ts = _spawn_detailed_template_week(tail_number, target_game_week, items)
+        inserted += n
+        tails_touched |= ts
+
     return inserted, tails_touched
 
 

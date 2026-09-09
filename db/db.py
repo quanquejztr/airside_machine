@@ -570,6 +570,33 @@ def _add_column_if_missing(table: str, column: str, decl: str) -> None:
             raise
 
 
+def _repair_us_airport_timezones() -> None:
+    """Undo the swapped Alaska / Pacific timezone names in existing saves.
+
+    The airport generator had a -180..-130 band named Pacific/Honolulu, which swallowed
+    all of Alaska (Anchorage itself came out as Honolulu), and a -130..-117 band named
+    America/Anchorage that shadowed the Los_Angeles band, so the whole US west coast —
+    LAX, SFO, SEA, PDX — was tagged Alaska time. 185 airports were affected.
+
+    Order matters: fix the Pacific coast first, while genuine Alaska rows are still
+    labelled Honolulu and so cannot be caught by that update. The latitude guards then
+    make both statements idempotent, since Alaska sits above 50N and the contiguous
+    west coast below it.
+    """
+    execute(
+        """
+        UPDATE airports SET timezone = 'America/Los_Angeles'
+        WHERE country = 'US' AND timezone = 'America/Anchorage' AND lat < 50
+        """
+    )
+    execute(
+        """
+        UPDATE airports SET timezone = 'America/Anchorage'
+        WHERE country = 'US' AND timezone = 'Pacific/Honolulu' AND lat > 50
+        """
+    )
+
+
 def _repair_catalog_reference_data() -> None:
     """Fix C750's shifted CSV fields and factory cabins that exceed type EEC."""
     execute(
@@ -1458,6 +1485,10 @@ def ensure_schema_migrations():
     # Catalog repairs (C750 malformed row, factory cabins over EEC). Idempotent.
     try:
         _repair_catalog_reference_data()
+    except Exception:
+        pass
+    try:
+        _repair_us_airport_timezones()
     except Exception:
         pass
     _migrations_done = True

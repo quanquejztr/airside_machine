@@ -329,31 +329,60 @@ def validate_position_timeline_for_new_legs(tail_number, game_week, new_legs_od)
         pos = d
 
 
+def _assert_detailed_line_addable_blob(raw) -> None:
+    """Raise if a standalone detailed line cannot stack onto this stored template.
+
+    Quick rotations are the only genuine incompatibility: they store a bare leg list
+    with different semantics. Chained blocks coexist fine — the chained blob carries
+    both `chains` and `items`.
+    """
+    if isinstance(raw, list) or (isinstance(raw, dict) and raw.get("mode") == "quick"):
+        raise ValueError(
+            "This aircraft already has a quick weekly rotation. Clear it before mixing detailed schedules."
+        )
+
+
+def assert_detailed_line_addable(tail_number: str) -> None:
+    """Pre-flight check for adding a standalone detailed line.
+
+    Callers must run this *before* create_flight_schedule(), which writes both
+    flight_schedules and flight_segments. Validating afterwards left the rejected
+    flight's segments orphaned in the week — present in no template, invisible to the
+    weekly respawn, and occupying the slot so the next attempt failed as an overlap.
+    """
+    row = db.fetch_one("SELECT legs_json FROM weekly_rotations WHERE tail_number = ?", (tail_number,))
+    if not row or not row["legs_json"]:
+        return
+    try:
+        raw = json.loads(row["legs_json"])
+    except (json.JSONDecodeError, TypeError):
+        return
+    _assert_detailed_line_addable_blob(raw)
+
+
 def merge_detailed_weekly_template(tail_number, new_items, created_game_week):
-    """Append detailed schedule lines; errors if a quick-only template exists."""
+    """Append detailed schedule lines, stacking onto whatever detailed plan exists.
+
+    Stacks onto an existing `detailed` template, and onto a `detailed_chained` template
+    alongside its chains. Only quick rotations are rejected.
+    """
     if not new_items:
         return
     row = db.fetch_one("SELECT legs_json FROM weekly_rotations WHERE tail_number = ?", (tail_number,))
+    payload = None
     if row:
         try:
             raw = json.loads(row["legs_json"])
         except (json.JSONDecodeError, TypeError):
             raw = {}
-        if isinstance(raw, list) or (isinstance(raw, dict) and raw.get("mode") == "quick"):
-            raise ValueError(
-                "This aircraft already has a quick weekly rotation. Clear it before mixing detailed schedules."
-            )
+        _assert_detailed_line_addable_blob(raw)
         if isinstance(raw, dict) and raw.get("mode") == "detailed_chained":
-            raise ValueError(
-                "This aircraft already has a chained detailed rotation. "
-                "Clear it (menu 9 → 3) before adding standalone detailed lines."
-            )
-        if isinstance(raw, dict) and raw.get("mode") == "detailed":
-            items = (raw.get("items") or []) + list(new_items)
-        else:
-            items = list(new_items)
-        payload = {"mode": "detailed", "items": items}
-    else:
+            # Keep the chains untouched; stack the new lines beside them.
+            payload = dict(raw)
+            payload["items"] = list(raw.get("items") or []) + list(new_items)
+        elif isinstance(raw, dict) and raw.get("mode") == "detailed":
+            payload = {"mode": "detailed", "items": list(raw.get("items") or []) + list(new_items)}
+    if payload is None:
         payload = {"mode": "detailed", "items": list(new_items)}
     db.execute(
         """
@@ -712,17 +741,33 @@ def assign_rotation(tail_number, route_ids, departure_times=None, flight_numbers
     }
 
 
+_WEEK_ORDER = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+
 def _operating_days_list(days_of_week: str) -> list:
-    """Parse days_of_week from create_flight_schedule / template (DAILY or JSON array string)."""
+    """Parse days_of_week from create_flight_schedule / template (DAILY or JSON array string).
+
+    Raises on anything else. This used to fall back to ["MON"], so a bare "SAT" silently
+    scheduled the whole rotation on Monday with no error anywhere.
+    """
     if days_of_week == "DAILY":
-        return ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+        return list(_WEEK_ORDER)
     try:
         parsed = json.loads(days_of_week)
-        if isinstance(parsed, list):
-            return parsed
     except (json.JSONDecodeError, TypeError):
-        pass
-    return ["MON"]
+        parsed = None
+    if isinstance(parsed, list):
+        days = [str(d).strip().upper() for d in parsed]
+        bad = [d for d in days if d not in _WEEK_ORDER]
+        if bad:
+            raise ValueError(
+                f"Unknown operating day(s): {', '.join(bad)}. Use MON..SUN."
+            )
+        return days
+    raise ValueError(
+        f"Invalid operating days {days_of_week!r}. Use \"DAILY\" or a JSON array "
+        'like ["MON","WED"].'
+    )
 
 
 def _plan_chained_detailed_segments(
@@ -739,7 +784,11 @@ def _plan_chained_detailed_segments(
     For each operating day, chain routes in order: first leg at first_departure local time,
     then per-leg ground time between legs (defaults to MTT when turn_hours is None).
     """
-    from engine.scheduling.time_helpers import _day_of_week_label, week_base_hours
+    from engine.scheduling.time_helpers import (
+        _day_of_week_label,
+        game_week_from_abs_hour,
+        week_base_hours,
+    )
     w_base = week_base_hours(game_week)
     try:
         dep_hours, dep_mins = map(int, first_departure_hhmm.split(":"))
@@ -761,6 +810,16 @@ def _plan_chained_detailed_segments(
     turns = list(turn_hours) if turn_hours else [float(mtt_hours)] * len(routes_ordered)
     if len(turns) < len(routes_ordered):
         turns = turns + [float(mtt_hours)] * (len(routes_ordered) - len(turns))
+
+    # A chain is allowed to finish in the following week — legs carry their own week —
+    # but it may not lap the week, which would put the same tail on two stands at once.
+    chain_span = sum(fh_list) + sum(turns[: max(0, len(routes_ordered) - 1)])
+    if chain_span >= 168.0:
+        raise ValueError(
+            f"This rotation takes {chain_span:.1f}h, which is longer than a game week (168h). "
+            "Remove legs or shorten turnarounds so the chain completes within one week."
+        )
+
     planned = []
     for anchor_day in days_sorted:
         t = w_base + DAY_START_HOURS[anchor_day] + hod
@@ -770,7 +829,11 @@ def _plan_chained_detailed_segments(
             arr_abs = dep_abs + fhh
             planned.append(
                 {
+                    # Week and day come from this leg's own departure, so a chain that
+                    # runs past its anchor week is tagged honestly rather than being
+                    # stamped with the anchor week and labelled SUN.
                     "day": _day_of_week_label(game_week, dep_abs),
+                    "game_week": game_week_from_abs_hour(dep_abs),
                     "dep_abs": dep_abs,
                     "arr_abs": arr_abs,
                     "route_id": route["route_id"],
@@ -830,6 +893,225 @@ def _reject_if_incompatible_weekly_template_for_chained(tail_number: str):
             "This aircraft already has standalone detailed schedule lines. Clear them (menu 9 → 3) "
             "before adding a chained detailed rotation."
         )
+
+
+def suggest_departure_times(
+    tail_number: str,
+    route_ids: list,
+    days_of_week: str,
+    *,
+    preferred_time: str | None = None,
+    limit: int = 5,
+    step_minutes: int = 30,
+    turn_minutes=None,
+) -> dict:
+    """First-leg departure times at which this chain can actually be scheduled.
+
+    Sweeps candidate times across the day and probes each with the same checks
+    create_chained_detailed_rotation() runs, so a suggested time is one that will be
+    accepted and a rejected one carries the reason the player would have seen.
+
+    Every operating day must work, because one chained block flies the same clock time on
+    all of its days — a time that only suits Saturday is not a usable DAILY rotation.
+
+    Read-only. Flight numbers are placeholders: allocating real ones writes to the
+    database, and a suggestion must not consume numbers it may never use.
+    """
+    from engine.scheduling.ferry import (
+        max_weekly_airborne_hours_cap,
+        sum_airborne_hours_for_tail_week,
+    )
+    from engine.scheduling.shared import _assert_player_routes_schedulable, get_financial_constant
+
+    route_ids = list(route_ids or [])
+    if len(route_ids) < 2:
+        raise ValueError("Chained detailed rotation needs at least two routes.")
+
+    aircraft = get_fleet_aircraft(tail_number)
+    if not aircraft:
+        raise ValueError(f"Aircraft '{tail_number}' not found in fleet")
+    if aircraft["status"] not in ("IDLE", "SCHEDULED"):
+        raise ValueError(f"Aircraft is not available (status: {aircraft['status']})")
+    aircraft_type = db.fetch_one(
+        "SELECT * FROM aircraft_types WHERE type_id = ?", (aircraft["type_id"],)
+    )
+    if not aircraft_type:
+        raise ValueError(f"Aircraft type '{aircraft['type_id']}' not found")
+
+    routes_ordered = []
+    for rid in route_ids:
+        route = get_route(rid)
+        if not route:
+            raise ValueError(f"Route '{rid}' not found")
+        routes_ordered.append(route)
+    _assert_player_routes_schedulable(list(route_ids))
+
+    # Time-independent rejections: report them once instead of for all 48 candidates.
+    for route in routes_ordered:
+        if route["distance_nm"] > aircraft_type["range_nm"]:
+            raise ValueError(
+                f"Leg {route['route_id']} ({route['distance_nm']:.0f} nm) exceeds aircraft max range "
+                f"({aircraft_type['range_nm']} nm)."
+            )
+    for i in range(1, len(routes_ordered)):
+        prev_d = str(routes_ordered[i - 1]["dest_iata"]).upper()
+        cur_o = str(routes_ordered[i]["origin_iata"]).upper()
+        if cur_o != prev_d:
+            raise ValueError(
+                f"Rotation must connect: after {routes_ordered[i - 1]['route_id']} "
+                f"the next leg must begin at {prev_d}, not {cur_o}."
+            )
+    if str(routes_ordered[0]["origin_iata"]).upper() != str(routes_ordered[-1]["dest_iata"]).upper():
+        raise ValueError(
+            "Chained detailed rotation must return to the starting airport each day."
+        )
+
+    operating_days = _operating_days_list(days_of_week)
+    mtt_hours = float(get_financial_constant("mtt_minutes", 30)) / 60.0
+    turn_mins = normalize_turn_minutes(route_ids, turn_minutes)
+    turn_hours = [m / 60.0 for m in turn_mins]
+    cruise = aircraft_type["cruise_speed_kts"]
+
+    gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    game_week = int(gs["game_week"]) if gs else 1
+
+    fh_list = [r["distance_nm"] / cruise for r in routes_ordered]
+    chain_hours = sum(fh_list) + sum(turn_hours[: max(0, len(routes_ordered) - 1)])
+
+    # Also time-independent: the chain's airborne hours are the same whenever it departs.
+    additional_air = sum(fh_list) * (len(operating_days) or 1)
+    cap_air = max_weekly_airborne_hours_cap()
+    existing_air = sum_airborne_hours_for_tail_week(tail_number, game_week)
+    if existing_air + additional_air > cap_air + 1e-6:
+        raise ValueError(
+            f"Weekly airborne limit is {cap_air:.0f} h per aircraft. "
+            f"This tail already has about {existing_air:.1f} h planned; "
+            f"adding this chain (~{additional_air:.1f} h) would exceed the limit."
+        )
+
+    step = max(5, int(step_minutes))
+    placeholders = [f"__SUGGEST{i}" for i in range(len(routes_ordered))]
+    feasible: list[dict] = []
+    rejected: list[dict] = []
+
+    # Rank by closeness to the time the player actually asked for. Returning the earliest
+    # feasible slots instead would answer "00:00, 00:30, 01:00" to someone who wanted a
+    # morning departure — correct, and useless.
+    preferred_minute = None
+    if preferred_time:
+        try:
+            hh, mm = str(preferred_time).split(":")
+            preferred_minute = int(hh) * 60 + int(mm)
+        except (ValueError, AttributeError):
+            preferred_minute = None
+
+    for minute in range(0, 24 * 60, step):
+        hhmm = f"{minute // 60:02d}:{minute % 60:02d}"
+        try:
+            planned, _, _ = _plan_chained_detailed_segments(
+                game_week,
+                operating_days,
+                hhmm,
+                routes_ordered,
+                placeholders,
+                cruise,
+                mtt_hours,
+                turn_hours=turn_hours,
+            )
+        except ValueError as e:
+            # Chain longer than a week: no departure time can help.
+            raise ValueError(str(e))
+
+        # `planned` already covers every operating day, so one probe answers "does this
+        # departure time work on all of them" — which is the question that matters, since
+        # a chained block flies the same clock time on each of its days.
+        reason = None
+        try:
+            assert_chain_plan_schedulable(tail_number, game_week, planned, mtt_hours)
+        except ValueError as e:
+            reason = str(e)
+
+        if reason is None:
+            first = min(planned, key=lambda p: p["dep_abs"])
+            last = max(planned, key=lambda p: p["arr_abs"])
+            feasible.append(
+                {
+                    "departure_time": hhmm,
+                    "minute": minute,
+                    "days": list(operating_days),
+                    "first_dep_abs": float(first["dep_abs"]),
+                    "last_arr_abs": float(last["arr_abs"]),
+                    "chain_hours": round(chain_hours, 2),
+                }
+            )
+        elif len(rejected) < 8:
+            rejected.append({"departure_time": hhmm, "reason": reason})
+
+    if preferred_minute is not None:
+        # Wrap-around distance: 23:30 is 30 minutes from 00:00, not 23 hours.
+        def _distance(entry):
+            d = abs(int(entry["minute"]) - preferred_minute)
+            return min(d, 24 * 60 - d)
+
+        feasible.sort(key=lambda e: (_distance(e), e["minute"]))
+
+    suggestions = feasible[: max(1, int(limit))]
+    for s in suggestions:
+        s.pop("minute", None)
+
+    return {
+        "tail_number": tail_number,
+        "route_ids": list(route_ids),
+        "days": list(operating_days),
+        "chain_hours": round(chain_hours, 2),
+        "step_minutes": step,
+        "preferred_time": preferred_time,
+        "feasible_count": len(feasible),
+        "suggestions": suggestions,
+        "rejected_sample": rejected,
+    }
+
+
+def assert_chain_plan_schedulable(tail_number, game_week, planned, mtt_hours) -> None:
+    """Every check on a planned chain that depends on *when* it departs.
+
+    Gate concurrency and slot quotas at each airport, the aircraft being where each leg
+    starts, and no overlap with its existing flights. Read-only: safe to probe with
+    candidate times before committing to one.
+
+    Shared by create_chained_detailed_rotation() and suggest_departure_times() so a
+    suggested time is exactly a time that creation will accept.
+    """
+    from engine.scheduling.shared import _assert_new_segment_airport_limits
+
+    try:
+        _assert_new_segment_airport_limits(
+            int(game_week),
+            [
+                {
+                    "tail_number": tail_number,
+                    "origin_iata": str(p["origin_iata"]).upper(),
+                    "dest_iata": str(p["dest_iata"]).upper(),
+                    "dep_abs": float(p["dep_abs"]),
+                    "arr_abs": float(p["arr_abs"]),
+                }
+                for p in planned
+            ],
+        )
+    except Exception as e:
+        raise ValueError(str(e))
+
+    validate_position_timeline_for_new_legs(
+        tail_number,
+        game_week,
+        [(p["dep_abs"], p["arr_abs"], p["origin_iata"], p["dest_iata"]) for p in planned],
+    )
+    assert_tail_schedule_accepts_new_intervals(
+        tail_number,
+        game_week,
+        [(p["dep_abs"], p["arr_abs"]) for p in planned],
+        mtt_hours,
+    )
 
 
 def create_chained_detailed_rotation(
@@ -957,32 +1239,9 @@ def create_chained_detailed_rotation(
         p["flight_number"] = resolved_fns[idx % n_routes]
     flight_numbers = list(resolved_fns)
 
-    # Concurrent-gates capacity check (auctioned airports only) using finalized dep/arr times.
+    # Gates, slots, positioning and overlap, using finalized dep/arr times.
     # Must run BEFORE any INSERTs so the schedule cannot "succeed" and then be fixed later.
-    try:
-        _assert_new_segment_airport_limits(
-            int(game_week),
-            [
-                {
-                    "tail_number": tail_number,
-                    "origin_iata": str(p["origin_iata"]).upper(),
-                    "dest_iata": str(p["dest_iata"]).upper(),
-                    "dep_abs": float(p["dep_abs"]),
-                    "arr_abs": float(p["arr_abs"]),
-                }
-                for p in planned
-            ],
-        )
-    except Exception as e:
-        raise ValueError(str(e))
-
-    new_legs_od = [
-        (p["dep_abs"], p["arr_abs"], p["origin_iata"], p["dest_iata"]) for p in planned
-    ]
-    validate_position_timeline_for_new_legs(tail_number, game_week, new_legs_od)
-
-    planned_intervals = [(p["dep_abs"], p["arr_abs"]) for p in planned]
-    assert_tail_schedule_accepts_new_intervals(tail_number, game_week, planned_intervals, mtt_hours)
+    assert_chain_plan_schedulable(tail_number, game_week, planned, mtt_hours)
 
     # Count how many times the chain starts per week (operating days), not how many
     # calendar weekday labels one rotation spans — same rule as quick schedule / standalone detailed.
@@ -1028,7 +1287,11 @@ def create_chained_detailed_rotation(
         di = rt["dest_iata"] if rt else None
         dep_time_str = hhmm_from_absolute_game_hour(p["dep_abs"])
         arr_time_str = hhmm_from_absolute_game_hour(p["arr_abs"])
-        segment_id = f"{tail_number}-{p['route_id']}-W{game_week}-{p['day']}-{uuid.uuid4().hex[:8]}"
+        # A chain anchored late in the week can run past its end. Tag each leg with the
+        # week its own departure falls in; stamping them all with the anchor week made
+        # gate capacity compare them against the wrong week's traffic.
+        leg_week = int(p.get("game_week") or game_week)
+        segment_id = f"{tail_number}-{p['route_id']}-W{leg_week}-{p['day']}-{uuid.uuid4().hex[:8]}"
 
         leg_turn = int(round(turn_mins[route_idx]))
 
@@ -1049,7 +1312,7 @@ def create_chained_detailed_rotation(
             (
                 segment_id,
                 schedule_id,
-                game_week,
+                leg_week,
                 p["day"],
                 tail_number,
                 p["route_id"],
@@ -1183,14 +1446,10 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
     w_base = week_base_hours(game_week)
     mtt_hours = float(get_financial_constant("mtt_minutes", 30)) / 60.0
     
-    if days_of_week == "DAILY":
-        operating_days = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
-    else:
-        try:
-            operating_days = json.loads(days_of_week)
-        except Exception:
-            operating_days = ['MON']
-    
+    # Same parser as the chained path: unparseable days raise rather than silently
+    # collapsing the whole line onto Monday.
+    operating_days = _operating_days_list(days_of_week)
+
     planned = []
     for day in operating_days:
         if day not in DAY_START_HOURS:
