@@ -35,22 +35,28 @@ def _stable_pair_jitter_hours(route_pair_id: str) -> float:
 def bank_dep_hours(
     freq: int, strategy: str, w0: float, *, pair_id: str | None = None
 ) -> list[float]:
-    """Return `freq` outbound departure hours (absolute game-hours) for the week."""
+    """
+    Return `freq` outbound departure hours (absolute game-hours) for the week.
+
+    Flights are spread across all 7 days and rotated through clock hours so
+    operators are not stacked on Monday morning/afternoon banks. Strategy is
+    kept for call-site compatibility; the calendar spread is the same for all.
+    """
     n = max(1, int(freq))
-    strat = str(strategy or "HUBSPOKE").upper()
     base = float(w0)
-    jitter = _stable_pair_jitter_hours(pair_id) if pair_id else 0.0
-    if strat == "HUBSPOKE":
-        slots: list[float] = []
-        morning = base + 7.0 + jitter
-        afternoon = base + 15.0 + jitter
-        for i in range(n):
-            bank = morning if i % 2 == 0 else afternoon
-            slots.append(bank + (i // 2) * 24.0)
-        return slots
-    if strat == "PREMIUM":
-        return [base + 9.0 + jitter + float(i) * (168.0 / float(n)) for i in range(n)]
-    return [base + jitter + (float(i) / float(n)) * 168.0 for i in range(n)]
+    phase = _stable_pair_jitter_hours(pair_id) if pair_id else 0.0
+    waves = max(1, (n + 6) // 7)
+    slots: list[float] = []
+    for i in range(n):
+        if n >= 7:
+            day = i % 7
+            wave = i // 7
+        else:
+            day = int(i * 7 / n) % 7
+            wave = 0
+        hour = (phase + day * (24.0 / 7.0) + wave * (24.0 / float(waves))) % 24.0
+        slots.append(base + float(day) * 24.0 + hour)
+    return slots
 
 
 def _resolve_aircraft_type_id(competitor_id: str, route_id: str) -> Optional[str]:

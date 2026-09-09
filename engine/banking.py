@@ -264,7 +264,12 @@ def payoff_loan(loan_id: str) -> Dict[str, Any]:
     row = db.fetch_one("SELECT * FROM loans WHERE loan_id = ? AND status = 'ACTIVE'", (aid,))
     if not row:
         raise ValueError("No active loan with that id.")
-    due = float(row["principal_remaining"] or 0.0)
+    principal = float(row["principal_remaining"] or 0.0)
+    # Settle accrued interest too, the same way the weekly path does in
+    # _apply_toward_loan(). Charging bare principal made an early payoff free, so
+    # borrow-then-immediately-repay was an exactly cash-neutral round trip.
+    interest = principal * float(row["weekly_interest_rate"] or 0.0)
+    due = principal + interest
     al = get_airline()
     cash = float(al["cash"] or 0.0) if al else 0.0
     if cash + 0.01 < due:
@@ -275,9 +280,22 @@ def payoff_loan(loan_id: str) -> Dict[str, Any]:
         (aid,),
     )
     sync_total_debt()
-    _record_credit_event("LOAN_REPAID", 15, f"Paid off loan {aid[:8]} (${due:,.0f}).")
-    _notify(f"Loan paid off: ${due:,.0f}. Credit +15.")
-    return {"loan_id": aid, "paid": due, "debt": sync_total_debt()}
+    # Reward carrying a loan, not opening one. A same-week round trip earns nothing,
+    # so it can never out-earn the -5 charged at origination; previously +15 against
+    # that -5 made originate/payoff a free +10 credit farm, repeatable to the cap.
+    weeks_held = max(0, _current_week() - int(row["originated_week"] or 0))
+    reward = 0 if weeks_held < 1 else min(15, 5 + weeks_held)
+    if reward:
+        _record_credit_event(
+            "LOAN_REPAID", reward, f"Paid off loan {aid[:8]} (${due:,.0f}) after {weeks_held}w."
+        )
+        _notify(f"Loan paid off: ${due:,.0f}. Credit +{reward}.")
+    else:
+        _record_credit_event(
+            "LOAN_REPAID", 0, f"Paid off loan {aid[:8]} (${due:,.0f}) same week — no credit gain.",
+        )
+        _notify(f"Loan paid off: ${due:,.0f}. Repaid same week — no credit gain.")
+    return {"loan_id": aid, "paid": due, "interest": interest, "debt": sync_total_debt()}
 
 
 def list_loans(*, active_only: bool = False) -> List[Dict[str, Any]]:
@@ -370,12 +388,17 @@ def update_credit_score(net_income: float) -> int:
 
 
 def _seize_costliest_owned() -> Optional[str]:
+    """Surrender the most valuable aircraft in Chapter 11, owned or leased.
+
+    Restricting this to OWNED aircraft meant an all-leased fleet lost nothing while
+    still having half its debt forgiven, which made repeated strategic bankruptcy
+    strictly profitable. A leased jet is repossessed by the lessor just the same.
+    """
     row = db.fetch_one(
         """
         SELECT f.tail_number, f.type_id, t.purchase_price
         FROM fleet f
         JOIN aircraft_types t ON t.type_id = f.type_id
-        WHERE f.ownership = 'OWNED'
         ORDER BY t.purchase_price DESC
         LIMIT 1
         """
@@ -441,6 +464,18 @@ def check_bankruptcy(game_week: int) -> Optional[Dict[str, Any]]:
     if streak < 3 or debt <= 0:
         return None
 
+    # Surrender an aircraft FIRST: forgiveness is the consideration for losing an
+    # asset, so a creditor with nothing to repossess forgives nothing. Without this
+    # an empty or fully-leased fleet got the 50% write-down for free.
+    seized = _seize_costliest_owned()
+    if not seized:
+        _notify(
+            "Chapter 11 filing rejected: no aircraft left to surrender, so no debt "
+            "was forgiven. Raise cash or sell down debt.",
+            gw,
+        )
+        return None
+
     loans = db.fetch_all("SELECT * FROM loans WHERE status = 'ACTIVE'")
     for raw in loans or []:
         remaining = float(raw["principal_remaining"] or 0.0) * 0.5
@@ -462,7 +497,6 @@ def check_bankruptcy(game_week: int) -> Optional[Dict[str, Any]]:
             """,
             (remaining, pmt, lid),
         )
-    seized = _seize_costliest_owned()
     db.execute(
         "UPDATE airline SET credit_score = ?, negative_cash_weeks = 0, last_chapter11_week = ? WHERE id = 1",
         (350, gw),
@@ -470,16 +504,13 @@ def check_bankruptcy(game_week: int) -> Optional[Dict[str, Any]]:
     _record_credit_event(
         "BANKRUPTCY",
         0,
-        f"Chapter 11 week {gw}: 50% debt forgiven"
-        + (f", seized {seized}" if seized else ", no owned aircraft to seize")
-        + ".",
+        f"Chapter 11 week {gw}: 50% debt forgiven, seized {seized}.",
         apply_delta=False,
     )
     sync_total_debt()
     msg = (
-        f"Chapter 11: half of remaining debt forgiven"
-        + (f"; {seized} seized" if seized else "")
-        + ". Credit reset to 350."
+        f"Chapter 11: half of remaining debt forgiven; {seized} seized. "
+        "Credit reset to 350."
     )
     _notify(msg, gw)
     return {"chapter11": True, "seized_tail": seized, "debt": sync_total_debt(), "credit_score": 350}

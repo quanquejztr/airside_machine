@@ -423,6 +423,235 @@ class TestClockSpeed(unittest.TestCase):
             self.assertEqual(0, st["speed_multiplier"])
             self.assertTrue(st["is_paused"])
 
+    def test_status_week_uses_committed_not_interpolated(self):
+        """HUD week/day must not race ahead of catch-up'd hours near a week boundary."""
+        import time
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            clk = GameClock()
+            clk.running = False
+            # ~1.1 game hours shy of week 9 (1344).
+            clk.game_hours_elapsed = 1342.9
+            clk._snapshot_ghe = 1342.9
+            clk.speed_multiplier = 60
+            # Pretend 1 real second has passed → interpolates +2.0h → past 1344.
+            clk._snapshot_wall_time = time.time() - 1.0
+            live = clk.get_interpolated_game_hours()
+            self.assertGreaterEqual(live, 1344.0)
+            st = clk.get_status()
+            self.assertEqual(8, st["current_week"])
+            self.assertEqual(7, st["current_day"])
+            self.assertAlmostEqual(1342.9, float(st["committed_game_hour"]), places=2)
+            self.assertAlmostEqual(1342.9, float(st["game_hours_elapsed"]), places=2)
+            self.assertGreaterEqual(float(st["current_game_hour"]), 1344.0)
+
+    def test_stop_flushes_catch_up_to_db(self):
+        """stop() must persist catch-up'd hours so restart does not snap backward."""
+        import time
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            clk = GameClock()
+            clk.running = False
+            clk.game_hours_elapsed = 1342.0
+            clk._snapshot_ghe = 1342.0
+            clk.speed_multiplier = 60
+            clk._snapshot_wall_time = time.time() - 1.5  # +3.0h → 1345 (week 9)
+            clk.stop()
+            row = db.fetch_one(
+                "SELECT game_hours_elapsed, game_week FROM game_state WHERE id = 1"
+            )
+            self.assertGreaterEqual(float(row["game_hours_elapsed"]), 1344.0)
+            self.assertEqual(9, int(row["game_week"]))
+
+    def test_milestones_see_persisted_hours(self):
+        """Persist-before-on_week: crossing the boundary writes week 9 before the hook."""
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            seen = []
+
+            def on_week(w):
+                row = db.fetch_one(
+                    "SELECT game_hours_elapsed, game_week FROM game_state WHERE id = 1"
+                )
+                seen.append(
+                    (
+                        int(w),
+                        float(row["game_hours_elapsed"]),
+                        int(row["game_week"]),
+                    )
+                )
+
+            clk = GameClock(on_week=on_week)
+            clk.running = False
+            clk.game_hours_elapsed = 1343.5
+            clk._snapshot_ghe = 1343.5
+            clk.last_week = 8
+            clk.speed_multiplier = 0
+            # Simulate the post-tick catch-up + persist + milestones path.
+            clk.game_hours_elapsed = 1344.1
+            clk._snapshot_ghe = 1344.1
+            clk._persist_game_state_unlocked()
+            with clk.lock:
+                clk._check_time_milestones_locked()
+            self.assertEqual(1, len(seen))
+            self.assertEqual(9, seen[0][0])
+            self.assertGreaterEqual(seen[0][1], 1344.0)
+            self.assertEqual(9, seen[0][2])
+
+    def test_callback_reentering_clock_does_not_deadlock(self):
+        """Regression: on_departure -> trigger_aog -> request_auto_pause wedged the clock.
+
+        request_auto_pause() takes GameClock.lock, and the old run loop held that
+        same non-reentrant lock across the callback, so the clock thread blocked on
+        itself forever and every HTTP reader queued behind it.
+        """
+        import threading
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            done = threading.Event()
+            ran_on = {}
+
+            def on_week(w):
+                ran_on["thread"] = threading.current_thread().name
+                clk.request_auto_pause(f"Aircraft N1 is AOG (week {w})")
+                done.set()
+
+            clk = GameClock(on_week=on_week)
+            clk.running = False
+            clk.speed_multiplier = 4
+            clk._start_worker()
+            clk._enqueue("week", 9)
+            try:
+                self.assertTrue(done.wait(5), "callback deadlocked re-entering the clock")
+                self.assertEqual("game-clock-callbacks", ran_on["thread"])
+                self.assertEqual(0, clk.speed_multiplier)
+                self.assertIn("AOG", clk.last_auto_pause_reason or "")
+            finally:
+                clk.stop()
+
+    def test_slow_callback_never_blocks_status_or_speed(self):
+        """A long week-roll must not stall /api/clock, /api/state or the map poll."""
+        import threading
+        import time
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            entered = threading.Event()
+
+            def on_week(w):
+                entered.set()
+                time.sleep(3.0)
+
+            clk = GameClock(on_week=on_week)
+            clk.running = False
+            clk._start_worker()
+            clk._enqueue("week", 9)
+            try:
+                self.assertTrue(entered.wait(2), "callback never ran")
+                t0 = time.time()
+                status = clk.get_status()
+                ok, _ = clk.set_speed(4, player_initiated=True)
+                elapsed = time.time() - t0
+                self.assertTrue(ok)
+                self.assertIsNotNone(status["time_display"])
+                self.assertLess(
+                    elapsed, 0.5, "clock lock was held across the callback"
+                )
+            finally:
+                clk.stop()
+
+    def test_interpolation_is_bounded_while_thread_is_wedged(self):
+        """A stale snapshot must hold time still, not teleport the HUD hours ahead."""
+        import time
+
+        from engine.clock import MAX_EXTRAPOLATION_REAL_SECONDS
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            clk = GameClock()
+            clk.running = False
+            clk.is_alive = lambda: True  # a live thread that stopped catching up
+            clk.game_hours_elapsed = 1470.0
+            clk._snapshot_ghe = 1470.0
+            clk.speed_multiplier = 60
+            # A wedged loop leaves both stamps stale; _catch_up_locked sets them together.
+            clk._snapshot_wall_time = time.time() - 18.5  # the observed ~37h skew
+            clk._last_tick = clk._snapshot_wall_time
+
+            live = clk.get_interpolated_game_hours()
+            uncapped = 1470.0 + (18.5 / 30.0) * 60.0
+            self.assertAlmostEqual(1507.0, uncapped, places=0)
+            ceiling = 1470.0 + (MAX_EXTRAPOLATION_REAL_SECONDS / 30.0) * 60.0
+            self.assertLessEqual(live, ceiling + 1e-6)
+            self.assertTrue(clk.is_stalled())
+
+    def test_flight_map_payload_sends_committed_hour(self):
+        """The map payload must not alias game_hours_elapsed to the interpolated hour."""
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import stop_game_clock
+            from engine.flight_map_data import get_flight_map_payload
+
+            stop_game_clock()
+            db.execute(
+                "UPDATE game_state SET game_hours_elapsed = 1470, speed_multiplier = 60 WHERE id = 1"
+            )
+            payload = get_flight_map_payload()
+            self.assertIn("committed_game_hour", payload)
+            self.assertAlmostEqual(
+                float(payload["committed_game_hour"]),
+                float(payload["game_hours_elapsed"]),
+                places=6,
+            )
+            self.assertAlmostEqual(1470.0, float(payload["committed_game_hour"]), places=2)
+
+    def test_worker_preserves_week_before_flight_event_order(self):
+        """Week spawn must land before the flight events for that week are dispatched."""
+        import threading
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from engine.clock import GameClock
+
+            order = []
+            both = threading.Event()
+
+            def on_week(w):
+                order.append("week")
+
+            def on_departure(seg):
+                order.append("departure")
+
+            clk = GameClock(on_week=on_week, on_departure=on_departure)
+            clk.running = False
+            clk._dispatch_flight_events = lambda t0, t1: (
+                order.append("flights"),
+                both.set(),
+            )
+            clk._start_worker()
+            clk._enqueue("week", 9)
+            clk._enqueue("flights", (1343.0, 1345.0))
+            try:
+                self.assertTrue(both.wait(5))
+                self.assertEqual(["week", "flights"], order)
+            finally:
+                clk.stop()
+
 
 class TestFlightMapVisibility(unittest.TestCase):
     def test_future_legs_are_not_all_drawn(self):
@@ -881,6 +1110,10 @@ class TestOverlayAPI(unittest.TestCase):
             cases = {
                 "get_state": lambda: api.get_state(),
                 "flight_map": lambda: api.flight_map(),
+                "airports_map": lambda: api.airports_map(),
+                "airport_routes": lambda: api.airport_routes(
+                    prow["origin_iata"] if prow else (rt["origin_iata"] if rt else "ATL")
+                ),
                 "search_airports": lambda: api.search_airports("SF"),
                 "list_catalog": lambda: api.list_catalog(None),
                 "cabin_layout": lambda: api.cabin_layout("A320"),
@@ -1024,6 +1257,63 @@ class TestAIWiring(unittest.TestCase):
                 "SELECT COUNT(*) AS n FROM competitor_routes WHERE competitor_id = 'AI_TITAN'"
             )["n"]
             self.assertGreater(routes, 0, "starter network should be re-seeded after reset")
+
+
+# ---------------------------------------------------------------------------
+# 8a2. Player hub starter capacity + raised runway hourly caps.
+# ---------------------------------------------------------------------------
+class TestPlayerHubStarters(unittest.TestCase):
+    def test_create_airline_at_slot_hub_gets_free_gates_and_slots(self):
+        from helpers import fresh_game
+        from engine.gates import is_auctioned_airport
+        from engine.slots import declared_hourly_cap, is_slot_controlled, slots_held
+
+        with fresh_game(hub="ICN", name="Test Air", callsign="TST"):
+            from db import db
+
+            self.assertTrue(is_auctioned_airport("ICN"))
+            self.assertTrue(is_slot_controlled("ICN"))
+            gates = db.fetch_one(
+                """
+                SELECT gate_units FROM airport_gate_allocations
+                WHERE airport_iata = 'ICN' AND holder_id = 'PLAYER' AND status = 'ACTIVE'
+                """
+            )
+            self.assertIsNotNone(gates)
+            self.assertEqual(int(gates["gate_units"] or 0), 2)
+            self.assertEqual(slots_held("ICN", "PLAYER", 1), 12)
+            self.assertEqual(slots_held("ICN", "PLAYER", 12), 12)
+            self.assertGreaterEqual(declared_hourly_cap("ICN"), 26)
+
+    def test_create_airline_at_non_slot_hub_skips_slots(self):
+        from helpers import fresh_game
+        from engine.slots import is_slot_controlled
+
+        with fresh_game(hub="SGN", name="VNA Test", callsign="VNT"):
+            from db import db
+
+            self.assertFalse(is_slot_controlled("SGN"))
+            slots = db.fetch_one(
+                """
+                SELECT slots_held FROM slot_allocations
+                WHERE airport_iata = 'SGN' AND holder_id = 'PLAYER' AND game_week = 1
+                """
+            )
+            self.assertIsNone(slots)
+
+    def test_slot_hourly_caps_raise_on_existing_rows(self):
+        from helpers import fresh_game
+        from engine.slots import STAGE1_SLOT_AIRPORTS, declared_hourly_cap, seed_slot_controlled_airports
+
+        with fresh_game(hub="ATL", name="Cap Test", callsign="CAP"):
+            from db import db
+
+            db.execute(
+                "UPDATE slot_controlled_airports SET declared_hourly_cap = 3 WHERE iata = 'LHR'"
+            )
+            self.assertEqual(declared_hourly_cap("LHR"), 3)
+            seed_slot_controlled_airports()
+            self.assertEqual(declared_hourly_cap("LHR"), int(STAGE1_SLOT_AIRPORTS["LHR"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1192,6 +1482,28 @@ class TestAiPhase1(unittest.TestCase):
                 (cid, pair),
             )["status"]
             self.assertEqual("ACTIVE", str(st))
+
+
+# ---------------------------------------------------------------------------
+# 8b2. AI departure banks — 7-day / 24-hour spread.
+# ---------------------------------------------------------------------------
+class TestAiFlightBanks(unittest.TestCase):
+    def test_frequency_seven_covers_every_weekday(self):
+        from engine.ai_flights import bank_dep_hours
+
+        hours = bank_dep_hours(7, "HUBSPOKE", 0.0, pair_id="ATL-JFK")
+        days = sorted({int(h // 24.0) % 7 for h in hours})
+        self.assertEqual(days, [0, 1, 2, 3, 4, 5, 6])
+        clock_hours = [h % 24.0 for h in hours]
+        self.assertGreater(max(clock_hours) - min(clock_hours), 6.0)
+
+    def test_hubspoke_is_not_monday_morning_only(self):
+        from engine.ai_flights import bank_dep_hours
+
+        hours = bank_dep_hours(5, "HUBSPOKE", 336.0, pair_id="ICN-NRT")
+        offsets = [h - 336.0 for h in hours]
+        self.assertGreater(max(offsets), 96.0, "should reach later weekdays, not Mon–Tue banks")
+        self.assertFalse(all(abs((h % 24.0) - 7.0) < 0.5 or abs((h % 24.0) - 15.0) < 0.5 for h in hours))
 
 
 # ---------------------------------------------------------------------------

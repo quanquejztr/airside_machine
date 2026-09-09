@@ -330,6 +330,7 @@ def schedule_ferry_reposition(
         _assert_new_segment_airport_limits(
             seg_gw,
             [{"origin_iata": pos, "dest_iata": dest, "dep_abs": dep_abs, "arr_abs": arr_abs, "tail_number": tail}],
+            ferry=True,
         )
     except Exception as e:
         raise ValueError(str(e)) from e

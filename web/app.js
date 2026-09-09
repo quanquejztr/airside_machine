@@ -3,13 +3,39 @@ const $ = (sel, root = document) => root.querySelector(sel);
 let mapInst = null;
 let lineLayer = null;
 let acLayer = null;
+let airportLayer = null;
+let airportRenderer = null;
+let airportRouteLayer = null;
+let airportDraftLayer = null;
 const flights = {};
+const airportPins = {};
+let airportCatalog = null;
+let airportCatalogPromise = null;
+let airportNetwork = new Set();
+let airportHub = "";
+let airportPinRefreshTimer = null;
+let selectedAirportIata = "";
+let selectedAirportRoutesSeq = 0;
+/** @type {null | { origin: string, dest: string | null, phase: 'pick_dest' | 'confirm' }} */
+let routeDraft = null;
+let routeDraftPreviewSeq = 0;
 let zTop = 40;
 let winOffset = 0;
 let lastState = null;
 let hudSeq = 0;
 let didFitFlights = false;
-const mapClock = { hour: 0, speed: 0, realSecPerHour: 30, at: 0, alive: true };
+const mapClock = {
+  hour: 0,
+  speed: 0,
+  realSecPerHour: 30,
+  at: 0,
+  alive: true,
+  serverHour: 0,
+  serverAt: 0,
+  committedHour: 0,
+  committedAt: 0,
+  stalled: false,
+};
 const seenNoticeIds = new Set();
 let mapLoadSeq = 0;
 let mapPollTimer = null;
@@ -19,30 +45,87 @@ function syncMapClock(src) {
   const incoming = src.current_game_hour != null ? Number(src.current_game_hour)
     : src.game_hours_elapsed != null ? Number(src.game_hours_elapsed)
     : null;
+  // Always trust the server stamp — never keep a raced-ahead extrapolated hour.
   if (incoming != null && Number.isFinite(incoming)) {
-    const extrapolated = mapClock.at ? liveGameHour() : mapClock.hour;
-    if (!Number.isFinite(extrapolated) || Math.abs(incoming - extrapolated) > 0.05) {
-      mapClock.hour = incoming;
+    mapClock.hour = incoming;
+    mapClock.serverHour = incoming;
+    mapClock.serverAt = performance.now();
+  }
+  // Only an explicit committed stamp may move the HUD calendar. Falling back to
+  // game_hours_elapsed let payloads that alias it to the interpolated hour push the
+  // HUD a week ahead, which is what made the clock flip between two times.
+  if (src.committed_game_hour != null) {
+    const committed = Number(src.committed_game_hour);
+    if (Number.isFinite(committed)) {
+      mapClock.committedHour = committed;
+      mapClock.committedAt = performance.now();
     }
   }
   if (src.speed_multiplier != null) mapClock.speed = Number(src.speed_multiplier);
   if (src.real_seconds_per_game_hour) mapClock.realSecPerHour = Number(src.real_seconds_per_game_hour);
   if (src.clock_alive != null) mapClock.alive = Boolean(src.clock_alive);
+  if (src.clock_stalled != null) mapClock.stalled = Boolean(src.clock_stalled);
   mapClock.at = performance.now();
   scheduleMapPoll();
 }
 
 function liveGameHour() {
-  if (mapClock.alive === false) return mapClock.hour;
-  const elapsed = (performance.now() - (mapClock.at || performance.now())) / 1000;
-  return mapClock.hour + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  if (mapClock.alive === false || mapClock.stalled) return mapClock.hour;
+  const now = performance.now();
+  const elapsed = (now - (mapClock.at || now)) / 1000;
+  const raw = mapClock.hour + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  // Cap runaway extrapolation while a poll is hung (common at 60× + DB lock).
+  // Allow at most ~1 real second of predicted advance beyond the last server stamp.
+  if (mapClock.serverAt) {
+    const sinceServer = (now - mapClock.serverAt) / 1000;
+    const maxAhead = ((Math.min(sinceServer, 1.0) / (mapClock.realSecPerHour || 30))
+      * (mapClock.speed || 0));
+    const ceiling = mapClock.serverHour + maxAhead;
+    if (Number.isFinite(ceiling)) return Math.min(raw, ceiling);
+  }
+  return raw;
+}
+
+/** HUD calendar from committed hours — never paints a week ahead of the save. */
+function hudGameHour() {
+  // A stalled server clock is not advancing, so neither should the HUD.
+  if (mapClock.alive === false || mapClock.stalled) {
+    return mapClock.committedHour || mapClock.hour;
+  }
+  const committed = Number.isFinite(mapClock.committedHour) ? mapClock.committedHour : mapClock.hour;
+  const now = performance.now();
+  const baseAt = mapClock.committedAt || mapClock.at || now;
+  const elapsed = (now - baseAt) / 1000;
+  const raw = committed + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  const since = mapClock.committedAt ? (now - mapClock.committedAt) / 1000 : elapsed;
+  const maxAhead = (Math.min(since, 1.0) / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  let live = Math.min(raw, committed + maxAhead);
+  const committedWeek = Math.floor(committed / 168) + 1;
+  const liveWeek = Math.floor(live / 168) + 1;
+  if (liveWeek > committedWeek) {
+    // Hold at end of the committed week until the server persists the rollover.
+    live = committedWeek * 168 - 1e-6;
+  }
+  return live;
+}
+
+function freezeMapClock() {
+  mapClock.hour = liveGameHour();
+  mapClock.committedHour = hudGameHour();
+  mapClock.speed = 0;
+  mapClock.alive = false;
+  mapClock.at = performance.now();
+  mapClock.committedAt = mapClock.at;
 }
 
 function applyClockSpeed(speed) {
   const hour = mapClock.at ? liveGameHour() : mapClock.hour;
+  const committed = mapClock.committedAt ? hudGameHour() : (mapClock.committedHour || hour);
   mapClock.hour = hour;
+  mapClock.committedHour = committed;
   mapClock.speed = Number(speed) || 0;
   mapClock.at = performance.now();
+  mapClock.committedAt = mapClock.at;
 }
 
 function formatHudTime(ghe, speed) {
@@ -62,7 +145,7 @@ function formatHudTime(ghe, speed) {
 function paintHudTime() {
   const el = $("#hud-time");
   if (!el) return;
-  if (mapClock.at) el.textContent = formatHudTime(liveGameHour(), mapClock.speed);
+  if (mapClock.at) el.textContent = formatHudTime(hudGameHour(), mapClock.speed);
   else if (lastState && lastState.clock && lastState.clock.time_display) el.textContent = lastState.clock.time_display;
 }
 
@@ -170,7 +253,13 @@ function closeWindow(id) {
 
 async function refreshHud() {
   const seq = ++hudSeq;
-  const s = await api("/api/state");
+  let s;
+  try {
+    s = await api("/api/state");
+  } catch (err) {
+    freezeMapClock();
+    throw err;
+  }
   if (seq !== hudSeq) return;
   lastState = s;
   const a = s.airline;
@@ -308,11 +397,17 @@ function openAirline() {
         callsign: String(fd.get("callsign") || "").toUpperCase(),
         home_hub_iata: await resolveAirportCode(fd.get("home_hub_iata")),
       } };
+      const hubIata = String(
+        (lastState.airline && lastState.airline.home_hub_iata) || ""
+      ).toUpperCase();
       toast("Airline created");
       closeWindow("airline");
       resetClientWorld();
+      // Skip the first world-wide flight fit so the hub zoom isn't overridden.
+      didFitFlights = true;
       await refreshHud();
-      loadMap().catch(() => {});
+      await loadMap();
+      await focusMapOnHub(hubIata);
     } catch (err) { setMsg(form, err.message, false); }
   };
 }
@@ -1204,6 +1299,15 @@ function openRouteDetail(preselect) {
       const p = d.performance;
       const ops = d.ops;
       const rc = (ops && ops.remaining_cabin) || {};
+      const origin = String(r.origin_iata || "").toUpperCase();
+      const dest = String(r.dest_iata || "").toUpperCase();
+      const reverseId = origin && dest ? `${dest}-${origin}` : "";
+      const reverse = reverseId
+        ? overview.find((row) => String(row.route_id || "").toUpperCase() === reverseId)
+        : null;
+      const reverseBtn = reverse
+        ? `<button type="button" id="rd-apply-reverse">Apply to ${escapeHtml(reverse.route_id)}</button>`
+        : "";
       panel.innerHTML = `
         <div class="rd-panel-head">
           <div>
@@ -1230,28 +1334,47 @@ function openRouteDetail(preselect) {
             <div><label>First / F</label><input name="price_first" type="number" min="0.01" step="0.01" value="${r.price_first}" /></div>
           </div>
           <p class="muted">Y and J bases feed demand vs distance reference fares. W and F are list tickets.</p>
-          <button type="submit">Save fares</button>
+          <div class="row2" style="align-items:center;gap:8px">
+            <button type="submit">Save fares</button>
+            ${reverseBtn}
+          </div>
+          ${reverse ? `<p class="muted">Copies the fares above onto ${escapeHtml(reverse.route_id)} (already opened).</p>` : ""}
         </form>`;
       $("#rd-close-panel", el).onclick = () => { panel.hidden = true; panel.innerHTML = ""; };
+      const fareBody = (targetRouteId) => {
+        const fd = new FormData($("#rd-fares", el));
+        return {
+          route_id: targetRouteId,
+          price_leisure: Number(fd.get("price_leisure")),
+          price_premium_economy: Number(fd.get("price_premium_economy")),
+          price_business: Number(fd.get("price_business")),
+          price_first: Number(fd.get("price_first")),
+        };
+      };
       $("#rd-fares", el).onsubmit = async (e) => {
         e.preventDefault();
-        const fd = new FormData($("#rd-fares", el));
         try {
           await api("/api/routes/prices", {
             method: "POST",
-            body: JSON.stringify({
-              route_id: r.route_id,
-              price_leisure: Number(fd.get("price_leisure")),
-              price_premium_economy: Number(fd.get("price_premium_economy")),
-              price_business: Number(fd.get("price_business")),
-              price_first: Number(fd.get("price_first")),
-            }),
+            body: JSON.stringify(fareBody(r.route_id)),
           });
           toast("Fares updated");
           await showFares(r.route_id);
           await loadTable();
         } catch (err) { toast(err.message); }
       };
+      const applyRev = $("#rd-apply-reverse", el);
+      if (applyRev && reverse) {
+        applyRev.onclick = async () => {
+          try {
+            await api("/api/routes/prices", {
+              method: "POST",
+              body: JSON.stringify(fareBody(reverse.route_id)),
+            });
+            toast(`Fares applied to ${reverse.route_id}`);
+          } catch (err) { toast(err.message); }
+        };
+      }
     } catch (err) {
       panel.innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
     }
@@ -2145,6 +2268,609 @@ function flightDotLabelHtml(seg, p) {
   return lines.join("<br>");
 }
 
+function airportPopupHtml(ap) {
+  const iata = String(ap.iata || "").trim().toUpperCase();
+  const icao = String(ap.icao || "").trim().toUpperCase();
+  const name = String(ap.name || "").trim();
+  const city = String(ap.city || "").trim();
+  const country = String(ap.country || "").trim();
+  const tz = String(ap.timezone || "").trim();
+  const cat = String(ap.category || "").replace(/_/g, " ");
+  const runway = ap.runway_length_ft != null ? Number(ap.runway_length_ft).toLocaleString() + " ft" : "—";
+  const gates = ap.gate_count != null ? Number(ap.gate_count).toLocaleString() : "—";
+  const score = ap.score != null ? Number(ap.score).toLocaleString() : "—";
+  const place = [city, country].filter(Boolean).join(", ");
+  return `
+    <div class="ap-popup">
+      <div class="ap-popup-title">${escapeHtml(name || iata)}</div>
+      <div class="ap-popup-codes">
+        <span>${escapeHtml(iata || "—")}</span>
+        ${icao ? `<span class="ap-popup-icao">${escapeHtml(icao)}</span>` : ""}
+      </div>
+      ${place ? `<div class="ap-popup-place">${escapeHtml(place)}</div>` : ""}
+      <table class="ap-popup-table">
+        <tr><th>Runway</th><td>${escapeHtml(runway)}</td></tr>
+        <tr><th>Gates</th><td>${escapeHtml(gates)}</td></tr>
+        <tr><th>Timezone</th><td>${escapeHtml(tz || "—")}</td></tr>
+        <tr><th>Category</th><td>${escapeHtml(cat || "—")}</td></tr>
+        <tr><th>Score</th><td>${escapeHtml(score)}</td></tr>
+      </table>
+      <button type="button" class="ap-new-route-btn" data-origin="${escapeHtml(iata)}">New route</button>
+    </div>
+  `;
+}
+
+function airportLatLon(iata) {
+  const code = String(iata || "").toUpperCase();
+  const pin = airportPins[code];
+  if (pin && pin.ap && pin.ap.lat != null && pin.ap.lon != null) {
+    return { lat: Number(pin.ap.lat), lon: Number(pin.ap.lon) };
+  }
+  const ap = (airportCatalog || []).find((a) => a.iata === code);
+  if (ap) return { lat: Number(ap.lat), lon: Number(ap.lon) };
+  return null;
+}
+
+/** Animate the map onto the player's home hub after founding (or on demand). */
+async function focusMapOnHub(iata, opts = {}) {
+  const code = String(iata || "").toUpperCase();
+  if (!code) return;
+  try { initMap(); } catch (_) { return; }
+  if (!mapInst) return;
+  try {
+    await ensureAirportCatalog();
+  } catch (_) { /* still try pin / catalog below */ }
+  const ll = airportLatLon(code);
+  if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lon)) return;
+  // Keep the hub pin on-screen at this zoom, then fly in.
+  refreshAirportPins();
+  const zoom = opts.zoom != null ? Number(opts.zoom) : 6;
+  const duration = opts.duration != null ? Number(opts.duration) : 1.35;
+  didFitFlights = true;
+  mapInst.flyTo([ll.lat, ll.lon], zoom, {
+    animate: true,
+    duration: Math.max(0.4, duration),
+    easeLinearity: 0.25,
+  });
+}
+
+function clearRouteDraft() {
+  routeDraft = null;
+  if (airportDraftLayer) airportDraftLayer.clearLayers();
+  if (mapInst && mapInst.getContainer()) {
+    mapInst.getContainer().classList.remove("ap-picking-dest");
+  }
+}
+
+function clearAirportRouteSelection() {
+  selectedAirportIata = "";
+  if (airportRouteLayer) airportRouteLayer.clearLayers();
+  Object.values(flights).forEach((f) => {
+    if (!f || !f.line) return;
+    const flying = liveProgress(f) > 0.002 && liveProgress(f) < 0.998;
+    f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
+  });
+}
+
+function startNewRouteDraft(originIata) {
+  const origin = String(originIata || "").toUpperCase();
+  if (!origin || !airportLatLon(origin)) {
+    toast("Airport location unavailable");
+    return;
+  }
+  clearAirportRouteSelection();
+  clearRouteDraft();
+  routeDraft = { origin, dest: null, phase: "pick_dest" };
+  if (mapInst) {
+    mapInst.closePopup();
+    if (mapInst.getContainer()) mapInst.getContainer().classList.add("ap-picking-dest");
+  }
+  toast("Click a destination airport");
+}
+
+/** Compact demand block — same numbers as Routes → Preview. */
+function routeDraftStatsInner(preview) {
+  if (preview == null) {
+    return `<div class="muted">Loading demand…</div>`;
+  }
+  if (preview.__error) {
+    return `<div class="err">${escapeHtml(preview.__error)}</div>`;
+  }
+  const dem = preview.demand || {};
+  const market = Number(dem.weekly_market_total != null ? dem.weekly_market_total : dem.total_pax || 0);
+  const src = dem.demand_source_badge || "Demand";
+  const floorNote = dem.market_floor_applied ? " · min market" : "";
+  const already = preview.already_operated
+    ? `<div class="ap-open-route-note">You already operate this</div>`
+    : "";
+  return `
+    <div class="ap-open-route-demand"><b>${market.toLocaleString()}</b> pax/wk
+      <span class="muted">· ${escapeHtml(src)}${escapeHtml(floorNote)}</span></div>
+    <div class="muted">${Number(dem.business_pax || 0).toLocaleString()} business ·
+      ${Number(dem.leisure_pax || 0).toLocaleString()} leisure</div>
+    <div class="muted">Y${Number(dem.economy_pax || 0)} / W${Number(dem.premium_economy_pax || 0)} /
+      J${Number(dem.business_cabin_pax || 0)} / F${Number(dem.first_pax || 0)}</div>
+    <div class="muted">${Number(preview.distance_nm || 0).toLocaleString()} nm ·
+      Cost ~ <b>${money(preview.total_new_cost)}</b></div>
+    ${already}`;
+}
+
+function openRouteBoxHtml(origin, dest, preview) {
+  return `
+    <div class="ap-open-route-box">
+      <div class="ap-open-route-pair">${escapeHtml(origin)} → ${escapeHtml(dest)}</div>
+      <div class="ap-open-route-stats">${routeDraftStatsInner(preview)}</div>
+      <button type="button" class="ap-open-route-btn">Open route</button>
+      <button type="button" class="ap-open-route-cancel" aria-label="Cancel">×</button>
+    </div>`;
+}
+
+function drawRouteDraftPreview() {
+  if (!airportDraftLayer || !mapInst || !routeDraft || !routeDraft.dest) return;
+  airportDraftLayer.clearLayers();
+  const o = airportLatLon(routeDraft.origin);
+  const d = airportLatLon(routeDraft.dest);
+  if (!o || !d) return;
+
+  const endpoints = [[o.lat, o.lon], [d.lat, d.lon]];
+  const pts = interpolateGreatCircle(o.lat, o.lon, d.lat, d.lon, 64);
+  // Soft underlay first so the pulse stroke sits on top.
+  const underOpts = {
+    color: "#0ea5e9",
+    weight: 8,
+    opacity: 0.22,
+    pane: "routes",
+    steps: 5,
+    wrap: false,
+    interactive: false,
+    className: "ap-draft-line-glow",
+  };
+  if (typeof L.Geodesic === "function") {
+    new L.Geodesic(endpoints, underOpts).addTo(airportDraftLayer);
+  } else {
+    L.polyline(pts, underOpts).addTo(airportDraftLayer);
+  }
+  const lineOpts = {
+    color: "#38bdf8",
+    weight: 3.5,
+    opacity: 0.95,
+    pane: "routes",
+    steps: 5,
+    wrap: false,
+    interactive: false,
+    className: "ap-draft-line",
+  };
+  if (typeof L.Geodesic === "function") {
+    new L.Geodesic(endpoints, lineOpts).addTo(airportDraftLayer);
+  } else {
+    L.polyline(pts, lineOpts).addTo(airportDraftLayer);
+  }
+
+  const origin = routeDraft.origin;
+  const dest = routeDraft.dest;
+  const marker = L.marker([d.lat, d.lon], {
+    icon: L.divIcon({
+      className: "ap-open-route-anchor",
+      html: openRouteBoxHtml(origin, dest, null),
+      iconSize: [196, 150],
+      iconAnchor: [98, 158],
+    }),
+    interactive: true,
+    keyboard: false,
+    zIndexOffset: 800,
+  }).addTo(airportDraftLayer);
+
+  const wireOpenRouteBox = () => {
+    const el = marker.getElement();
+    if (!el || el.dataset.wired === "1") return;
+    el.dataset.wired = "1";
+    L.DomEvent.disableClickPropagation(el);
+    L.DomEvent.disableScrollPropagation(el);
+    const openBtn = el.querySelector(".ap-open-route-btn");
+    const cancelBtn = el.querySelector(".ap-open-route-cancel");
+    if (openBtn) {
+      openBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        confirmOpenDraftRoute();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        clearRouteDraft();
+      });
+    }
+  };
+  marker.on("add", wireOpenRouteBox);
+  requestAnimationFrame(wireOpenRouteBox);
+
+  const seq = ++routeDraftPreviewSeq;
+  routeDraft.previewSeq = seq;
+  api(`/api/routes/preview?origin=${encodeURIComponent(origin)}&dest=${encodeURIComponent(dest)}`)
+    .then((p) => {
+      if (!routeDraft || routeDraft.previewSeq !== seq) return;
+      const el = marker.getElement();
+      const slot = el && el.querySelector(".ap-open-route-stats");
+      if (slot) slot.innerHTML = routeDraftStatsInner(p);
+    })
+    .catch((err) => {
+      if (!routeDraft || routeDraft.previewSeq !== seq) return;
+      const el = marker.getElement();
+      const slot = el && el.querySelector(".ap-open-route-stats");
+      if (slot) {
+        slot.innerHTML = routeDraftStatsInner({ __error: err.message || "Demand unavailable" });
+      }
+    });
+}
+
+async function confirmOpenDraftRoute() {
+  if (!routeDraft || !routeDraft.origin || !routeDraft.dest) return;
+  const origin = routeDraft.origin;
+  const dest = routeDraft.dest;
+  try {
+    await api("/api/routes", {
+      method: "POST",
+      body: JSON.stringify({ origin, dest }),
+    });
+    toast(`Opened ${origin}–${dest}`);
+    clearRouteDraft();
+    await refreshHud();
+    // Refresh network coloring + show spokes from the new origin.
+    try {
+      const data = await api("/api/flight-map.json");
+      updateAirports(data);
+    } catch (_) { /* ignore */ }
+    if (airportPins[origin]) {
+      selectAirportRoutes(origin, airportPins[origin].marker);
+    }
+  } catch (err) {
+    toast(err.message || "Could not open route");
+  }
+}
+
+function pickDraftDestination(destIata) {
+  if (!routeDraft || routeDraft.phase !== "pick_dest") return false;
+  const dest = String(destIata || "").toUpperCase();
+  if (!dest || dest === routeDraft.origin) {
+    toast("Pick a different airport");
+    return true;
+  }
+  if (!airportLatLon(dest)) {
+    toast("Destination location unavailable");
+    return true;
+  }
+  routeDraft.dest = dest;
+  routeDraft.phase = "confirm";
+  if (mapInst && mapInst.getContainer()) {
+    mapInst.getContainer().classList.remove("ap-picking-dest");
+  }
+  if (mapInst) mapInst.closePopup();
+  drawRouteDraftPreview();
+  return true;
+}
+
+function airportSpokeStyle(hasPlayer, hasAi, suspendedOnly) {
+  if (hasPlayer) {
+    return {
+      color: "#2563eb",
+      weight: hasAi ? 3.5 : 3,
+      opacity: 0.95,
+      dashArray: null,
+    };
+  }
+  if (suspendedOnly) {
+    return { color: "#94a3b8", weight: 1.5, opacity: 0.55, dashArray: "4 6" };
+  }
+  return { color: "#f59e0b", weight: 2.25, opacity: 0.85, dashArray: null };
+}
+
+function drawAirportRouteSpokes(hubIata, routes) {
+  if (!airportRouteLayer || !mapInst) return;
+  airportRouteLayer.clearLayers();
+  const hub = String(hubIata || "").toUpperCase();
+  const byOther = {};
+  (routes || []).forEach((r) => {
+    const other = String(r.other_iata || "").toUpperCase();
+    if (!other || other === hub) return;
+    if (!byOther[other]) {
+      byOther[other] = {
+        other,
+        hasPlayer: false,
+        hasAi: false,
+        suspendedOnly: true,
+        lat: null,
+        lon: null,
+        labels: [],
+      };
+    }
+    const bucket = byOther[other];
+    const op = String(r.operator || "");
+    if (op === "PLAYER") bucket.hasPlayer = true;
+    else bucket.hasAi = true;
+    if (String(r.status || "").toUpperCase() !== "SUSPENDED") bucket.suspendedOnly = false;
+    // Endpoint coords: the non-hub end of this directed leg.
+    if (String(r.origin_iata || "").toUpperCase() === hub) {
+      bucket.lat = Number(r.dest_lat);
+      bucket.lon = Number(r.dest_lon);
+    } else {
+      bucket.lat = Number(r.origin_lat);
+      bucket.lon = Number(r.origin_lon);
+    }
+    const label = String(r.operator_label || op);
+    if (label && bucket.labels.indexOf(label) < 0) bucket.labels.push(label);
+  });
+
+  const hubPin = airportPins[hub];
+  const hubLat = hubPin && hubPin.ap ? Number(hubPin.ap.lat) : null;
+  const hubLon = hubPin && hubPin.ap ? Number(hubPin.ap.lon) : null;
+  if (hubLat == null || hubLon == null) return;
+
+  // Soften background flight lines while a network is selected.
+  Object.values(flights).forEach((f) => {
+    if (f && f.line) f.line.setStyle({ opacity: f.player ? 0.18 : 0.08 });
+  });
+
+  Object.values(byOther).forEach((spoke) => {
+    if (spoke.lat == null || spoke.lon == null || !Number.isFinite(spoke.lat) || !Number.isFinite(spoke.lon)) {
+      return;
+    }
+    const style = airportSpokeStyle(spoke.hasPlayer, spoke.hasAi, spoke.suspendedOnly && !spoke.hasPlayer);
+    const endpoints = [[hubLat, hubLon], [spoke.lat, spoke.lon]];
+    const lineOpts = {
+      ...style,
+      pane: "routes",
+      steps: 5,
+      wrap: false,
+      className: "ap-route-spoke",
+    };
+    const pts = interpolateGreatCircle(hubLat, hubLon, spoke.lat, spoke.lon, 64);
+    const line = (typeof L.Geodesic === "function")
+      ? new L.Geodesic(endpoints, lineOpts).addTo(airportRouteLayer)
+      : L.polyline(pts, lineOpts).addTo(airportRouteLayer);
+    const tip = `${hub}–${spoke.other}`;
+    line.bindTooltip(tip, { sticky: true, direction: "top", className: "ap-pin-tip" });
+  });
+}
+
+async function selectAirportRoutes(iata, marker) {
+  const code = String(iata || "").toUpperCase();
+  if (!code || !marker) return;
+  if (routeDraft && routeDraft.phase === "pick_dest") {
+    pickDraftDestination(code);
+    return;
+  }
+  if (routeDraft && routeDraft.phase === "confirm") {
+    // Starting a fresh inspection cancels an unfinished draft.
+    clearRouteDraft();
+  }
+  if (selectedAirportIata === code) {
+    clearAirportRouteSelection();
+    return;
+  }
+  selectedAirportIata = code;
+  const seq = ++selectedAirportRoutesSeq;
+  try {
+    const data = await api("/api/airports/routes?iata=" + encodeURIComponent(code));
+    if (seq !== selectedAirportRoutesSeq || selectedAirportIata !== code) return;
+    drawAirportRouteSpokes(code, data.routes || []);
+  } catch (err) {
+    if (seq !== selectedAirportRoutesSeq || selectedAirportIata !== code) return;
+    clearAirportRouteSelection();
+    toast(err.message || "Failed to load routes");
+  }
+}
+
+function ensureAirportCatalog() {
+  if (airportCatalog) return Promise.resolve(airportCatalog);
+  if (!airportCatalogPromise) {
+    airportCatalogPromise = api("/api/airports-map.json")
+      .then((data) => {
+        const list = Array.isArray(data.airports) ? data.airports : [];
+        airportCatalog = list
+          .filter((ap) => ap && ap.iata != null && ap.lat != null && ap.lon != null)
+          .map((ap) => ({
+            iata: String(ap.iata).toUpperCase(),
+            icao: ap.icao,
+            name: ap.name,
+            city: ap.city,
+            country: ap.country,
+            lat: Number(ap.lat),
+            lon: Number(ap.lon),
+            runway_length_ft: ap.runway_length_ft,
+            gate_count: ap.gate_count,
+            timezone: ap.timezone,
+            score: Number(ap.score || 0),
+            category: String(ap.category || ""),
+          }))
+          .sort((a, b) => b.score - a.score || a.iata.localeCompare(b.iata));
+        return airportCatalog;
+      })
+      .catch((err) => {
+        airportCatalogPromise = null;
+        throw err;
+      });
+  }
+  return airportCatalogPromise;
+}
+
+/** Zoom → size floor + geographic separation so metro clusters keep the biggest hub. */
+function airportZoomPolicy(zoom) {
+  const z = Number(zoom) || 0;
+  if (z <= 2) return { minScore: 1450000, minSepKm: 900, cats: ["large_airport"] };
+  if (z <= 3) return { minScore: 1200000, minSepKm: 520, cats: ["large_airport"] };
+  if (z <= 4) return { minScore: 1000000, minSepKm: 300, cats: ["large_airport"] };
+  if (z <= 5) return { minScore: 850000, minSepKm: 180, cats: ["large_airport"] };
+  if (z <= 6) return { minScore: 600000, minSepKm: 110, cats: ["large_airport", "medium_airport"] };
+  if (z <= 7) return { minScore: 350000, minSepKm: 70, cats: ["large_airport", "medium_airport"] };
+  if (z <= 8) return { minScore: 150000, minSepKm: 28, cats: null };
+  if (z <= 9) return { minScore: 50000, minSepKm: 16, cats: null };
+  return { minScore: 0, minSepKm: 8, cats: null };
+}
+
+function airportPinStyle(iata) {
+  const onNetwork = airportNetwork.has(iata);
+  const isHub = airportHub && iata === airportHub;
+  if (isHub) {
+    return { radius: 7, color: "#5b21b6", weight: 2, fillColor: "#8b5cf6", fillOpacity: 0.95 };
+  }
+  if (onNetwork) {
+    return { radius: 6, color: "#1e40af", weight: 1.5, fillColor: "#3b82f6", fillOpacity: 0.95 };
+  }
+  return { radius: 4.5, color: "#6b7280", weight: 1.1, fillColor: "#9ca3af", fillOpacity: 0.92 };
+}
+
+/** Approx great-circle distance in km (good enough for metro declutter). */
+function airportSepKm(a, b) {
+  const toRad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * toRad;
+  const dLon = (b.lon - a.lon) * toRad;
+  const lat1 = a.lat * toRad;
+  const lat2 = b.lat * toRad;
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function selectAirportsForZoom(catalog, zoom) {
+  const policy = airportZoomPolicy(zoom);
+  // Fully zoomed in: show the whole catalog (canvas renderer handles the load).
+  if (policy.minScore <= 0 && policy.minSepKm <= 8) {
+    return catalog;
+  }
+  const accepted = [];
+
+  function tooClose(ap) {
+    for (let i = 0; i < accepted.length; i++) {
+      if (airportSepKm(ap, accepted[i]) < policy.minSepKm) return true;
+    }
+    return false;
+  }
+
+  function tryAccept(ap, force) {
+    if (!force && tooClose(ap)) return false;
+    accepted.push(ap);
+    return true;
+  }
+
+  // Network airports always win (even if clustered), then fill with largest others.
+  const network = [];
+  const others = [];
+  for (let i = 0; i < catalog.length; i++) {
+    const ap = catalog[i];
+    if (airportNetwork.has(ap.iata)) network.push(ap);
+    else others.push(ap);
+  }
+  network.sort((a, b) => b.score - a.score || a.iata.localeCompare(b.iata));
+  network.forEach((ap) => tryAccept(ap, true));
+
+  for (let i = 0; i < others.length; i++) {
+    const ap = others[i];
+    if (ap.score < policy.minScore) continue;
+    if (policy.cats && policy.cats.indexOf(ap.category) < 0) continue;
+    tryAccept(ap, false);
+  }
+  return accepted;
+}
+
+function syncAirportPin(ap) {
+  const iata = ap.iata;
+  const style = airportPinStyle(iata);
+  if (!airportPins[iata]) {
+    const marker = L.circleMarker([ap.lat, ap.lon], {
+      ...style,
+      pane: "airports",
+      renderer: airportRenderer || undefined,
+      className: "ap-pin",
+    }).addTo(airportLayer);
+    marker.bindTooltip(iata, {
+      permanent: false,
+      direction: "top",
+      offset: [0, -6],
+      className: "ap-pin-tip",
+    });
+    marker.bindPopup(() => airportPopupHtml(airportPins[iata].ap), {
+      maxWidth: 280,
+      className: "ap-pin-popup",
+      autoPan: true,
+    });
+    marker.on("popupopen", () => {
+      if (routeDraft && routeDraft.phase === "pick_dest") {
+        marker.closePopup();
+        return;
+      }
+      const root = marker.getPopup() && marker.getPopup().getElement();
+      const btn = root && root.querySelector(".ap-new-route-btn");
+      if (!btn) return;
+      btn.onclick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startNewRouteDraft(btn.getAttribute("data-origin") || iata);
+      };
+    });
+    marker.on("click", (ev) => {
+      if (ev && ev.originalEvent) L.DomEvent.stopPropagation(ev.originalEvent);
+      if (routeDraft && routeDraft.phase === "pick_dest") {
+        pickDraftDestination(iata);
+        marker.closePopup();
+        return;
+      }
+      selectAirportRoutes(iata, marker);
+    });
+    marker.on("popupclose", () => {
+      if (routeDraft) return;
+      if (selectedAirportIata === iata) clearAirportRouteSelection();
+    });
+    airportPins[iata] = { marker, ap };
+  } else {
+    airportPins[iata].ap = ap;
+    airportPins[iata].marker.setLatLng([ap.lat, ap.lon]);
+    airportPins[iata].marker.setStyle(style);
+    if (!airportLayer.hasLayer(airportPins[iata].marker)) {
+      airportLayer.addLayer(airportPins[iata].marker);
+    }
+  }
+}
+
+function refreshAirportPins() {
+  if (!airportLayer || !mapInst || !airportCatalog) return;
+  const visible = selectAirportsForZoom(airportCatalog, mapInst.getZoom());
+  const seen = {};
+  visible.forEach((ap) => {
+    seen[ap.iata] = true;
+    syncAirportPin(ap);
+  });
+  Object.keys(airportPins).forEach((iata) => {
+    if (!seen[iata]) {
+      airportLayer.removeLayer(airportPins[iata].marker);
+      delete airportPins[iata];
+    }
+  });
+}
+
+function scheduleAirportPinRefresh() {
+  if (airportPinRefreshTimer) clearTimeout(airportPinRefreshTimer);
+  airportPinRefreshTimer = setTimeout(() => {
+    airportPinRefreshTimer = null;
+    refreshAirportPins();
+  }, 80);
+}
+
+function updateAirports(data) {
+  airportHub = String((data.airline && data.airline.home_hub_iata) || "").toUpperCase();
+  const net = new Set();
+  if (airportHub) net.add(airportHub);
+  (data.network_iatas || []).forEach((code) => {
+    const c = String(code || "").toUpperCase();
+    if (c) net.add(c);
+  });
+  airportNetwork = net;
+  ensureAirportCatalog()
+    .then(() => refreshAirportPins())
+    .catch((err) => toast(err.message || "Airport map failed to load"));
+}
+
 function updateFlights(data) {
   const seen = {};
   const bounds = [];
@@ -2242,7 +2968,11 @@ function animate() {
     if (pos) f.marker.setLatLng(pos);
     const flying = p > 0.002 && p < 0.998;
     f.marker.setStyle({ fillOpacity: flying || f.player ? 1 : 0.45, radius: f.player ? (flying ? 9 : 7) : 5 });
-    f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
+    if (selectedAirportIata) {
+      f.line.setStyle({ opacity: f.player ? 0.18 : 0.08 });
+    } else {
+      f.line.setStyle({ opacity: flying ? (f.player ? 0.95 : 0.55) : (f.player ? 0.45 : 0.2) });
+    }
   });
   requestAnimationFrame(animate);
 }
@@ -2257,6 +2987,8 @@ function initMap() {
     toast("Geodesic plugin failed to load — Pacific routes may draw the long way.");
   }
   mapInst = L.map("map", { worldCopyJump: true, zoomControl: false });
+  mapInst.createPane("airports");
+  mapInst.getPane("airports").style.zIndex = 405;
   mapInst.createPane("routes");
   mapInst.getPane("routes").style.zIndex = 410;
   mapInst.createPane("aircraft");
@@ -2267,9 +2999,28 @@ function initMap() {
     noWrap: false,
     attribution: "&copy; OpenStreetMap",
   }).addTo(mapInst);
+  airportRenderer = L.canvas({ pane: "airports" });
+  airportLayer = L.layerGroup().addTo(mapInst);
   lineLayer = L.layerGroup().addTo(mapInst);
+  airportRouteLayer = L.layerGroup().addTo(mapInst);
+  airportDraftLayer = L.layerGroup().addTo(mapInst);
   acLayer = L.layerGroup().addTo(mapInst);
   mapInst.setView([20, 10], 3);
+  mapInst.on("zoomend", scheduleAirportPinRefresh);
+  mapInst.on("click", () => {
+    if (routeDraft && routeDraft.phase === "pick_dest") {
+      clearRouteDraft();
+      toast("New route cancelled");
+      return;
+    }
+    if (selectedAirportIata) clearAirportRouteSelection();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && routeDraft) {
+      clearRouteDraft();
+      toast("New route cancelled");
+    }
+  });
   requestAnimationFrame(() => mapInst.invalidateSize());
   animate();
 }
@@ -2278,15 +3029,23 @@ async function loadMap() {
   try { initMap(); } catch (err) { toast(err.message); return; }
   if (!mapInst) return;
   const seq = ++mapLoadSeq;
-  const data = await api("/api/flight-map.json");
-  if (seq !== mapLoadSeq) return;
-  syncMapClock(data);
-  updateFlights(data);
+  try {
+    const data = await api("/api/flight-map.json");
+    if (seq !== mapLoadSeq) return;
+    syncMapClock(data);
+    updateAirports(data);
+    updateFlights(data);
+  } catch (err) {
+    // Don't let the HUD keep racing while the sim/API is stuck.
+    freezeMapClock();
+    throw err;
+  }
 }
 
 function mapPollIntervalMs() {
   const sp = mapClock.speed || 0;
-  if (sp >= 20) return 500;
+  if (sp >= 60) return 250;
+  if (sp >= 20) return 400;
   if (sp >= 4) return 800;
   return 1500;
 }

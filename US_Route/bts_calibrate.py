@@ -406,8 +406,8 @@ def print_report(
 
     # Mode B calibration preview (target_share from CSV default 0.90, pdm=9, seg 2/3.5)
     eff = 0.30 * 9.0 * 2.0 + 0.70 * 9.0 * 3.5
-    cal_k = 0.90 / eff
-    print(f"\nCalibration preview (base_total = anchor_weekly × {cal_k:.4f}, share=0.90):")
+    cal_k = 1.30 / eff
+    print(f"\nCalibration preview (base_total = anchor_weekly × {cal_k:.4f}, share=1.30):")
     for od in checks:
         hit = by_od.get(od)
         if hit:

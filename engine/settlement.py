@@ -459,7 +459,14 @@ def _retry_ai_turn_only(completed_game_week: int) -> Dict[str, Any]:
             push_news(f"⚠ Week {gw} AI turn still incomplete ({ai_errors} errors) — will retry")
         except Exception:
             pass
-    return {"game_week": gw, "ai_turn": ai_result, "ai_errors": ai_errors}
+    # Economics already applied — treat as a no-op settlement for cash/ledger callers.
+    return {
+        "skipped": True,
+        "reason": "cash_already_applied",
+        "game_week": gw,
+        "ai_turn": ai_result,
+        "ai_errors": ai_errors,
+    }
 
 
 def catch_up_missing_settlements(*, limit: Optional[int] = None) -> Dict[str, Any]:

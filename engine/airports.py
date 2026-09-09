@@ -126,6 +126,50 @@ def list_airports_by_category(category):
     return [get_airport(airport['iata']) for airport in airports]
 
 
+_map_catalog_cache = None
+
+
+def list_airports_for_map(force_refresh: bool = False):
+    """
+    Full airport catalog for the live map (lat/lon + size fields).
+
+    Cached in-process — airport seed data does not change during a save.
+    """
+    global _map_catalog_cache
+    if _map_catalog_cache is not None and not force_refresh:
+        return _map_catalog_cache
+    rows = db.fetch_all(
+        """
+        SELECT iata, icao, name, city, country, lat, lon,
+               runway_length_ft, gate_count, timezone, score, category
+        FROM airports
+        ORDER BY score DESC, iata
+        """
+    ) or []
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "iata": row["iata"],
+                "icao": row["icao"],
+                "name": row["name"],
+                "city": row["city"],
+                "country": row["country"],
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"]),
+                "runway_length_ft": int(row["runway_length_ft"])
+                if row["runway_length_ft"] is not None
+                else None,
+                "gate_count": int(row["gate_count"]) if row["gate_count"] is not None else None,
+                "timezone": row["timezone"],
+                "score": int(row["score"] or 0),
+                "category": row["category"],
+            }
+        )
+    _map_catalog_cache = out
+    return out
+
+
 def display_airport_info(iata):
     """Display detailed airport information."""
     airport = get_airport(iata.upper())

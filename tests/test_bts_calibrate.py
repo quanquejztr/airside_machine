@@ -102,7 +102,7 @@ class TestBtsDbLoad(unittest.TestCase):
 
             self.assertAlmostEqual(
                 float(db.get_financial_constant("bts_target_market_share") or 0),
-                0.90,
+                1.30,
                 places=2,
             )
             # The floor keeps ultra-thin OD pairs flyable without inventing markets.

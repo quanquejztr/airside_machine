@@ -143,26 +143,30 @@ def price_factor(fare, segment, base_fare):
         segment: 'business' or 'leisure'
     
     Returns:
-        float: Demand multiplier based on price (clamped 0.05 to 2.0)
+        float: Demand multiplier based on price. The elasticity term is clamped to
+        0.05..2.0, but fares above 4× reference then decay without a floor, so
+        revenue cannot grow without bound (see below).
     """
     if fare <= 0 or base_fare <= 0:
         return 1.0
-    
+
     price_ratio = base_fare / fare
-    
+
     if segment == 'business':
         elasticity = 0.3
     elif segment == 'leisure':
         elasticity = 1.2
     else:
         elasticity = 0.5
-    
-    factor = price_ratio ** elasticity
+
+    factor = max(0.05, min(2.0, price_ratio ** elasticity))
     # Collapse demand above 4× reference so monopoly fares do not grow revenue forever.
-    extra = 1.0
+    # This must be applied AFTER the clamp: folding it in before meant the 0.05 floor
+    # swallowed it, demand stopped responding to price above ~8× reference, and gross
+    # revenue (fare × a fixed passenger count) then scaled linearly with fare forever.
     if fare > 4.0 * base_fare:
-        extra = (4.0 * base_fare / fare) ** 2.0
-    return max(0.05, min(2.0, factor * extra))
+        factor *= (4.0 * base_fare / fare) ** 2.0
+    return factor
 
 
 def preview_weekly_demand_before_open(origin_airport, dest_airport, distance_nm, game_week=None, current_month=None):

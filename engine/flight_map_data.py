@@ -72,7 +72,8 @@ def _airports_for_iatas(iatas: Set[str]) -> Dict[str, Dict[str, Any]]:
         if not code:
             continue
         cached = _airport_geo.get(code)
-        if cached:
+        # Require enriched fields so older cache entries get refreshed.
+        if cached and "runway_length_ft" in cached:
             found[code] = cached
         else:
             missing.append(code)
@@ -80,16 +81,26 @@ def _airports_for_iatas(iatas: Set[str]) -> Dict[str, Dict[str, Any]]:
         chunk = missing[i : i + 400]
         ph = ",".join("?" * len(chunk))
         for row in db.fetch_all(
-            f"SELECT iata, name, city, country, lat, lon FROM airports WHERE iata IN ({ph})",
+            f"""
+            SELECT iata, icao, name, city, country, lat, lon,
+                   runway_length_ft, gate_count, timezone, score, category
+            FROM airports WHERE iata IN ({ph})
+            """,
             tuple(chunk),
         ) or []:
             rec = {
                 "iata": row["iata"],
+                "icao": row["icao"],
                 "name": row["name"],
                 "city": row["city"],
                 "country": row["country"],
                 "lat": float(row["lat"]),
                 "lon": float(row["lon"]),
+                "runway_length_ft": int(row["runway_length_ft"]) if row["runway_length_ft"] is not None else None,
+                "gate_count": int(row["gate_count"]) if row["gate_count"] is not None else None,
+                "timezone": row["timezone"],
+                "score": int(row["score"]) if row["score"] is not None else None,
+                "category": row["category"],
             }
             _airport_geo[str(row["iata"])] = rec
             found[str(row["iata"])] = rec
@@ -104,17 +115,25 @@ def get_flight_map_payload() -> Dict[str, Any]:
     """
     gs = db.fetch_one("SELECT game_hours_elapsed, speed_multiplier FROM game_state WHERE id = 1")
     clock_alive = False
+    clock_stalled = False
     try:
         from engine.clock import get_api_clock_status, get_display_game_hours
 
         clock = get_api_clock_status()
-        current_game_hour = float(clock.get("current_game_hour") or get_display_game_hours())
+        live = clock.get("current_game_hour")
+        current_game_hour = float(live) if live is not None else float(get_display_game_hours())
+        # The HUD calendar is driven by committed hours; sending the interpolated
+        # value under this key made the browser paint a week ahead of the save.
+        committed = clock.get("committed_game_hour")
+        committed_game_hour = float(committed) if committed is not None else current_game_hour
         game_week = int(clock.get("current_week") or 1)
         speed = int(clock.get("speed_multiplier") or 0)
         real_s = float(clock.get("real_seconds_per_game_hour") or 30)
         clock_alive = bool(clock.get("clock_alive"))
+        clock_stalled = bool(clock.get("clock_stalled"))
     except Exception:
         current_game_hour = float(gs["game_hours_elapsed"] or 0.0) if gs else 0.0
+        committed_game_hour = current_game_hour
         game_week = int(current_game_hour // 168) + 1 if gs else 1
         speed = 0
         real_s = 30.0
@@ -177,6 +196,7 @@ def get_flight_map_payload() -> Dict[str, Any]:
         visible_ai_rows = []
 
     iatas: Set[str] = set()
+    network_iatas: Set[str] = set()
     for row in fleet_rows or []:
         ca = row["current_airport_iata"]
         if ca:
@@ -187,6 +207,34 @@ def get_flight_map_payload() -> Dict[str, Any]:
     for row in visible_ai_rows:
         iatas.add(str(row["origin_iata"]))
         iatas.add(str(row["dest_iata"]))
+    # Always pin the player hub + open player routes so airports stay clickable
+    # even when no legs are airborne this hour.
+    try:
+        hub = db.fetch_one("SELECT home_hub_iata FROM airline WHERE id = 1")
+        if hub and hub["home_hub_iata"]:
+            code = str(hub["home_hub_iata"]).upper()
+            iatas.add(code)
+            network_iatas.add(code)
+    except Exception:
+        pass
+    try:
+        for r in db.fetch_all(
+            """
+            SELECT r.origin_iata, r.dest_iata
+            FROM player_routes pr
+            JOIN routes r ON r.route_id = pr.route_id
+            """
+        ) or []:
+            if r["origin_iata"]:
+                code = str(r["origin_iata"]).upper()
+                iatas.add(code)
+                network_iatas.add(code)
+            if r["dest_iata"]:
+                code = str(r["dest_iata"]).upper()
+                iatas.add(code)
+                network_iatas.add(code)
+    except Exception:
+        pass
 
     airports = _airports_for_iatas(iatas)
 
@@ -308,12 +356,15 @@ def get_flight_map_payload() -> Dict[str, Any]:
     return {
         "ok": True,
         "game_week": game_week,
-        "game_hours_elapsed": current_game_hour,
+        "game_hours_elapsed": committed_game_hour,
+        "committed_game_hour": committed_game_hour,
         "current_game_hour": current_game_hour,
         "speed_multiplier": speed,
         "real_seconds_per_game_hour": real_s,
         "clock_alive": clock_alive,
+        "clock_stalled": clock_stalled,
         "airline": airline,
+        "network_iatas": sorted(network_iatas),
         "airports": airports,
         "fleet": fleet,
         "segments": segments,

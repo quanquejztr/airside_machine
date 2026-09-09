@@ -3,8 +3,9 @@ Runway slot caps (hourly movements), independent of apron/gate concurrency.
 
 Stage 1: JFK, LHR, HND, IAD, DCA, DXB, PEK, ICN, LAX, SIN, SYD, TPE, HKG, CDG.
 
-Game-scale declared_hourly_cap (4–7 movements/hour). Real IATA Level-3 caps
-(60–90/hr) would never bind with this sim's traffic.
+Game-scale declared_hourly_cap (all Stage-1 airports start at 26 movements/hour).
+Real IATA Level-3 caps (60–90/hr) would rarely bind with this sim's traffic; 26/hr
+still allows congestion at peak banks without locking starters out of their hub.
 """
 
 from __future__ import annotations
@@ -17,20 +18,20 @@ from db import db
 
 
 STAGE1_SLOT_AIRPORTS: Dict[str, int] = {
-    "JFK": 6,
-    "LHR": 6,
-    "HND": 5,
-    "IAD": 5,
-    "DCA": 4,
-    "DXB": 7,
-    "PEK": 6,
-    "ICN": 6,
-    "LAX": 6,
-    "SIN": 6,
-    "SYD": 5,
-    "TPE": 5,
-    "HKG": 6,
-    "CDG": 6,
+    "JFK": 26,
+    "LHR": 26,
+    "HND": 26,
+    "IAD": 26,
+    "DCA": 26,
+    "DXB": 26,
+    "PEK": 26,
+    "ICN": 26,
+    "LAX": 26,
+    "SIN": 26,
+    "SYD": 26,
+    "TPE": 26,
+    "HKG": 26,
+    "CDG": 26,
 }
 
 _MISSING_AIRPORTS = {
@@ -190,6 +191,18 @@ def seed_slot_controlled_airports() -> None:
             """,
             (iata, int(cap)),
         )
+        # Raise caps on existing saves when STAGE1 values increase (INSERT OR IGNORE
+        # alone would leave stale low caps forever).
+        db.execute(
+            """
+            UPDATE slot_controlled_airports
+            SET declared_hourly_cap = ?
+            WHERE iata = ?
+              AND COALESCE(declared_hourly_cap, 0) < ?
+              AND slot_season != 'OPEN'
+            """,
+            (int(cap), iata, int(cap)),
+        )
 
 
 def is_slot_controlled(iata: str) -> bool:
@@ -280,11 +293,16 @@ def check_slot_available(
     return (current < cap, current, cap)
 
 
-def assert_player_slots_for_new_segments(game_week: int, segments: list[dict]) -> None:
+def assert_player_slots_for_new_segments(
+    game_week: int, segments: list[dict], *, ferry: bool = False
+) -> None:
     """
     Pre-insert check: existing live movements + these planned extras must stay under
     the hourly cap AND the player's weekly purchased quota at slot-controlled airports.
     segments: origin_iata, dest_iata, dep_abs, arr_abs.
+
+    ferry=True skips the weekly purchased-quota check (repositioning is not commercial
+    service) but still enforces the airport's declared hourly movement cap.
     """
     gw = int(game_week)
     grandfather_historic_slot_holdings(gw)
@@ -310,6 +328,8 @@ def assert_player_slots_for_new_segments(game_week: int, segments: list[dict]) -
                 f"{ap} is full at hour {ch} ({cur}/{cap} movements; this schedule adds {n}). "
                 f"Pick a different departure time."
             )
+    if ferry:
+        return
     for ap, n in extra_ap.items():
         held = slots_held(ap, "PLAYER", gw)
         used = int(sum(hourly_movements_at(ap, gw, holder_id="PLAYER").values()))

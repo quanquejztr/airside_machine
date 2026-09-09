@@ -89,13 +89,19 @@ def _assert_new_segment_airport_limits(
     segs: list,
     *,
     replace_tails: bool = True,
+    ferry: bool = False,
 ) -> None:
-    """Gate concurrency and slot hourly caps. Raises ValueError on failure."""
+    """Gate concurrency and slot hourly caps. Raises ValueError on failure.
+
+    ferry=True: repositioning legs skip gate-allocation and weekly slot-quota
+    checks (aircraft already sits at the spoke). Hourly runway capacity still applies.
+    """
     from engine.gates import assert_player_gate_capacity_for_new_segments as _assert_gates
     from engine.slots import assert_player_slots_for_new_segments
 
-    _assert_gates(int(game_week), segs, replace_tails=replace_tails)
-    assert_player_slots_for_new_segments(int(game_week), segs)
+    if not ferry:
+        _assert_gates(int(game_week), segs, replace_tails=replace_tails)
+    assert_player_slots_for_new_segments(int(game_week), segs, ferry=ferry)
 
 
 def _assert_incremental_spawn_airport_limits(game_week: int, segs: list) -> None:
