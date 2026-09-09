@@ -162,6 +162,14 @@ class _World:
         db._migrations_done = False
 
     def close(self):
+        # Stop the clock BEFORE restoring DB_FILE. A clock thread that outlives the
+        # world would otherwise persist its temp-world hour (near 0) into whatever
+        # DB_FILE points at next — which is the player's real save.
+        try:
+            from engine.clock import stop_game_clock
+            stop_game_clock()
+        except Exception:
+            pass
         if self.db is not None:
             reset_db_connection(self.db)
             self.db.DB_FILE = self._orig

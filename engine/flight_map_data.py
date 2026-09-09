@@ -115,17 +115,25 @@ def get_flight_map_payload() -> Dict[str, Any]:
     """
     gs = db.fetch_one("SELECT game_hours_elapsed, speed_multiplier FROM game_state WHERE id = 1")
     clock_alive = False
+    clock_stalled = False
     try:
         from engine.clock import get_api_clock_status, get_display_game_hours
 
         clock = get_api_clock_status()
-        current_game_hour = float(clock.get("current_game_hour") or get_display_game_hours())
+        live = clock.get("current_game_hour")
+        current_game_hour = float(live) if live is not None else float(get_display_game_hours())
+        # The HUD calendar is driven by committed hours; sending the interpolated
+        # value under this key made the browser paint a week ahead of the save.
+        committed = clock.get("committed_game_hour")
+        committed_game_hour = float(committed) if committed is not None else current_game_hour
         game_week = int(clock.get("current_week") or 1)
         speed = int(clock.get("speed_multiplier") or 0)
         real_s = float(clock.get("real_seconds_per_game_hour") or 30)
         clock_alive = bool(clock.get("clock_alive"))
+        clock_stalled = bool(clock.get("clock_stalled"))
     except Exception:
         current_game_hour = float(gs["game_hours_elapsed"] or 0.0) if gs else 0.0
+        committed_game_hour = current_game_hour
         game_week = int(current_game_hour // 168) + 1 if gs else 1
         speed = 0
         real_s = 30.0
@@ -348,11 +356,13 @@ def get_flight_map_payload() -> Dict[str, Any]:
     return {
         "ok": True,
         "game_week": game_week,
-        "game_hours_elapsed": current_game_hour,
+        "game_hours_elapsed": committed_game_hour,
+        "committed_game_hour": committed_game_hour,
         "current_game_hour": current_game_hour,
         "speed_multiplier": speed,
         "real_seconds_per_game_hour": real_s,
         "clock_alive": clock_alive,
+        "clock_stalled": clock_stalled,
         "airline": airline,
         "network_iatas": sorted(network_iatas),
         "airports": airports,

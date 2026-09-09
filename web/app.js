@@ -32,6 +32,9 @@ const mapClock = {
   alive: true,
   serverHour: 0,
   serverAt: 0,
+  committedHour: 0,
+  committedAt: 0,
+  stalled: false,
 };
 const seenNoticeIds = new Set();
 let mapLoadSeq = 0;
@@ -48,23 +51,34 @@ function syncMapClock(src) {
     mapClock.serverHour = incoming;
     mapClock.serverAt = performance.now();
   }
+  // Only an explicit committed stamp may move the HUD calendar. Falling back to
+  // game_hours_elapsed let payloads that alias it to the interpolated hour push the
+  // HUD a week ahead, which is what made the clock flip between two times.
+  if (src.committed_game_hour != null) {
+    const committed = Number(src.committed_game_hour);
+    if (Number.isFinite(committed)) {
+      mapClock.committedHour = committed;
+      mapClock.committedAt = performance.now();
+    }
+  }
   if (src.speed_multiplier != null) mapClock.speed = Number(src.speed_multiplier);
   if (src.real_seconds_per_game_hour) mapClock.realSecPerHour = Number(src.real_seconds_per_game_hour);
   if (src.clock_alive != null) mapClock.alive = Boolean(src.clock_alive);
+  if (src.clock_stalled != null) mapClock.stalled = Boolean(src.clock_stalled);
   mapClock.at = performance.now();
   scheduleMapPoll();
 }
 
 function liveGameHour() {
-  if (mapClock.alive === false) return mapClock.hour;
+  if (mapClock.alive === false || mapClock.stalled) return mapClock.hour;
   const now = performance.now();
   const elapsed = (now - (mapClock.at || now)) / 1000;
   const raw = mapClock.hour + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
   // Cap runaway extrapolation while a poll is hung (common at 60× + DB lock).
-  // Allow at most ~2 real seconds of predicted advance beyond the last server stamp.
+  // Allow at most ~1 real second of predicted advance beyond the last server stamp.
   if (mapClock.serverAt) {
     const sinceServer = (now - mapClock.serverAt) / 1000;
-    const maxAhead = ((Math.min(sinceServer, 2.0) / (mapClock.realSecPerHour || 30))
+    const maxAhead = ((Math.min(sinceServer, 1.0) / (mapClock.realSecPerHour || 30))
       * (mapClock.speed || 0));
     const ceiling = mapClock.serverHour + maxAhead;
     if (Number.isFinite(ceiling)) return Math.min(raw, ceiling);
@@ -72,18 +86,46 @@ function liveGameHour() {
   return raw;
 }
 
+/** HUD calendar from committed hours — never paints a week ahead of the save. */
+function hudGameHour() {
+  // A stalled server clock is not advancing, so neither should the HUD.
+  if (mapClock.alive === false || mapClock.stalled) {
+    return mapClock.committedHour || mapClock.hour;
+  }
+  const committed = Number.isFinite(mapClock.committedHour) ? mapClock.committedHour : mapClock.hour;
+  const now = performance.now();
+  const baseAt = mapClock.committedAt || mapClock.at || now;
+  const elapsed = (now - baseAt) / 1000;
+  const raw = committed + (elapsed / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  const since = mapClock.committedAt ? (now - mapClock.committedAt) / 1000 : elapsed;
+  const maxAhead = (Math.min(since, 1.0) / (mapClock.realSecPerHour || 30)) * (mapClock.speed || 0);
+  let live = Math.min(raw, committed + maxAhead);
+  const committedWeek = Math.floor(committed / 168) + 1;
+  const liveWeek = Math.floor(live / 168) + 1;
+  if (liveWeek > committedWeek) {
+    // Hold at end of the committed week until the server persists the rollover.
+    live = committedWeek * 168 - 1e-6;
+  }
+  return live;
+}
+
 function freezeMapClock() {
   mapClock.hour = liveGameHour();
+  mapClock.committedHour = hudGameHour();
   mapClock.speed = 0;
   mapClock.alive = false;
   mapClock.at = performance.now();
+  mapClock.committedAt = mapClock.at;
 }
 
 function applyClockSpeed(speed) {
   const hour = mapClock.at ? liveGameHour() : mapClock.hour;
+  const committed = mapClock.committedAt ? hudGameHour() : (mapClock.committedHour || hour);
   mapClock.hour = hour;
+  mapClock.committedHour = committed;
   mapClock.speed = Number(speed) || 0;
   mapClock.at = performance.now();
+  mapClock.committedAt = mapClock.at;
 }
 
 function formatHudTime(ghe, speed) {
@@ -103,7 +145,7 @@ function formatHudTime(ghe, speed) {
 function paintHudTime() {
   const el = $("#hud-time");
   if (!el) return;
-  if (mapClock.at) el.textContent = formatHudTime(liveGameHour(), mapClock.speed);
+  if (mapClock.at) el.textContent = formatHudTime(hudGameHour(), mapClock.speed);
   else if (lastState && lastState.clock && lastState.clock.time_display) el.textContent = lastState.clock.time_display;
 }
 
