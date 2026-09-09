@@ -17,6 +17,7 @@ Design rules:
 from __future__ import annotations
 
 import csv
+import json
 import os
 import shutil
 import sqlite3
@@ -2522,12 +2523,19 @@ class TestSpawnIdempotency(unittest.TestCase):
 
         from engine.gates import _gate_intervals_at_airport, peak_concurrency, _upsert_allocation
 
-        with TempSave() as db:
-            db.ensure_schema_migrations()
-            rt = db.fetch_one("SELECT route_id, origin_iata, dest_iata FROM routes LIMIT 1")
-            if not rt:
-                self.skipTest("need a route")
-            route_id = str(rt["route_id"])
+        # FreshGame, not a copy of the developer's live save. This asserts an exact peak,
+        # so it needs a world with no other traffic at the airport; against a real save it
+        # measured whatever that save happened to have parked there (55 segments at ATL in
+        # week 1, in one instance) and failed for reasons unrelated to duplicate rows.
+        with FreshGame(hub="TPA") as db:
+            dests = near_airports(db.db, "TPA", min_nm=200, max_nm=1100, limit=10)
+            if not dests:
+                self.skipTest("need a destination")
+            route_id = db.open_route("TPA", dests[0])
+            rt = db.fetch_one(
+                "SELECT route_id, origin_iata, dest_iata FROM routes WHERE route_id = ?",
+                (route_id,),
+            )
             oi = str(rt["origin_iata"]).upper()
             di = str(rt["dest_iata"]).upper()
             _upsert_allocation(oi, "PLAYER", 2, effective_week=1)
@@ -2552,6 +2560,457 @@ class TestSpawnIdempotency(unittest.TestCase):
                 )
             peak = peak_concurrency(_gate_intervals_at_airport(oi, 1))
             self.assertEqual(1, peak)
+
+
+# ---------------------------------------------------------------------------
+# Airport reference data: US timezones
+# ---------------------------------------------------------------------------
+class TestAirportTimezones(unittest.TestCase):
+    """Alaska and Pacific names were effectively swapped by the generator's band table."""
+
+    EXPECTED = {
+        "ANC": "America/Anchorage",      # Anchorage was tagged Pacific/Honolulu
+        "FAI": "America/Anchorage",
+        "HNL": "Pacific/Honolulu",
+        "OGG": "Pacific/Honolulu",
+        "SFO": "America/Los_Angeles",    # the whole west coast was tagged Alaska time
+        "LAX": "America/Los_Angeles",
+        "SEA": "America/Los_Angeles",
+        "PDX": "America/Los_Angeles",
+        "DEN": "America/Denver",
+    }
+
+    def test_csv_timezones_are_correct(self):
+        with open(DATA / "airports.csv", newline="", encoding="utf-8") as f:
+            by_iata = {r["iata"]: r for r in csv.DictReader(f)}
+        for iata, tz in self.EXPECTED.items():
+            if iata in by_iata:
+                self.assertEqual(tz, by_iata[iata]["timezone"], f"{iata} timezone")
+
+    def test_generator_separates_alaska_from_hawaii(self):
+        """Longitude alone cannot: both lie far west, which is how the bug arose."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "process_airports", str(DATA / "process_airports.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        self.assertEqual((-9, "America/Anchorage"), mod.get_timezone(-149.996, 61.174))  # ANC
+        self.assertEqual((-10, "Pacific/Honolulu"), mod.get_timezone(-157.924, 21.319))  # HNL
+        self.assertEqual((-8, "America/Los_Angeles"), mod.get_timezone(-122.375, 37.619))  # SFO
+
+    def test_existing_saves_are_repaired_and_repair_is_idempotent(self):
+        from db.db import _repair_us_airport_timezones
+
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            # Re-introduce the old wrong values, then repair.
+            db.execute(
+                "UPDATE airports SET timezone='America/Anchorage'"
+                " WHERE country='US' AND lat < 50 AND lon BETWEEN -130 AND -117"
+            )
+            db.execute(
+                "UPDATE airports SET timezone='Pacific/Honolulu'"
+                " WHERE country='US' AND lat > 50 AND lon < -129"
+            )
+            _repair_us_airport_timezones()
+
+            def tz(iata):
+                row = db.fetch_one("SELECT timezone FROM airports WHERE iata = ?", (iata,))
+                return row["timezone"] if row else None
+
+            first = {i: tz(i) for i in ("ANC", "SFO", "SEA", "HNL")}
+            for iata, expected in self.EXPECTED.items():
+                if tz(iata) is not None:
+                    self.assertEqual(expected, tz(iata), f"{iata} after repair")
+
+            # Runs on every startup, so a second pass must not swap anything back.
+            _repair_us_airport_timezones()
+            _repair_us_airport_timezones()
+            self.assertEqual(first, {i: tz(i) for i in ("ANC", "SFO", "SEA", "HNL")})
+
+
+# ---------------------------------------------------------------------------
+# Departure-time suggestions for a drafted chain
+# ---------------------------------------------------------------------------
+class TestDepartureSuggestions(unittest.TestCase):
+    def _world(self):
+        from engine.gates import is_auctioned_airport
+
+        g = FreshGame(hub="TPA")
+        dests = [
+            a
+            for a in near_airports(g.db, "TPA", min_nm=200, max_nm=1100, limit=25, require_runway_ft=7500)
+            if not is_auctioned_airport(a)
+        ]
+        self.assertTrue(dests, "need a usable destination")
+        tail = g.buy("B738")
+        return g, tail, g.open_round_trip(dests[0])
+
+    def test_suggested_times_are_actually_creatable(self):
+        """The contract: anything suggested must be accepted by creation.
+
+        The suggester and create_chained_detailed_rotation share
+        assert_chain_plan_schedulable precisely so the two cannot drift apart.
+        """
+        import json as _json
+
+        from engine.scheduling import create_chained_detailed_rotation, suggest_departure_times
+
+        g, tail, trip = self._world()
+        with g:
+            days = _json.dumps(["SAT"])
+            create_chained_detailed_rotation(tail, list(trip), ["X1", "X2"], days, "09:00")
+            out = suggest_departure_times(
+                tail, list(trip), days, preferred_time="09:00", limit=3
+            )
+            self.assertTrue(out["suggestions"], "expected some workable time")
+            # Only the first: acting on a suggestion changes the schedule, so the rest
+            # were computed against a state that no longer holds. The contract is that a
+            # suggestion is creatable against the state it was computed from.
+            first = out["suggestions"][0]["departure_time"]
+            create_chained_detailed_rotation(tail, list(trip), ["", ""], days, first)
+
+    def test_blocked_time_is_not_suggested_and_carries_a_reason(self):
+        import json as _json
+
+        from engine.scheduling import create_chained_detailed_rotation, suggest_departure_times
+
+        g, tail, trip = self._world()
+        with g:
+            days = _json.dumps(["SAT"])
+            create_chained_detailed_rotation(tail, list(trip), ["X1", "X2"], days, "09:00")
+            out = suggest_departure_times(
+                tail, list(trip), days, preferred_time="09:00", limit=12, step_minutes=30
+            )
+            offered = {s["departure_time"] for s in out["suggestions"]}
+            self.assertNotIn("09:00", offered, "the occupied time must not be offered")
+            reasons = {r["departure_time"]: r["reason"] for r in out["rejected_sample"]}
+            self.assertTrue(reasons, "rejections must explain themselves")
+
+    def test_results_are_ranked_by_closeness_to_the_requested_time(self):
+        """Earliest-first would answer 00:00 to someone who asked for the afternoon."""
+        import json as _json
+
+        from engine.scheduling import suggest_departure_times
+
+        g, tail, trip = self._world()
+        with g:
+            out = suggest_departure_times(
+                tail, list(trip), _json.dumps(["SAT"]), preferred_time="14:00", limit=3
+            )
+            times = [s["departure_time"] for s in out["suggestions"]]
+            self.assertEqual("14:00", times[0], "an available preferred time comes first")
+            for t in times:
+                hh = int(t.split(":")[0])
+                self.assertLess(abs(hh - 14), 4, f"{t} is not near the requested 14:00")
+
+    def test_suggester_does_not_write_anything(self):
+        """It probes with read-only validators and placeholder flight numbers."""
+        import json as _json
+
+        from engine.scheduling import suggest_departure_times
+
+        g, tail, trip = self._world()
+        with g:
+            def counts():
+                return tuple(
+                    g.fetch_one(f"SELECT COUNT(*) c FROM {t}")["c"]
+                    for t in ("flight_segments", "flight_schedules", "weekly_rotations")
+                )
+
+            before = counts()
+            suggest_departure_times(tail, list(trip), _json.dumps(["SAT"]), limit=5)
+            self.assertEqual(before, counts(), "suggesting must not mutate the schedule")
+
+    def test_impossible_chain_reports_once_not_per_candidate(self):
+        import json as _json
+
+        from engine.scheduling import suggest_departure_times
+
+        g, tail, trip = self._world()
+        with g:
+            with self.assertRaises(ValueError):
+                # Reversed order does not connect, and no departure time can fix that.
+                suggest_departure_times(
+                    tail, [trip[1], trip[0]][::-1][:1] + [trip[0]], _json.dumps(["SAT"])
+                )
+
+
+# ---------------------------------------------------------------------------
+# Week-boundary handling: long chains that run past the end of their anchor week
+# ---------------------------------------------------------------------------
+class TestChainWeekOverflow(unittest.TestCase):
+    """A chain anchored late in the week finishes in the next one.
+
+    Legs used to be stamped with the anchor week and labelled SUN regardless, so gate
+    capacity compared them against the wrong week's traffic — accepting a schedule that
+    conflicted, then cancelling its later legs at the rollover.
+    """
+
+    LONGHAUL = [
+        ("TPA", "LHR", 4000), ("LHR", "SGN", 5800), ("SGN", "SIN", 590),
+        ("SIN", "JFK", 8270), ("JFK", "SFO", 2240), ("SFO", "SLC", 520),
+    ]
+
+    def _routes(self):
+        return [
+            {"route_id": f"{a}-{b}", "origin_iata": a, "dest_iata": b, "distance_nm": d}
+            for a, b, d in self.LONGHAUL
+        ]
+
+    def test_overflowing_legs_carry_their_own_week_and_weekday(self):
+        from engine.scheduling.rotation import _plan_chained_detailed_segments
+
+        with FreshGame(hub="TPA") as g:
+            routes = self._routes()
+            fns = [f"XX{i}" for i in range(len(routes))]
+            gw = 9
+            planned, _, _ = _plan_chained_detailed_segments(
+                gw, ["SAT"], "08:00", routes, fns, 490.0, 1.5
+            )
+            base = (gw - 1) * 168.0
+            spilled = [p for p in planned if p["dep_abs"] >= base + 168.0]
+            self.assertTrue(spilled, "a SAT-anchored 51h chain must run past the week end")
+            for p in planned:
+                self.assertEqual(
+                    int(p["dep_abs"] // 168.0) + 1,
+                    p["game_week"],
+                    "each leg must carry the week its own departure falls in",
+                )
+            # The old code clamped every overflowing leg's label to SUN.
+            self.assertTrue(
+                any(p["day"] != "SUN" for p in spilled),
+                "legs past the week end must get their real weekday, not a clamped SUN",
+            )
+
+    def test_day_label_uses_the_hour_not_a_clamped_week(self):
+        """The weekday comes from the hour itself, so overflow legs get their real day.
+
+        This previously subtracted the passed week's base and clamped the index to 0..6,
+        which labelled everything past the week end "SUN".
+        """
+        from engine.scheduling.time_helpers import _day_of_week_label
+
+        base = 8 * 168.0  # start of week 9
+        self.assertEqual("SAT", _day_of_week_label(9, base + 128.0))
+        # 172h into week 9 is Monday of week 10 — the clamp used to force SUN.
+        self.assertEqual("MON", _day_of_week_label(9, base + 172.0))
+        self.assertEqual("TUE", _day_of_week_label(9, base + 196.0))
+
+    def test_chain_longer_than_a_week_is_rejected(self):
+        from engine.scheduling.rotation import _plan_chained_detailed_segments
+
+        with FreshGame(hub="TPA") as g:
+            routes = [
+                {"route_id": f"L{i}", "origin_iata": "A", "dest_iata": "B", "distance_nm": 9000}
+                for i in range(20)
+            ]
+            with self.assertRaises(ValueError) as ctx:
+                _plan_chained_detailed_segments(
+                    9, ["MON"], "08:00", routes, [f"F{i}" for i in range(20)], 490.0, 1.5
+                )
+            self.assertIn("168", str(ctx.exception))
+
+    def test_gate_peak_counts_aircraft_by_absolute_time_not_week_tag(self):
+        """Two aircraft sharing a stand must be seen, even if one is tagged to another week.
+
+        Keying occupancy off the game_week label meant a mis-tagged leg was invisible to
+        the week it physically occupied, and both weeks reported a peak of 1.
+        """
+        import uuid
+
+        from engine.gates import _gate_intervals_at_airport, peak_concurrency
+
+        with FreshGame(hub="TPA") as g:
+            dests = near_airports(g.db, "TPA", min_nm=200, max_nm=1100, limit=10)
+            route_id = g.open_route("TPA", dests[0])
+            ap = "TPA"
+            hour = 9 * 168.0 + 35.0  # inside week 10
+            for tag_week, tail in ((9, "N-OVERFLOW"), (10, "N-NATIVE")):
+                g.execute(
+                    """
+                    INSERT INTO flight_segments (
+                        segment_id, game_week, day_of_week, tail_number, route_id,
+                        origin_iata, dest_iata, flight_number,
+                        scheduled_dep_time, scheduled_dep_game_hour,
+                        scheduled_arr_time, scheduled_arr_game_hour,
+                        baseline_dep_game_hour, baseline_arr_game_hour, turn_minutes,
+                        status, pax_business, pax_leisure, revenue_gross,
+                        excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee
+                    ) VALUES (?, ?, 'SUN', ?, ?, ?, ?, 'TST', '08:00', ?, '10:00', ?, ?, ?, 90,
+                              'SCHEDULED', 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    """,
+                    (str(uuid.uuid4()), tag_week, tail, route_id, ap, dests[0],
+                     hour, hour + 2.0, hour, hour + 2.0),
+                )
+            self.assertEqual(
+                2,
+                peak_concurrency(_gate_intervals_at_airport(ap, 10)),
+                "both aircraft occupy a week-10 stand regardless of their week tag",
+            )
+            self.assertEqual(
+                0,
+                peak_concurrency(_gate_intervals_at_airport(ap, 9)),
+                "neither flight occupies a stand during week 9",
+            )
+
+    def test_operating_days_rejects_unparseable_input(self):
+        """A bare day name used to become ["MON"], silently moving the whole rotation."""
+        from engine.scheduling.rotation import _operating_days_list
+
+        self.assertEqual(["WED"], _operating_days_list('["WED"]'))
+        self.assertEqual(7, len(_operating_days_list("DAILY")))
+        with self.assertRaises(ValueError):
+            _operating_days_list("SAT")
+        with self.assertRaises(ValueError):
+            _operating_days_list('["FUNDAY"]')
+
+
+# ---------------------------------------------------------------------------
+# Schedule stacking: add flights to an existing plan without clearing it first
+# ---------------------------------------------------------------------------
+class TestScheduleStacking(unittest.TestCase):
+    """A player must be able to add flights to an aircraft that already has a plan.
+
+    Standalone detailed lines used to be refused whenever the tail carried a chained
+    rotation, forcing a clear-and-rebuild. They now stack beside the chains in the same
+    `detailed_chained` blob.
+    """
+
+    def _world(self):
+        """Fresh game at TPA with a narrowbody and three non-auctioned round trips.
+
+        Non-auctioned destinations keep these tests about stacking rather than about
+        gate auctions, which would otherwise reject every leg for lack of allocation.
+        """
+        from engine.gates import is_auctioned_airport
+
+        g = FreshGame(hub="TPA")
+        dests = [
+            a
+            for a in near_airports(g.db, "TPA", min_nm=200, max_nm=1100, limit=25, require_runway_ft=7500)
+            if not is_auctioned_airport(a)
+        ]
+        self.assertGreaterEqual(len(dests), 3, "need three usable destinations")
+        tail = g.buy("B738")
+        trips = [g.open_round_trip(d) for d in dests[:3]]
+        return g, tail, trips
+
+    @staticmethod
+    def _days(*d):
+        return json.dumps(list(d))
+
+    def _rotation_blob(self, g, tail):
+        row = g.fetch_one("SELECT legs_json FROM weekly_rotations WHERE tail_number = ?", (tail,))
+        return json.loads(row["legs_json"]) if row and row["legs_json"] else {}
+
+    def test_stacking_and_respawn(self):
+        """Chains stack, a standalone line stacks beside them, and all survive respawn."""
+        # Deliberately does NOT import assert_detailed_line_addable: this test must fail
+        # with the old rejection if stacking ever regresses, not with an ImportError.
+        from engine.scheduling import (
+            create_chained_detailed_rotation,
+            create_flight_schedule,
+            merge_detailed_weekly_template,
+            spawn_rotation_segments_for_week,
+        )
+
+        g, tail, trips = self._world()
+        with g:
+            create_chained_detailed_rotation(
+                tail, list(trips[0]), ["TS100", "TS101"], self._days("MON"), "08:00"
+            )
+            create_chained_detailed_rotation(
+                tail, list(trips[1]), ["TS200", "TS201"], self._days("WED"), "08:00"
+            )
+            blob = self._rotation_blob(g, tail)
+            self.assertEqual("detailed_chained", blob.get("mode"))
+            self.assertEqual(2, len(blob.get("chains") or []), "chain must stack onto chain")
+
+            # The case that used to raise "already has a chained detailed rotation".
+            sched = create_flight_schedule(tail, trips[2][0], "TS300", self._days("FRI"), "08:00")
+            merge_detailed_weekly_template(tail, [sched["template_item"]], 1)
+
+            blob = self._rotation_blob(g, tail)
+            self.assertEqual(2, len(blob.get("chains") or []), "chains must be preserved")
+            self.assertEqual(1, len(blob.get("items") or []), "line must stack beside chains")
+            self.assertEqual(
+                5,
+                g.fetch_one(
+                    "SELECT COUNT(*) c FROM flight_segments WHERE tail_number = ? AND game_week = 1",
+                    (tail,),
+                )["c"],
+            )
+
+            # The subtle half: a stacked line that the chained spawn ignores would fly
+            # this week and then silently vanish at the next weekly respawn.
+            spawn_rotation_segments_for_week(2)
+            wk2 = g.fetch_all(
+                "SELECT origin_iata, dest_iata FROM flight_segments"
+                " WHERE tail_number = ? AND game_week = 2",
+                (tail,),
+            )
+            self.assertEqual(5, len(wk2), "2 chains x 2 legs + 1 stacked line must respawn")
+
+    def test_rejected_line_leaves_no_orphan_segment(self):
+        """create_flight_schedule writes rows, so incompatibility must be caught first.
+
+        Validating after the write left the rejected flight's segment orphaned in the
+        week — in no template, so invisible to respawn — and holding the slot, which made
+        the next attempt fail as an overlap.
+        """
+        from engine.scheduling import (
+            assign_rotation,
+            assert_detailed_line_addable,
+            create_flight_schedule,
+            merge_detailed_weekly_template,
+        )
+
+        g, tail, trips = self._world()
+        with g:
+            assign_rotation(tail, list(trips[0]))  # quick rotation — incompatible
+            before = g.fetch_one(
+                "SELECT COUNT(*) c FROM flight_segments WHERE tail_number = ?", (tail,)
+            )["c"]
+            with self.assertRaises(ValueError):
+                assert_detailed_line_addable(tail)
+                sched = create_flight_schedule(
+                    tail, trips[1][0], "TS900", self._days("FRI"), "08:00"
+                )
+                merge_detailed_weekly_template(tail, [sched["template_item"]], 1)
+            after = g.fetch_one(
+                "SELECT COUNT(*) c FROM flight_segments WHERE tail_number = ?", (tail,)
+            )["c"]
+            self.assertEqual(before, after, "rejected add must not leave an orphan segment")
+            self.assertEqual(
+                0,
+                g.fetch_one(
+                    "SELECT COUNT(*) c FROM flight_schedules WHERE tail_number = ?", (tail,)
+                )["c"],
+            )
+
+    def test_positioning_still_blocks_a_stranding_leg(self):
+        """Stacking must not weaken the position timeline check."""
+        from engine.scheduling import (
+            create_chained_detailed_rotation,
+            create_flight_schedule,
+            merge_detailed_weekly_template,
+        )
+
+        g, tail, trips = self._world()
+        with g:
+            create_chained_detailed_rotation(
+                tail, list(trips[0]), ["TS100", "TS101"], self._days("MON"), "08:00"
+            )
+            inbound = trips[1][1]  # departs the outstation, where the aircraft is not
+            with self.assertRaises(ValueError):
+                sched = create_flight_schedule(
+                    tail, inbound, "TS400", self._days("WED"), "08:00"
+                )
+                merge_detailed_weekly_template(tail, [sched["template_item"]], 1)
 
 
 # ---------------------------------------------------------------------------

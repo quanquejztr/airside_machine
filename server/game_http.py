@@ -385,6 +385,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/schedule/preview":
             self._send_json(api.preview_schedule(body))
             return
+        if path == "/api/schedule/suggest":
+            self._send_json(api.suggest_schedule_times(body))
+            return
         if path == "/api/schedule":
             self._send_json(api.assign_schedule(body))
             return

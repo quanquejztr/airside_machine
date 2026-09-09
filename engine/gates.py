@@ -311,6 +311,13 @@ def _gate_intervals_at_airport(
     ap = iata.upper().strip()
     gw = int(game_week)
     default_m = _default_turn_minutes()
+    # Stand occupancy is a function of absolute time, so select by the hours a flight
+    # actually occupies this week rather than by its game_week label. Keying off the
+    # label meant a leg mis-tagged to a neighbouring week — which every leg of a chain
+    # running past the week boundary used to be — was invisible to that week's capacity
+    # check, letting two aircraft share one stand with both weeks reporting a peak of 1.
+    w0 = float(gw - 1) * 168.0
+    w1 = w0 + 168.0
     rows = db.fetch_all(
         """
         SELECT
@@ -322,17 +329,24 @@ def _gate_intervals_at_airport(
             fs.turn_minutes AS turn_min
         FROM flight_segments fs
         JOIN routes r ON r.route_id = fs.route_id
-        WHERE fs.game_week = ?
-          AND fs.status != 'CANCELLED'
+        WHERE fs.status != 'CANCELLED'
           AND (COALESCE(fs.origin_iata, r.origin_iata) = ? OR COALESCE(fs.dest_iata, r.dest_iata) = ?)
+          AND (
+                (fs.scheduled_dep_game_hour >= ? AND fs.scheduled_dep_game_hour < ?)
+             OR (fs.scheduled_arr_game_hour >= ? AND fs.scheduled_arr_game_hour < ?)
+          )
         """,
-        (gw, ap, ap),
+        (ap, ap, w0, w1, w0, w1),
     )
     by_tail: dict[str, list[tuple[float, str, float]]] = {}
     planned_tail = "__PLANNED__"
 
     def _touch(tail: str, t: float, kind: str, mtt_h: float) -> None:
         if t <= 0 and kind == "A":
+            return
+        # Count each event in the week that contains it, so a visit straddling the
+        # boundary is not double-counted into both weeks.
+        if not (w0 <= float(t) < w1):
             return
         by_tail.setdefault(str(tail), []).append((float(t), kind, float(mtt_h)))
 
@@ -525,6 +539,19 @@ def assert_player_gate_capacity_for_new_segments(
         if di:
             airports.add(di)
 
+    # A chain anchored late in the week finishes in the next one, so its later legs
+    # occupy stands during a week this call was not asked about. Check every week the
+    # proposal actually touches; checking only `game_week` let those legs be validated
+    # against the wrong week's traffic and never against the right one.
+    weeks: set[int] = {gw}
+    for s in segments or []:
+        for key in ("dep_abs", "arr_abs"):
+            try:
+                t = float(s.get(key))
+            except (TypeError, ValueError):
+                continue
+            weeks.add(int(t // 168.0) + 1)
+
     for ap in sorted(airports):
         if not ap or not is_auctioned_airport(ap):
             continue
@@ -538,14 +565,15 @@ def assert_player_gate_capacity_for_new_segments(
                 for s in (segments or [])
                 if s.get("tail_number")
             } or None
-        peak = player_gate_peak_at_airport(
-            ap, gw, extra_segments=segments, exclude_tails=exclude_tails
-        )
-        if peak > cap:
-            raise ValueError(
-                f"Not enough concurrent gates at {ap}. Need peak {peak}, have {cap}. "
-                f"Bid for more gates or spread departures/arrivals out."
+        for wk in sorted(weeks):
+            peak = player_gate_peak_at_airport(
+                ap, wk, extra_segments=segments, exclude_tails=exclude_tails
             )
+            if peak > cap:
+                raise ValueError(
+                    f"Not enough concurrent gates at {ap}. Need peak {peak}, have {cap}. "
+                    f"Bid for more gates or spread departures/arrivals out."
+                )
 
 
 def assert_player_gate_capacity_for_week(game_week: int, airports: list[str] | None = None) -> None:

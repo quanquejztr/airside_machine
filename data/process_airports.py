@@ -217,9 +217,9 @@ def add_runway_lengths(input_file='top-500-airports.csv', output_file='us-airpor
 # STEP 3: ADD GATE COUNTS AND TIMEZONE
 # ============================================================================
 
+# Longitude bands for the contiguous US. Alaska and Hawaii are handled separately in
+# get_timezone(): both lie far west, so longitude alone cannot tell them apart.
 US_TIMEZONES = [
-    (-180, -130, -10, 'Pacific/Honolulu'),
-    (-130, -117, -8, 'America/Anchorage'),
     (-125, -114, -8, 'America/Los_Angeles'),
     (-114, -104, -7, 'America/Denver'),
     (-104, -90, -6, 'America/Chicago'),
@@ -227,10 +227,26 @@ US_TIMEZONES = [
 ]
 
 
-def get_timezone(longitude):
-    """Determine timezone based on longitude."""
+def get_timezone(longitude, latitude=None):
+    """Determine timezone from position.
+
+    Latitude separates Alaska from Hawaii. Without it the table had a -180..-130 band
+    named Pacific/Honolulu — which swallowed all of Alaska, tagging Anchorage itself as
+    Honolulu — and a -130..-117 band named America/Anchorage that shadowed the
+    Los_Angeles band, tagging the entire US west coast (LAX, SFO, SEA, PDX) as Alaska
+    time. The offsets were right; the names were effectively swapped.
+    """
+    lon = float(longitude)
+    lat = None if latitude is None else float(latitude)
+
+    if lat is not None:
+        if lat > 50.0 and lon < -129.0:
+            return -9, 'America/Anchorage'
+        if 15.0 <= lat <= 25.0 and -162.0 <= lon <= -152.0:
+            return -10, 'Pacific/Honolulu'
+
     for west, east, offset, tz_name in US_TIMEZONES:
-        if west <= longitude <= east:
+        if west <= lon <= east:
             return offset, tz_name
     return -5, 'America/New_York'
 
@@ -281,10 +297,11 @@ def add_gate_and_timezone(input_file='us-airports-with-runways.csv',
             stats['total'] += 1
             
             ident = row[1]
+            latitude = float(row[4])
             longitude = float(row[5])
-            
-            # Get timezone
-            tz_offset, tz_name = get_timezone(longitude)
+
+            # Get timezone (latitude distinguishes Alaska from Hawaii)
+            tz_offset, tz_name = get_timezone(longitude, latitude)
             
             # Get gate count
             gate_count = gates.get(ident, '')
