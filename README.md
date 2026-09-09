@@ -106,6 +106,10 @@ python3 -m unittest discover -s tests -v
 
 - Tri Cuong Luong — [luongtricuong2409@gmail.com](mailto:luongtricuong2409@gmail.com)
 
+## Co-authors
+
+- Manh Ha Tran - [mhaftran@gmail.com](mailto:mhaftran@gmail.com)
+
 ## License / status
 
 Personal / WIP simulation. Phases 0–12 are built; marketing (13) and onboarding (14) are not. See `docs/phase_implementation_detail.md`.
