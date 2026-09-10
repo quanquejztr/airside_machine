@@ -134,10 +134,20 @@ def _visit_intervals_for_tail_events(
 ) -> list[tuple[float, float]]:
     """
     One aircraft, one stand: merge arrival + departure at the same airport into a single
-    occupancy window [arr, dep + MTT) instead of double-counting deplaning and boarding.
+    occupancy window [arr, dep).
 
-    Each event is (time, 'A'|'D', mtt_hours). Departures use the scheduled leg turnaround;
-    orphan arrivals use their event mtt for a minimum hold.
+    The stand is held from touchdown to pushback, and nothing after. The turnaround is
+    already baked into the schedule — the rotation planner places each departure at
+    arrival + turn_minutes — so the window from arrival to departure *is* the turn. The
+    old model used [arr, dep + MTT), which added the turnaround a second time and left
+    every aircraft holding its stand for 45 minutes after it had taken off. That made
+    each visit twice its true length and manufactured collisions between tails that
+    never actually share a stand.
+
+    Each event is (time, 'A'|'D', mtt_hours). An orphan arrival — one whose departure
+    falls outside the window being measured — holds for its own mtt as a minimum. An
+    orphan departure is the mirror case: the aircraft was already parked, so the stand
+    was occupied for the turn *before* pushback, [dep - mtt, dep).
     """
     if not events:
         return []
@@ -155,10 +165,10 @@ def _visit_intervals_for_tail_events(
             open_mtt = mtt
         else:
             if open_arr is not None and t + 1e-9 >= open_arr:
-                out.append((open_arr, t + mtt))
+                out.append((open_arr, t))
                 open_arr = None
             else:
-                out.append((t, t + mtt))
+                out.append((t - mtt, t))
     if open_arr is not None:
         out.append((open_arr, open_arr + open_mtt))
     return out

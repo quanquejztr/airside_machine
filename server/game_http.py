@@ -272,6 +272,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/catalog/cabin":
             self._send_json(api.cabin_layout(q.get("type_id", "")))
             return
+        if path == "/api/hub-candidates":
+            self._send_json(api.hub_candidates(q.get("limit", ""), q.get("min_score", "")))
+            return
+        if path == "/api/hub-profile":
+            self._send_json(api.hub_profile(q.get("iata", "")))
+            return
+        if path == "/api/fleet/disposal-quote":
+            self._send_json(api.fleet_disposal_quote(q.get("tail", "")))
+            return
         if path == "/api/fleet":
             self._send_json(api.list_fleet())
             return
@@ -375,6 +384,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/fleet/reposition":
             self._send_json(api.reposition_aircraft(body))
+            return
+        if path == "/api/fleet/dispose":
+            self._send_json(api.dispose_aircraft(body))
+            return
+        if path == "/api/fleet/dispose/cancel":
+            self._send_json(api.cancel_aircraft_disposal(body))
             return
         if path == "/api/routes":
             self._send_json(api.open_player_route(body))

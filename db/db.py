@@ -570,6 +570,90 @@ def _add_column_if_missing(table: str, column: str, decl: str) -> None:
             raise
 
 
+def _load_airport_od_share() -> None:
+    """Fill airports.od_share — the share of traffic that starts or ends at the airport.
+
+    The demand anchors are segment traffic and so already count connecting passengers.
+    Without this column there is no way to tell a tourist city from a transit city: both
+    carry far more traffic than their local catchment explains, which is why comparing
+    actual traffic against a gravity model cannot separate them (Charlotte, at roughly
+    20% local, scores below Las Vegas at roughly 95%).
+
+    Airports missing from the CSV take od_share_default, which suits small and regional
+    fields where nearly all traffic is local.
+    """
+    _add_column_if_missing("airports", "od_share", "REAL")
+    try:
+        from db.seed import load_csv
+
+        rows = load_csv("airport_od_share.csv")
+    except Exception:
+        rows = []
+    for r in rows:
+        try:
+            iata = str(r.get("iata") or "").strip().upper()
+            share = float(r.get("od_share"))
+        except (TypeError, ValueError):
+            continue
+        if not iata or not (0.0 < share <= 1.0):
+            continue
+        execute("UPDATE airports SET od_share = ? WHERE iata = ?", (share, iata))
+
+    default = get_financial_constant("od_share_default")
+    default = 0.85 if default is None else float(default)
+    execute("UPDATE airports SET od_share = ? WHERE od_share IS NULL", (default,))
+
+
+def _add_fleet_disposal_columns() -> None:
+    """Columns for selling an aircraft and returning a lease early.
+
+    Depreciation needs inputs the fleet table never recorded: when the aircraft was
+    acquired, what was paid, and how much it has flown. `pending_disposal` cannot reuse
+    `fleet.status` — that column carries a CHECK constraint, and SQLite cannot alter one
+    without rebuilding the table.
+    """
+    _add_column_if_missing("fleet", "acquired_game_week", "INTEGER")
+    _add_column_if_missing("fleet", "purchase_price_paid", "REAL")
+    _add_column_if_missing("fleet", "total_airborne_hours", "REAL NOT NULL DEFAULT 0")
+    _add_column_if_missing("fleet", "pending_disposal", "TEXT")
+    _add_column_if_missing("fleet", "pending_disposal_week", "INTEGER")
+    _add_column_if_missing("week_ledger", "asset_sale_proceeds", "REAL NOT NULL DEFAULT 0")
+    _add_column_if_missing("week_ledger", "lease_return_penalties", "REAL NOT NULL DEFAULT 0")
+
+    # Backfill for aircraft that predate these columns. Hours come from flown history;
+    # acquisition week is approximated from the tail's earliest segment because nothing
+    # ever recorded it. Both only fill NULLs, so this is safe to re-run and never
+    # overwrites a value the game has since set properly.
+    execute(
+        """
+        UPDATE fleet SET purchase_price_paid = (
+            SELECT t.purchase_price FROM aircraft_types t WHERE t.type_id = fleet.type_id
+        )
+        WHERE purchase_price_paid IS NULL
+        """
+    )
+    execute(
+        """
+        UPDATE fleet SET acquired_game_week = COALESCE(
+            (SELECT MIN(fs.game_week) FROM flight_segments fs
+              WHERE fs.tail_number = fleet.tail_number),
+            1
+        )
+        WHERE acquired_game_week IS NULL
+        """
+    )
+    execute(
+        """
+        UPDATE fleet SET total_airborne_hours = COALESCE((
+            SELECT SUM(fs.scheduled_arr_game_hour - fs.scheduled_dep_game_hour)
+              FROM flight_segments fs
+             WHERE fs.tail_number = fleet.tail_number AND fs.status = 'LANDED'
+        ), 0)
+        WHERE total_airborne_hours = 0
+        """
+    )
+
+
 def _repair_us_airport_timezones() -> None:
     """Undo the swapped Alaska / Pacific timezone names in existing saves.
 
@@ -594,6 +678,59 @@ def _repair_us_airport_timezones() -> None:
         UPDATE airports SET timezone = 'America/Anchorage'
         WHERE country = 'US' AND timezone = 'Pacific/Honolulu' AND lat > 50
         """
+    )
+
+
+def _repair_slot_allocation_carry_forward() -> None:
+    """Restore slot entitlements that were re-baselined at a week flip.
+
+    ``grandfather_historic_slot_holdings`` used to grant "movements flown so far this
+    week" to any holder with no row for the current week, and settlement's carry-forward
+    used INSERT OR IGNORE, so it could not overwrite that stub. A holder with 30 units
+    who had four movements on the board when the week rolled was silently cut to four,
+    and the rest of their schedule was then refused for exceeding quota.
+
+    The engine no longer creates those stubs, but existing saves still carry them. A
+    holding only ever shrinks through ``enforce_slot_utilization``, which runs at a
+    slot-season boundary and rewrites that same week's row, so any *non-boundary* week
+    at or after the current one that holds less than the week before it is a stub and
+    is raised back. Idempotent.
+    """
+    row = fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    if not row:
+        return
+    try:
+        cur_week = int(row["game_week"] or 1)
+    except (TypeError, ValueError):
+        return
+    season = 12
+    sr = fetch_one("SELECT value FROM financial_constants WHERE key = 'slot_season_weeks'")
+    try:
+        season = max(1, int(float(sr["value"]))) if sr else 12
+    except (TypeError, ValueError, KeyError):
+        season = 12
+
+    execute(
+        """
+        UPDATE slot_allocations AS a
+        SET slots_held = (
+            SELECT p.slots_held FROM slot_allocations AS p
+            WHERE p.airport_iata = a.airport_iata
+              AND p.holder_id = a.holder_id
+              AND p.game_week < a.game_week
+            ORDER BY p.game_week DESC LIMIT 1
+        )
+        WHERE a.game_week >= ?
+          AND (a.game_week % ?) != 0
+          AND a.slots_held < COALESCE((
+            SELECT p.slots_held FROM slot_allocations AS p
+            WHERE p.airport_iata = a.airport_iata
+              AND p.holder_id = a.holder_id
+              AND p.game_week < a.game_week
+            ORDER BY p.game_week DESC LIMIT 1
+          ), 0)
+        """,
+        (cur_week, season),
     )
 
 
@@ -1489,6 +1626,18 @@ def ensure_schema_migrations():
         pass
     try:
         _repair_us_airport_timezones()
+    except Exception:
+        pass
+    try:
+        _repair_slot_allocation_carry_forward()
+    except Exception:
+        pass
+    try:
+        _add_fleet_disposal_columns()
+    except Exception:
+        pass
+    try:
+        _load_airport_od_share()
     except Exception:
         pass
     _migrations_done = True

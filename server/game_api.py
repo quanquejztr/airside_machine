@@ -1220,6 +1220,80 @@ def preview_schedule(body: dict) -> dict:
     )
 
 
+def hub_candidates(limit: str = "", min_score: str = "") -> dict:
+    """Shortlist for the hub picker, with the two selection metrics."""
+    from engine.hub_profile import hub_candidates as _cands
+
+    try:
+        n = max(1, min(60, int(limit or 25)))
+        score = int(min_score or 900_000)
+    except (TypeError, ValueError):
+        return _err("limit and min_score must be numbers.")
+    try:
+        return _ok({"hubs": _cands(limit=n, min_score=score)})
+    except Exception as e:
+        return _err(str(e))
+
+
+def hub_profile(iata: str = "") -> dict:
+    """Full demand profile for one candidate hub."""
+    from engine.hub_profile import hub_profile as _profile
+
+    code = str(iata or "").strip().upper()
+    if not code:
+        return _err("iata is required.")
+    try:
+        return _ok(_profile(code))
+    except Exception as e:
+        return _err(str(e))
+
+
+def fleet_disposal_quote(tail: str) -> dict:
+    """What selling or returning this aircraft would mean, before committing."""
+    t = str(tail or "").strip().upper()
+    if not t:
+        return _err("tail is required.")
+    try:
+        ac = aircraft.get_fleet_aircraft(t)
+        if not ac:
+            return _err(f"Aircraft '{t}' not found in fleet")
+        owned = str(ac.get("ownership") or "").upper() == "OWNED"
+        out = {
+            "tail_number": t,
+            "ownership": ac.get("ownership"),
+            "kind": "SELL" if owned else "RETURN_LEASE",
+            "pending_disposal": ac.get("pending_disposal"),
+            "blockers": aircraft.disposal_blockers(t),
+        }
+        if owned:
+            out["valuation"] = aircraft.estimate_resale_value(t)
+        else:
+            out["penalty"] = aircraft.lease_return_penalty(t)
+        return _ok(out)
+    except Exception as e:
+        return _err(str(e))
+
+
+def dispose_aircraft(body: dict) -> dict:
+    t = str(body.get("tail_number") or "").strip().upper()
+    if not t:
+        return _err("tail_number is required.")
+    try:
+        return _ok(aircraft.request_disposal(t))
+    except Exception as e:
+        return _err(str(e))
+
+
+def cancel_aircraft_disposal(body: dict) -> dict:
+    t = str(body.get("tail_number") or "").strip().upper()
+    if not t:
+        return _err("tail_number is required.")
+    try:
+        return _ok(aircraft.cancel_disposal(t))
+    except Exception as e:
+        return _err(str(e))
+
+
 def suggest_schedule_times(body: dict) -> dict:
     """Departure times at which the drafted chain can actually be scheduled.
 

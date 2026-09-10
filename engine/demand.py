@@ -227,15 +227,60 @@ def preview_weekly_demand_before_open(origin_airport, dest_airport, distance_nm,
         * lei_seg
     )
 
-    # Cabin split (for UI previews): same model as _cabin_market_split_from_pools
+    # The whole market, before anything is taken off it.
+    market_business = max(0, demand_business)
+    market_leisure = max(0, demand_leisure)
+    market_total = market_business + market_leisure
+
+    # Apply exactly what compute_demand() applies, or the preview promises traffic the
+    # route will never deliver. Two things are taken off the market before it reaches you:
+    # connecting passengers you have not earned a bank for, and the share competitors win.
+    o_iata = str(origin_airport["iata"]).upper()
+    d_iata = str(dest_airport["iata"]).upper()
+    connect_capture = connecting_capture_factor(o_iata, d_iata)
+
+    share_b = share_l = 1.0
+    competitor_factor_val = 0.0
+    try:
+        route_id = f"{o_iata}-{d_iata}"
+        comps = _fetch_competitor_rows_for_route(route_id)
+        if comps:
+            lg = compute_logit_shares_for_route(
+                route_id,
+                player_fare_business=float(price_business),
+                player_fare_leisure=float(price_leisure),
+                player_reputation=float((airline or {}).get("reputation_score") or 50.0)
+                if airline
+                else 50.0,
+                competitor_rows=comps,
+                pre_business=float(market_business),
+                pre_leisure=float(market_leisure),
+            )
+            share_b = max(0.05, min(1.0, float(lg["player_share_business"])))
+            share_l = max(0.05, min(1.0, float(lg["player_share_leisure"])))
+            competitor_factor_val = float(lg["competitor_factor"])
+    except Exception:
+        share_b = share_l = 1.0
+        competitor_factor_val = 0.0
+
+    demand_business = int(market_business * connect_capture * share_b)
+    demand_leisure = int(market_leisure * connect_capture * share_l)
+
+    # Cabin split reflects what you would actually carry, not the untouched market.
     csplit = _cabin_market_split_from_pools(demand_business, demand_leisure)
-    market_total = max(0, demand_business + demand_leisure)
 
     return {
         "business_pax": max(0, demand_business),
         "leisure_pax": max(0, demand_leisure),
-        "total_pax": market_total,
+        "total_pax": max(0, demand_business + demand_leisure),
+        # The untouched market, kept separate so the UI can show both numbers.
         "weekly_market_total": market_total,
+        "market_business_pax": market_business,
+        "market_leisure_pax": market_leisure,
+        "connect_capture": round(connect_capture, 4),
+        "player_share_business": round(share_b, 4),
+        "player_share_leisure": round(share_l, 4),
+        "competitor_factor": round(competitor_factor_val, 4),
         **csplit,
         "base_demand_business": base_business,
         "base_demand_leisure": base_leisure,
@@ -264,6 +309,12 @@ def _logit_utility(fare: float, reputation: float, segment: str) -> float:
 
 
 def _fetch_competitor_rows_for_route(route_id: str) -> List[Dict[str, Any]]:
+    """Competitors actually flying this route.
+
+    SUSPENDED used to count too, so an AI that had stopped serving a market kept taking
+    the player's passengers on it — the player saw a rival withdraw and their own traffic
+    never improve. Only carriers currently operating compete for share.
+    """
     return list(
         db.fetch_all(
             """
@@ -271,7 +322,7 @@ def _fetch_competitor_rows_for_route(route_id: str) -> List[Dict[str, Any]]:
             FROM competitor_routes cr
             JOIN competitors c ON c.competitor_id = cr.competitor_id
             WHERE (cr.outbound_route_id = ? OR cr.inbound_route_id = ?)
-              AND cr.status IN ('ACTIVE','SUSPENDED')
+              AND cr.status = 'ACTIVE'
             """,
             (route_id, route_id),
         )
@@ -374,6 +425,9 @@ def _pre_share_route_demands(
     demand_scale = _passenger_demand_multiplier()
     bus_seg = _demand_segment_multiplier("business")
     lei_seg = _demand_segment_multiplier("leisure")
+    connect_capture = connecting_capture_factor(
+        route["origin_iata"], route["dest_iata"]
+    )
     demand_business = int(
         base_business
         * seasonality_business
@@ -382,6 +436,7 @@ def _pre_share_route_demands(
         * noise_factor
         * demand_scale
         * bus_seg
+        * connect_capture
     )
     demand_leisure = int(
         base_leisure
@@ -391,6 +446,7 @@ def _pre_share_route_demands(
         * noise_factor
         * demand_scale
         * lei_seg
+        * connect_capture
     )
     return {
         "pre_business": max(0, demand_business),
@@ -509,6 +565,68 @@ def estimate_competitor_route_load_factor(
     if cap <= 0:
         return None
     return float(max(0.0, min(1.15, pax / cap)))
+
+
+def _fc_od_threshold() -> float:
+    """od_share at or above which an airport is treated as pure origin-destination."""
+    try:
+        v = db.get_financial_constant("hub_connect_od_threshold")
+        return 0.70 if v is None else float(v)
+    except Exception:
+        return 0.70
+
+
+def player_routes_at(iata: str) -> int:
+    """How many opened player routes touch this airport."""
+    code = str(iata or "").strip().upper()
+    if not code:
+        return 0
+    # player_routes stores only route_id; the endpoints live on routes.
+    row = db.fetch_one(
+        """
+        SELECT COUNT(*) AS c
+        FROM player_routes pr
+        JOIN routes r ON r.route_id = pr.route_id
+        WHERE UPPER(r.origin_iata) = ? OR UPPER(r.dest_iata) = ?
+        """,
+        (code, code),
+    )
+    return int(row["c"] or 0) if row else 0
+
+
+def connecting_capture_factor(origin_iata: str, dest_iata: str) -> float:
+    """Share of a route's market the player can actually fill, in [od_share, 1.0].
+
+    The demand anchors are segment traffic, so they already include people merely
+    changing planes. Handing all of that to a single route means one flight into Atlanta
+    earns the feed of an airline that does not exist. Local traffic is always available;
+    the connecting remainder is earned by building a bank at whichever end is hub-like.
+
+    Returns 1.0 whenever the connecting portion is fully unlocked, so pure O&D pairs and
+    mature networks are unaffected.
+    """
+    try:
+        from engine.hub_profile import connecting_unlock_fraction, od_share_for
+    except Exception:
+        return 1.0
+
+    # Only genuinely hub-like airports gate their traffic. Applying this everywhere
+    # would shave the default 15% connecting share off every route in the game — a
+    # global demand nerf, rather than a reason to build a bank where banks matter.
+    threshold = _fc_od_threshold()
+
+    captures = []
+    for code in (origin_iata, dest_iata):
+        share = od_share_for(code)
+        if share >= threshold:
+            continue
+        unlock = connecting_unlock_fraction(player_routes_at(code))
+        captures.append(share + (1.0 - share) * unlock)
+    if not captures:
+        return 1.0
+    # The more hub-like endpoint governs: it is the one whose traffic is mostly
+    # connecting, so it is the one that actually needs a bank to be captured.
+    return max(0.0, min(1.0, min(captures)))
 
 
 def compute_demand(route_id, game_week=1, current_month=1, competitor_factor=None, persist_share=False):

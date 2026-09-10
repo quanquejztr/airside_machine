@@ -360,6 +360,46 @@ class TestSlotUtilization(unittest.TestCase):
             self.assertEqual(8, held, "cancelled movements should count as used")
             self.assertEqual(0, below, "crediting them should reset the streak")
 
+    def test_holdings_carry_forward_without_settlement(self):
+        """A holding read before settlement runs must not read as zero."""
+        with TempSave() as db:
+            import engine.slots as S
+            self._alloc(db, 2, "IAD", 30, 14, below=1)
+            db.execute("DELETE FROM slot_allocations WHERE airport_iata='IAD' AND game_week=3")
+            self.assertEqual(30, S.slots_held("IAD", "PLAYER", 3),
+                             "week 3 must inherit week 2's entitlement")
+            self.assertEqual(30, self._held(db, 3, "IAD")[0],
+                             "the inherited row should be materialised")
+
+    def test_grandfather_does_not_rebaseline_an_existing_holder(self):
+        """Regression: partial spawn + historic grant capped a 30-unit holder at 4."""
+        with TempSave() as db:
+            import uuid
+            import engine.slots as S
+            S.seed_slot_controlled_airports()
+            self._alloc(db, 2, "IAD", 30, 14, below=1)
+            db.execute("DELETE FROM slot_allocations WHERE airport_iata='IAD' AND game_week=3")
+            # Four week-3 movements already on the board when grandfathering runs.
+            for i in range(4):
+                db.execute("""INSERT INTO slot_usages
+                              (usage_id, airport_iata, holder_id, game_week,
+                               segment_id, movement_type, clock_hour)
+                              VALUES (?,?,?,?,?,?,?)""",
+                           (str(uuid.uuid4()), "IAD", "PLAYER", 3, f"seg-{i}", "DEP", i))
+            S.grandfather_historic_slot_holdings(3)
+            self.assertEqual(30, S.slots_held("IAD", "PLAYER", 3),
+                             "an established holder must not be re-baselined to movements flown")
+
+    def test_carry_forward_wins_over_a_pre_created_row(self):
+        """ensure_slot_allocations_for_week must upsert, not silently ignore."""
+        with TempSave() as db:
+            import engine.slots as S
+            self._alloc(db, 2, "IAD", 30, 14, below=1)
+            self._alloc(db, 3, "IAD", 4, 4, below=0)   # grandfathered stub
+            S.ensure_slot_allocations_for_week(3)
+            self.assertEqual(30, self._held(db, 3, "IAD")[0],
+                             "carried entitlement must overwrite a smaller stub row")
+
 
 # ---------------------------------------------------------------------------
 # 6. Ferry / repositioning.
@@ -1921,6 +1961,38 @@ class TestGateRetention(unittest.TestCase):
                     flights_per_day, 12.0,
                     f"{name} threshold {thr} demands {flights_per_day:.0f} flights/stand/day")
 
+    def test_stand_is_released_at_pushback_not_a_turn_later(self):
+        """Regression: [arr, dep + MTT) double-counted the turn and invented collisions.
+
+        The rotation planner already places a departure at arrival + turn_minutes, so the
+        arrival-to-departure window *is* the turnaround. Adding MTT again left an aircraft
+        holding its stand for 45 minutes after takeoff, doubling every visit and putting
+        two tails on one stand when they never overlap in reality.
+        """
+        from engine.gates import _peak_concurrency, visit_intervals_for_tail
+
+        turn = 45.0 / 60.0
+        arr, dep = 346.12, 346.12 + turn
+        iv = visit_intervals_for_tail(turn, [(arr, "A"), (dep, "D")])
+        self.assertEqual(1, len(iv))
+        self.assertAlmostEqual(arr, iv[0][0], places=6)
+        self.assertAlmostEqual(dep, iv[0][1], places=6,
+                               msg="the stand must be free at pushback, not a turn later")
+
+        # The real ABB-007 / ABB-002 collision at MCO: 1.8 minutes of phantom overlap.
+        other = visit_intervals_for_tail(turn, [(344.65, "A"), (345.40, "D")])
+        self.assertEqual(1, _peak_concurrency(iv + other),
+                         "consecutive visits 42 minutes apart must not need two stands")
+
+    def test_orphan_departure_occupies_the_stand_before_pushback(self):
+        """A departure whose arrival is outside the window was parked, so occupancy precedes it."""
+        from engine.gates import visit_intervals_for_tail
+
+        turn = 45.0 / 60.0
+        (start, end), = visit_intervals_for_tail(turn, [(500.0, "D")])
+        self.assertAlmostEqual(500.0 - turn, start, places=6)
+        self.assertAlmostEqual(500.0, end, places=6)
+
     def test_turnaround_uses_one_gate_not_two(self):
         """One aircraft arriving then departing should not double-count as 2 concurrent gates."""
         from engine.gates import _gate_intervals_at_airport, _mtt_hours, _peak_concurrency
@@ -1954,7 +2026,13 @@ class TestGateRetention(unittest.TestCase):
             self.assertEqual(1, peak, "one tail turn at SFO should need only one stand")
 
     def test_scheduled_turn_minutes_drive_gate_occupancy(self):
-        """Per-leg turnaround from scheduling is gate MTT, not the global 30 min default."""
+        """Occupancy tracks the real ground time between arrival and departure.
+
+        The per-leg turnaround reaches the gate model through the schedule itself: the
+        rotation planner places the departure at arrival + turn_minutes, so a 3-hour turn
+        produces a 3-hour stand visit. `turn_minutes` is no longer added on top of that
+        window — doing so counted the turn twice.
+        """
         from engine.gates import _gate_intervals_at_airport
 
         with fresh_game():
@@ -1975,21 +2053,27 @@ class TestGateRetention(unittest.TestCase):
                 "dep_abs": dep,
                 "arr_abs": dep + 11.0,
             }
-            busy_default = sum(
-                e - s
-                for s, e in _gate_intervals_at_airport("ICN", 2, extra_segments=[inbound, outbound])
-            )
-            busy_long = sum(
+            short_h = 30.0 / 60.0
+            busy_short = sum(
                 e - s
                 for s, e in _gate_intervals_at_airport(
                     "ICN",
                     2,
-                    extra_segments=[inbound, {**outbound, "turn_minutes": 180}],
+                    extra_segments=[
+                        inbound,
+                        {**outbound, "dep_abs": arr + short_h, "arr_abs": arr + short_h + 11.0},
+                    ],
                 )
             )
-            self.assertGreater(busy_long, busy_default + 1.0)
-            # [arr, dep + turn): dep = arr + turn, so occupancy = 2 × turn
-            self.assertAlmostEqual(busy_long, turn_h * 2.0, places=2)
+            busy_long = sum(
+                e - s
+                for s, e in _gate_intervals_at_airport("ICN", 2, extra_segments=[inbound, outbound])
+            )
+            self.assertAlmostEqual(busy_short, short_h, places=2,
+                                   msg="a 30-minute turn occupies the stand for 30 minutes")
+            self.assertAlmostEqual(busy_long, turn_h, places=2,
+                                   msg="a 3-hour turn occupies the stand for 3 hours, not 6")
+            self.assertGreater(busy_long, busy_short + 1.0)
 
     def test_airport_board_coalesces_route_endpoints(self):
         with TempSave() as db:
@@ -2183,7 +2267,10 @@ class TestConcurrentGates(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual([(base, base + mtt)], intervals)
+        # A departure whose inbound leg is outside the window: the aircraft was already
+        # parked, so the stand was busy for the turn *leading up to* pushback and is free
+        # the moment it leaves. The window runs [dep - mtt, dep), not [dep, dep + mtt).
+        self.assertEqual([(base - mtt, base)], intervals)
 
     def test_exclude_tail_avoids_double_count_on_reschedule(self):
         import uuid
@@ -2560,6 +2647,451 @@ class TestSpawnIdempotency(unittest.TestCase):
                 )
             peak = peak_concurrency(_gate_intervals_at_airport(oi, 1))
             self.assertEqual(1, peak)
+
+
+# ---------------------------------------------------------------------------
+# Route-open preview must predict what the route will actually carry
+# ---------------------------------------------------------------------------
+class TestPreviewMatchesReality(unittest.TestCase):
+    """The preview promised the whole market; the route then delivered a fraction.
+
+    compute_demand() takes two things off the market that the preview ignored: the
+    connecting share a small network has not earned, and the slice competitors win.
+    A player opening a route on the strength of the preview was being misled by up to 7x.
+    """
+
+    def _pair(self, g, hub):
+        from engine.gates import is_auctioned_airport
+        from engine.routes import haversine_distance
+
+        dests = [
+            a
+            for a in near_airports(g.db, hub, min_nm=400, max_nm=2000, limit=25, require_runway_ft=7500)
+            if not is_auctioned_airport(a)
+        ]
+        self.assertTrue(dests, "need a destination")
+        o = dict(g.fetch_one("SELECT * FROM airports WHERE iata = ?", (hub,)))
+        d = dict(g.fetch_one("SELECT * FROM airports WHERE iata = ?", (dests[0],)))
+        dist = haversine_distance(float(o["lat"]), float(o["lon"]), float(d["lat"]), float(d["lon"]))
+        return o, d, dist
+
+    def test_preview_matches_compute_demand_after_opening(self):
+        """Uses a hub-like destination on purpose.
+
+        Against a plain O&D destination the capture factor is 1.0 and no competitor is
+        present, so preview and reality agree even with the bug in place — the test would
+        pass without detecting anything.
+        """
+        from engine.demand import compute_demand, preview_weekly_demand_before_open
+        from engine.hub_profile import od_share_for
+        from engine.routes import haversine_distance
+
+        with FreshGame(hub="BOS") as g:
+            row = g.fetch_one("SELECT * FROM airports WHERE iata = 'ORD'")
+            if not row:
+                self.skipTest("ORD not in catalog")
+            o = dict(g.fetch_one("SELECT * FROM airports WHERE iata = 'BOS'"))
+            d = dict(row)
+            self.assertLess(od_share_for("ORD"), 0.70, "destination must withhold something")
+            dist = haversine_distance(float(o["lat"]), float(o["lon"]), float(d["lat"]), float(d["lon"]))
+
+            pv = preview_weekly_demand_before_open(o, d, dist)
+            g.open_route("BOS", "ORD")
+            ac = compute_demand("BOS-ORD", 1, 1)
+            # Fares are untouched, so the only remaining difference is integer rounding.
+            self.assertGreater(ac["total_pax"], 0)
+            self.assertLess(pv["total_pax"], pv["weekly_market_total"], "capture must bite")
+            gap = abs(pv["total_pax"] - ac["total_pax"]) / ac["total_pax"]
+            self.assertLess(gap, 0.05, f"preview {pv['total_pax']} vs actual {ac['total_pax']}")
+
+    def test_suspended_competitor_stops_taking_share(self):
+        """A rival that has stopped flying a route must not keep its passengers.
+
+        The share query counted SUSPENDED routes alongside ACTIVE ones, so a competitor
+        withdrawing from a market left the player's traffic unchanged — the opposite of
+        what withdrawing should mean.
+        """
+        from engine.demand import _fetch_competitor_rows_for_route
+
+        with FreshGame(hub="BOS") as g:
+            row = g.fetch_one(
+                "SELECT competitor_id, route_pair_id, outbound_route_id FROM competitor_routes"
+                " WHERE status = 'ACTIVE' AND outbound_route_id IS NOT NULL LIMIT 1"
+            )
+            if not row:
+                self.skipTest("no active competitor route to suspend")
+            rid = str(row["outbound_route_id"])
+            self.assertTrue(_fetch_competitor_rows_for_route(rid), "should compete while active")
+
+            g.execute(
+                "UPDATE competitor_routes SET status = 'SUSPENDED'"
+                " WHERE competitor_id = ? AND route_pair_id = ?",
+                (row["competitor_id"], row["route_pair_id"]),
+            )
+            still = [
+                r for r in _fetch_competitor_rows_for_route(rid)
+                if str(r["competitor_id"]) == str(row["competitor_id"])
+            ]
+            self.assertEqual([], still, "a suspended route must not take share")
+
+    def test_preview_reports_market_and_capturable_separately(self):
+        """Both numbers must survive, so the UI can explain the difference."""
+        from engine.demand import preview_weekly_demand_before_open
+
+        with FreshGame(hub="BOS") as g:
+            o, d, dist = self._pair(g, "BOS")
+            pv = preview_weekly_demand_before_open(o, d, dist)
+            for key in ("weekly_market_total", "market_business_pax", "market_leisure_pax",
+                        "connect_capture", "player_share_business", "player_share_leisure"):
+                self.assertIn(key, pv)
+            self.assertGreaterEqual(pv["weekly_market_total"], pv["total_pax"])
+            self.assertAlmostEqual(
+                pv["weekly_market_total"],
+                pv["market_business_pax"] + pv["market_leisure_pax"],
+                delta=1,
+            )
+
+    def test_connecting_share_is_withheld_from_the_preview_too(self):
+        """A hub-like destination with no network must not be previewed at full market."""
+        from engine.demand import preview_weekly_demand_before_open
+        from engine.hub_profile import od_share_for
+        from engine.routes import haversine_distance
+
+        with FreshGame(hub="BOS") as g:
+            o = dict(g.fetch_one("SELECT * FROM airports WHERE iata = 'BOS'"))
+            row = g.fetch_one("SELECT * FROM airports WHERE iata = 'ORD'")
+            if not row:
+                self.skipTest("ORD not in catalog")
+            d = dict(row)
+            self.assertLess(od_share_for("ORD"), 0.70, "ORD should be hub-like")
+            dist = haversine_distance(float(o["lat"]), float(o["lon"]), float(d["lat"]), float(d["lon"]))
+            pv = preview_weekly_demand_before_open(o, d, dist)
+            self.assertLess(pv["connect_capture"], 1.0)
+            self.assertLess(
+                pv["total_pax"], pv["weekly_market_total"],
+                "connecting traffic must be withheld until a bank exists",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Hub selection: travel demand (local) vs transit power (connecting)
+# ---------------------------------------------------------------------------
+class TestHubMetrics(unittest.TestCase):
+    """The anchors are segment traffic, so they already contain connecting passengers.
+
+    Splitting that total by od_share is what lets a tourist city and a transit city read
+    differently — a gravity model cannot tell them apart, because both carry far more
+    traffic than their local catchment explains.
+    """
+
+    def test_od_share_loaded_with_sensible_defaults(self):
+        with FreshGame(hub="TPA") as g:
+            from engine.hub_profile import od_share_for
+
+            self.assertLess(od_share_for("ATL"), 0.5, "ATL is a connecting hub")
+            self.assertGreater(od_share_for("LAS"), 0.9, "Las Vegas is a destination")
+            self.assertLess(od_share_for("CLT"), 0.3, "Charlotte is the extreme case")
+            # An airport absent from the CSV still gets a usable value.
+            self.assertGreater(od_share_for("ZZZ_NOT_AN_AIRPORT"), 0.0)
+
+    def test_tourist_and_transit_cities_read_differently(self):
+        """LAS and CLT carry similar total traffic and must not look alike."""
+        with FreshGame(hub="TPA") as g:
+            from engine.hub_profile import hub_profile
+
+            las = hub_profile("LAS")
+            clt = hub_profile("CLT")
+            self.assertGreater(las["travel_demand_icons"], clt["travel_demand_icons"])
+            self.assertGreater(clt["transit_power"], las["transit_power"])
+            self.assertAlmostEqual(1.1, las["transit_power"], delta=0.15)
+            self.assertGreaterEqual(clt["transit_power"], 4.0)
+
+    def test_demand_icons_spread_the_candidates(self):
+        """Round-number thresholds put half the realistic hubs at 5/5, which is useless."""
+        from engine.hub_profile import DEMAND_ICON_THRESHOLDS, demand_icons
+
+        self.assertEqual(5, demand_icons(DEMAND_ICON_THRESHOLDS[0] + 1))
+        self.assertEqual(1, demand_icons(0))
+        seen = {demand_icons(v) for v in (600_000, 350_000, 200_000, 100_000, 10_000)}
+        self.assertEqual({1, 2, 3, 4, 5}, seen, "every level must be reachable")
+
+    def test_transit_power_is_the_inverse_of_od_share(self):
+        """The label promises arithmetic, so it must match."""
+        with FreshGame(hub="TPA") as g:
+            from engine.hub_profile import od_share_for, transit_power
+
+            for iata in ("ATL", "CLT", "LAS", "LHR"):
+                self.assertAlmostEqual(
+                    1.0 / od_share_for(iata), transit_power(iata), delta=0.06
+                )
+            self.assertLessEqual(
+                transit_power("CLT"), 5.5, "no real airport supports a 10x claim"
+            )
+
+    def test_connecting_unlock_is_threshold_then_ramp(self):
+        with FreshGame(hub="TPA") as g:
+            from engine.hub_profile import connecting_unlock_fraction
+
+            self.assertEqual(0.0, connecting_unlock_fraction(0))
+            self.assertEqual(0.0, connecting_unlock_fraction(3), "a few routes feed nobody")
+            self.assertGreater(connecting_unlock_fraction(9), 0.0)
+            self.assertLess(connecting_unlock_fraction(9), 1.0)
+            self.assertEqual(1.0, connecting_unlock_fraction(20))
+            ramp = [connecting_unlock_fraction(n) for n in range(4, 16)]
+            self.assertEqual(ramp, sorted(ramp), "must not go backwards")
+
+    def test_hub_capture_grows_with_the_network_but_spares_od_pairs(self):
+        """The mechanic must bite at hubs without nerfing every route in the game."""
+        from engine.demand import connecting_capture_factor
+        from engine.gates import is_auctioned_airport
+
+        with FreshGame(hub="ATL") as g:
+            dests = near_airports(g.db, "ATL", min_nm=200, max_nm=1500, limit=20)
+            g.open_route("ATL", dests[0])
+            small = connecting_capture_factor("ATL", dests[0])
+            self.assertLess(small, 0.5, "one route must not earn a hub's connecting feed")
+            for d in dests[1:15]:
+                g.open_route("ATL", d)
+            big = connecting_capture_factor("ATL", dests[0])
+            self.assertGreater(big, small)
+            self.assertAlmostEqual(1.0, big, delta=0.01, msg="a full bank captures it all")
+
+        with FreshGame(hub="TPA") as g2:
+            # Both ends are above the O&D threshold, so nothing is withheld.
+            self.assertAlmostEqual(1.0, connecting_capture_factor("LAS", "MCO"), delta=0.001)
+
+    def test_hub_profile_reports_the_supporting_numbers(self):
+        with FreshGame(hub="TPA") as g:
+            from engine.hub_profile import hub_profile
+
+            p = hub_profile("ATL")
+            self.assertGreater(p["reachable_destinations"], 50)
+            self.assertGreater(p["weekly_market_total"], p["travel_demand_weekly"])
+            self.assertAlmostEqual(
+                p["weekly_market_total"],
+                p["travel_demand_weekly"] + p["connecting_weekly"],
+                delta=2,
+                msg="local + connecting must reconstruct the total",
+            )
+            self.assertTrue(p["top_destinations"])
+            self.assertTrue(any(c["fleet_size"] > 0 for c in p["competitors"]),
+                            "ATL has AI competitors based there")
+
+
+# ---------------------------------------------------------------------------
+# Fleet disposal: sell an aircraft, hand a lease back early
+# ---------------------------------------------------------------------------
+class TestFleetDisposal(unittest.TestCase):
+    def _world(self):
+        return FreshGame(hub="TPA", cash=500_000_000)
+
+    def test_valuation_falls_with_age_usage_and_condition(self):
+        from engine import aircraft as A
+
+        with self._world() as g:
+            tail = g.buy("B738")
+            new = A.estimate_resale_value(tail)
+            self.assertEqual(1.0, new["age_factor"])
+            self.assertEqual(1.0, new["usage_factor"])
+            self.assertLess(new["estimated_value"], new["purchase_price_paid"],
+                            "a brand-new aircraft still loses the sale haircut")
+
+            g.execute("UPDATE game_state SET game_week = 105 WHERE id = 1")  # ~2 years
+            g.execute("UPDATE fleet SET total_airborne_hours = 2000 WHERE tail_number = ?", (tail,))
+            aged = A.estimate_resale_value(tail)
+            self.assertLess(aged["estimated_value"], new["estimated_value"])
+
+            g.execute("UPDATE fleet SET weeks_since_maintenance = 999 WHERE tail_number = ?", (tail,))
+            worn = A.estimate_resale_value(tail)
+            self.assertTrue(worn["maintenance_overdue"])
+            self.assertLess(worn["estimated_value"], aged["estimated_value"])
+
+            g.execute("UPDATE game_state SET game_week = 5000 WHERE id = 1")
+            g.execute("UPDATE fleet SET total_airborne_hours = 90000 WHERE tail_number = ?", (tail,))
+            floored = A.estimate_resale_value(tail)
+            self.assertTrue(floored["floor_applied"], "value must not decay below the residual")
+
+    def test_buy_then_sell_loses_money(self):
+        """Anti-exploit: a round trip must never be a source of free cash."""
+        from engine import aircraft as A
+        from engine.settlement import process_pending_disposals
+
+        with self._world() as g:
+            before = g.cash()
+            tail = g.buy("B738")
+            A.request_disposal(tail)
+            process_pending_disposals()
+            self.assertLess(g.cash(), before, "buy->sell round trip must lose money")
+
+    def test_lease_appears_in_the_books_from_the_first_week(self):
+        """Lease rent must move cash through week_ledger, not around it.
+
+        The first week used to be charged directly in lease_aircraft() and the tail
+        flagged `lease_prepaid`, which made compute_lease_costs() skip it. Real money left
+        the account and no P&L line ever showed it, so the books reported $0 lease costs
+        while cash fell.
+        """
+        from engine.settlement import run_settlement
+
+        with self._world() as g:
+            before = g.cash()
+            g.lease("B739")
+            self.assertEqual(before, g.cash(), "signing must not charge outside settlement")
+
+            g.execute("UPDATE game_state SET game_week = 2 WHERE id = 1")
+            run_settlement(1)
+            led = g.fetch_one("SELECT lease_costs FROM week_ledger WHERE game_week = 1")
+            self.assertGreater(
+                led["lease_costs"], 0, "the first week's rent must appear in the books"
+            )
+            self.assertLess(g.cash(), before, "and it must actually be paid")
+
+    def test_legacy_prepaid_lease_is_not_charged_twice(self):
+        """Leases signed under the old rules already paid week one; skip it exactly once."""
+        from engine.settlement import run_settlement
+
+        with self._world() as g:
+            tail = g.lease("B739")
+            g.execute("UPDATE fleet SET lease_prepaid = 1 WHERE tail_number = ?", (tail,))
+
+            g.execute("UPDATE game_state SET game_week = 2 WHERE id = 1")
+            run_settlement(1)
+            self.assertEqual(
+                0,
+                g.fetch_one("SELECT lease_costs FROM week_ledger WHERE game_week = 1")["lease_costs"],
+                "a prepaid week must not be billed again",
+            )
+
+            g.execute("UPDATE game_state SET game_week = 3 WHERE id = 1")
+            run_settlement(2)
+            self.assertGreater(
+                g.fetch_one("SELECT lease_costs FROM week_ledger WHERE game_week = 2")["lease_costs"],
+                0,
+                "billing must resume the week after",
+            )
+
+    def test_lease_return_charges_the_flat_penalty(self):
+        from engine import aircraft as A
+        from engine.settlement import process_pending_disposals
+
+        with self._world() as g:
+            tail = g.lease("B738")
+            penalty = A.lease_return_penalty(tail)
+            self.assertGreater(penalty, 0)
+            before = g.cash()
+            A.request_disposal(tail)
+            out = process_pending_disposals()
+            self.assertAlmostEqual(before - penalty, g.cash(), places=2)
+            self.assertEqual([tail], [r["tail_number"] for r in out["returned"]])
+            self.assertIsNone(
+                g.fetch_one("SELECT 1 FROM fleet WHERE tail_number = ?", (tail,))
+            )
+
+    def test_settlement_reentry_does_not_pay_twice(self):
+        """Settlement re-enters via retry and catch-up paths; a sale must credit once."""
+        from engine import aircraft as A
+        from engine.settlement import process_pending_disposals
+
+        with self._world() as g:
+            tail = g.buy("B738")
+            A.request_disposal(tail)
+            before = g.cash()
+            first = process_pending_disposals()
+            after_first = g.cash()
+            second = process_pending_disposals()
+            self.assertEqual(1, len(first["sold"]))
+            self.assertEqual(0, len(second["sold"]))
+            self.assertEqual(after_first, g.cash(), "second pass must not credit again")
+            self.assertGreater(after_first, before)
+
+    def test_away_from_hub_ferries_home_then_sells(self):
+        """Auto-ferry: request from anywhere, hold until home, then execute."""
+        from engine import aircraft as A
+        from engine.gates import is_auctioned_airport
+        from engine.scheduling import on_arrival, on_departure
+        from engine.settlement import process_pending_disposals
+
+        with self._world() as g:
+            dests = [
+                a
+                for a in near_airports(g.db, "TPA", min_nm=200, max_nm=1100, limit=25, require_runway_ft=7500)
+                if not is_auctioned_airport(a)
+            ]
+            tail = g.buy("B738")
+            g.open_round_trip(dests[0])
+            g.execute(
+                "UPDATE fleet SET current_airport_iata = ? WHERE tail_number = ?",
+                (dests[0], tail),
+            )
+            res = A.request_disposal(tail)
+            self.assertIsInstance(res["ferry"], dict, "a down-route aircraft must be positioned home")
+
+            held = process_pending_disposals()
+            self.assertEqual(1, len(held["held"]), "must not sell before it is home")
+            self.assertEqual(0, len(held["sold"]))
+
+            for s in g.fetch_all(
+                "SELECT segment_id FROM flight_segments WHERE tail_number = ? AND status = 'SCHEDULED'",
+                (tail,),
+            ):
+                on_departure(s["segment_id"])
+                on_arrival(s["segment_id"])
+
+            self.assertEqual([], A.disposal_blockers(tail))
+            out = process_pending_disposals()
+            self.assertEqual(1, len(out["sold"]))
+            self.assertEqual(0, g.fetch_one("SELECT COUNT(*) c FROM fleet")["c"])
+
+    def test_aog_cannot_be_queued_and_cancel_works(self):
+        from engine import aircraft as A
+        from engine.settlement import process_pending_disposals
+
+        with self._world() as g:
+            grounded = g.buy("B738")
+            g.execute(
+                "UPDATE fleet SET status='AOG', aog_reason='Mechanical' WHERE tail_number = ?",
+                (grounded,),
+            )
+            with self.assertRaises(ValueError):
+                A.request_disposal(grounded)
+
+            other = g.buy("B738")
+            A.request_disposal(other)
+            A.cancel_disposal(other)
+            self.assertIsNone(
+                g.fetch_one(
+                    "SELECT pending_disposal FROM fleet WHERE tail_number = ?", (other,)
+                )["pending_disposal"]
+            )
+            self.assertEqual(0, len(process_pending_disposals()["sold"]))
+
+    def test_acquisition_is_recorded_and_backfill_fills_older_rows(self):
+        from db.db import _add_fleet_disposal_columns
+
+        with self._world() as g:
+            tail = g.buy("B738")
+            row = g.fetch_one(
+                "SELECT acquired_game_week, purchase_price_paid, total_airborne_hours"
+                " FROM fleet WHERE tail_number = ?",
+                (tail,),
+            )
+            self.assertIsNotNone(row["acquired_game_week"])
+            self.assertGreater(row["purchase_price_paid"], 0)
+            self.assertEqual(0, row["total_airborne_hours"])
+
+            # An aircraft predating the columns: backfill must fill it, not leave NULLs.
+            g.execute(
+                "UPDATE fleet SET acquired_game_week = NULL, purchase_price_paid = NULL,"
+                " total_airborne_hours = 0 WHERE tail_number = ?",
+                (tail,),
+            )
+            _add_fleet_disposal_columns()
+            row = g.fetch_one(
+                "SELECT acquired_game_week, purchase_price_paid FROM fleet WHERE tail_number = ?",
+                (tail,),
+            )
+            self.assertIsNotNone(row["acquired_game_week"])
+            self.assertGreater(row["purchase_price_paid"], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2954,6 +3486,59 @@ class TestScheduleStacking(unittest.TestCase):
                 (tail,),
             )
             self.assertEqual(5, len(wk2), "2 chains x 2 legs + 1 stacked line must respawn")
+
+    def test_airborne_aircraft_can_still_take_a_free_time_block(self):
+        """Being busy now must not block scheduling later.
+
+        Dispatch used to require status IDLE or SCHEDULED, so an aircraft in the air
+        could not be given a rotation for a completely empty day. Whether a block is
+        free is decided by the overlap/turnaround rule and the position timeline; only
+        AOG and MAINTENANCE genuinely stop an aircraft flying.
+        """
+        from engine.scheduling import create_chained_detailed_rotation, on_departure
+
+        g, tail, trips = self._world()
+        with g:
+            create_chained_detailed_rotation(
+                tail, list(trips[0]), ["A1", "A2"], self._days("MON"), "08:00"
+            )
+            first = g.fetch_one(
+                "SELECT segment_id FROM flight_segments WHERE tail_number = ?"
+                " ORDER BY scheduled_dep_game_hour LIMIT 1",
+                (tail,),
+            )
+            on_departure(first["segment_id"])
+            self.assertEqual(
+                "IN_AIR",
+                g.fetch_one("SELECT status FROM fleet WHERE tail_number = ?", (tail,))["status"],
+            )
+
+            # A free day must be accepted even though the aircraft is airborne.
+            create_chained_detailed_rotation(
+                tail, list(trips[1]), ["B1", "B2"], self._days("WED"), "08:00"
+            )
+
+            # A genuine clash is still refused, on its merits rather than on status.
+            with self.assertRaises(ValueError):
+                create_chained_detailed_rotation(
+                    tail, list(trips[1]), ["C1", "C2"], self._days("MON"), "08:15"
+                )
+
+    def test_aog_aircraft_still_cannot_be_scheduled(self):
+        from engine.scheduling import create_chained_detailed_rotation
+
+        g, tail, trips = self._world()
+        with g:
+            g.execute(
+                "UPDATE fleet SET status = 'AOG', aog_reason = 'Mechanical'"
+                " WHERE tail_number = ?",
+                (tail,),
+            )
+            with self.assertRaises(ValueError) as ctx:
+                create_chained_detailed_rotation(
+                    tail, list(trips[0]), ["A1", "A2"], self._days("MON"), "08:00"
+                )
+            self.assertIn("AOG", str(ctx.exception))
 
     def test_rejected_line_leaves_no_orphan_segment(self):
         """create_flight_schedule writes rows, so incompatibility must be caught first.

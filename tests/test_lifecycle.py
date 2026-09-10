@@ -305,26 +305,29 @@ class TestFlyingAndSettlement(LifecycleBase):
             - float(l["lease_costs"]) - float(l["maintenance_costs"])
         self.assertAlmostEqual(pretax - float(l["corporate_tax"]), float(l["net_income"]), delta=2.0)
 
-    def test_first_lease_week_is_prepaid_then_billed(self):
-        """lease_aircraft charges week 1 up front (lease_prepaid=1); week 2 onward is billed."""
+    def test_every_lease_week_is_billed_through_the_ledger(self):
+        """Lease rent is a ledger expense from week 1, so it is visible in the books.
+
+        Signing used to take the first week's rent straight out of cash and set
+        lease_prepaid=1, which made compute_lease_costs() skip it. The money was real
+        but appeared nowhere in the financials, so a leased fleet looked free for its
+        first week. Signing is now cash-neutral and settlement bills every week.
+        """
         from engine.scheduling import (assign_rotation,
                                        reset_operational_schedule_for_new_calendar_week,
                                        spawn_rotation_segments_for_week)
         weekly = float(self.db.fetch_one(
             "SELECT weekly_lease_cost FROM aircraft_types WHERE type_id = ?",
             (self.type_id,))["weekly_lease_cost"])
-        self.assertEqual(1, int(self.db.fetch_one(
+        self.assertEqual(0, int(self.db.fetch_one(
             "SELECT lease_prepaid FROM fleet WHERE tail_number = ?", (self.tail,))["lease_prepaid"]),
-            "a new lease should be marked prepaid for its first week")
+            "signing must not prepay, or week 1 rent never reaches the ledger")
         assign_rotation(self.tail, [self.out_id, self.in_id])
         self.g.fly_all(1)
         self.g.settle(1)
-        self.assertAlmostEqual(0.0, float(self.db.fetch_one(
+        self.assertAlmostEqual(weekly, float(self.db.fetch_one(
             "SELECT lease_costs FROM week_ledger WHERE game_week = 1")["lease_costs"]), delta=1.0,
-            msg="week 1 was paid at signing, so the ledger should not bill it again")
-        self.assertEqual(0, int(self.db.fetch_one(
-            "SELECT lease_prepaid FROM fleet WHERE tail_number = ?", (self.tail,))["lease_prepaid"]),
-            "settlement must clear the prepaid flag")
+            msg="week 1 must bill one weekly lease")
         self.g.set_hour(168.0)
         reset_operational_schedule_for_new_calendar_week(2)
         spawn_rotation_segments_for_week(2)

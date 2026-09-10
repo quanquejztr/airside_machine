@@ -40,6 +40,82 @@ def compute_lease_costs() -> float:
     return total
 
 
+def process_pending_disposals() -> Dict[str, Any]:
+    """Execute queued aircraft sales and lease returns at the week roll.
+
+    MUST stay inside settlement's `cash_applied` guard: settlement re-enters (retry paths
+    and catch-up), and an unguarded payout would credit the sale price more than once.
+
+    Re-validates rather than trusting the request: a week has passed, so the aircraft may
+    have been rescheduled or moved. If it no longer qualifies the request is *held*, not
+    cancelled and not forced — the player is told and can act.
+    """
+    from engine import aircraft as ac_mod
+    from engine.setup import apply_settlement_cash
+
+    rows = db.fetch_all(
+        "SELECT tail_number, ownership, pending_disposal FROM fleet"
+        " WHERE pending_disposal IS NOT NULL"
+    )
+    out: Dict[str, Any] = {"sold": [], "returned": [], "held": [], "proceeds": 0.0, "penalties": 0.0}
+
+    for raw in rows or []:
+        tail = str(raw["tail_number"])
+        kind = str(raw["pending_disposal"] or "").upper()
+        try:
+            blockers = ac_mod.disposal_blockers(tail)
+        except Exception:
+            continue
+        if blockers:
+            out["held"].append({"tail_number": tail, "reasons": blockers})
+            _notify_disposal(f"⚠ {tail} disposal on hold: {blockers[0]}")
+            continue
+
+        if kind == "SELL":
+            # Recomputed now, not quoted at request time: the ferry home added hours.
+            value = float(ac_mod.estimate_resale_value(tail)["estimated_value"])
+            apply_settlement_cash(value)
+            out["proceeds"] += value
+            out["sold"].append({"tail_number": tail, "value": value})
+            _notify_disposal(f"Sold {tail} for ${value:,.0f}.")
+        else:
+            penalty = float(ac_mod.lease_return_penalty(tail))
+            if penalty:
+                apply_settlement_cash(-penalty)
+            out["penalties"] += penalty
+            out["returned"].append({"tail_number": tail, "penalty": penalty})
+            _notify_disposal(
+                f"Lease returned: {tail}."
+                + (f" Early-return fee ${penalty:,.0f}." if penalty else "")
+            )
+        _remove_tail_from_fleet(tail)
+
+    return out
+
+
+def _notify_disposal(message: str) -> None:
+    try:
+        from engine.news_feed import push_news
+
+        push_news(message)
+    except Exception:
+        pass
+
+
+def _remove_tail_from_fleet(tail: str) -> None:
+    """Same teardown the lease-expiry path uses; cancel_rotation clears flight_schedules."""
+    try:
+        from engine.scheduling import cancel_rotation
+
+        cancel_rotation(tail, wipe_completed_this_week=True)
+    except Exception:
+        pass
+    db.execute("DELETE FROM flight_segments WHERE tail_number = ?", (tail,))
+    db.execute("DELETE FROM weekly_rotations WHERE tail_number = ?", (tail,))
+    db.execute("DELETE FROM fleet_cabin_config WHERE tail_number = ?", (tail,))
+    db.execute("DELETE FROM fleet WHERE tail_number = ?", (tail,))
+
+
 def tick_leases_after_settlement() -> List[str]:
     """Decrement remaining lease weeks; return and remove expired tails."""
     rows = db.fetch_all(
@@ -767,10 +843,17 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
     flags = _settlement_flags(completed_game_week)
 
     expired_leases: List[str] = []
+    disposals: Dict[str, Any] = {}
     if not flags["cash_applied"]:
         # Operating result may go negative; purchases still use update_cash which cannot overdraft.
         apply_settlement_cash(net_income)
         expired_leases = tick_leases_after_settlement()
+        # Inside this guard on purpose — settlement re-enters, and an unguarded sale
+        # payout would credit the aircraft's value more than once.
+        try:
+            disposals = process_pending_disposals()
+        except Exception as e:
+            _notify_disposal(f"⚠ Disposal processing failed: {e}")
         _mark_settlement_flag(completed_game_week, "cash_applied")
         flags["cash_applied"] = 1
 
@@ -933,8 +1016,8 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
             game_week, revenue_gross, excise_tax, segment_fees, security_fees,
             pfc_fees, landing_fees, gate_fees, fuel_cost, lease_costs,
             maintenance_costs, loan_payments, corporate_tax, net_income,
-            cash_end_of_week
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cash_end_of_week, asset_sale_proceeds, lease_return_penalties
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             completed_game_week,
@@ -952,6 +1035,8 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
             corporate_tax,
             net_income,
             cash_end,
+            float(disposals.get("proceeds") or 0.0),
+            float(disposals.get("penalties") or 0.0),
         ),
     )
 

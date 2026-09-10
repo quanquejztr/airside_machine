@@ -168,6 +168,26 @@ def normalize_tail_schedule_for_week(
     return {"moved": moved, "cancelled": cancelled}
 
 
+# Statuses that genuinely stop an aircraft being dispatched. Everything else — IN_AIR,
+# LANDED, SCHEDULED — describes where the aircraft is *right now*, which says nothing
+# about whether a later time block is free. Whether it is free is decided by the overlap
+# and turnaround rule and by the position timeline, both of which run on every path.
+# Gating on status as well meant an airborne aircraft could not be given a rotation for
+# later in the week, even with the whole week empty.
+UNDISPATCHABLE_STATUSES = ("AOG", "MAINTENANCE")
+
+
+def assert_aircraft_dispatchable(aircraft) -> None:
+    """Raise only when the aircraft cannot fly at all, not merely because it is busy now."""
+    status = str((aircraft or {}).get("status") or "").upper()
+    if status in UNDISPATCHABLE_STATUSES:
+        reason = (aircraft or {}).get("aog_reason")
+        detail = f" ({reason})" if reason else ""
+        raise ValueError(
+            f"Aircraft is {status}{detail} and cannot be scheduled until it is back in service."
+        )
+
+
 def assert_tail_schedule_accepts_new_intervals(tail_number, game_week, new_intervals, mtt_hours):
     """
     Block times (dep, arr) must not overlap existing SCHEDULED/IN_AIR flights and must leave
@@ -477,9 +497,8 @@ def assign_rotation(tail_number, route_ids, departure_times=None, flight_numbers
         raise ValueError(f"Aircraft '{tail_number}' not found in fleet")
     
     # Aircraft can be IDLE or SCHEDULED (multiple rotations allowed)
-    if aircraft['status'] not in ('IDLE', 'SCHEDULED'):
-        raise ValueError(f"Aircraft is not available for scheduling (current status: {aircraft['status']})")
-    
+    assert_aircraft_dispatchable(aircraft)
+
     # Get aircraft type details
     aircraft_type = db.fetch_one(
         "SELECT * FROM aircraft_types WHERE type_id = ?",
@@ -930,8 +949,7 @@ def suggest_departure_times(
     aircraft = get_fleet_aircraft(tail_number)
     if not aircraft:
         raise ValueError(f"Aircraft '{tail_number}' not found in fleet")
-    if aircraft["status"] not in ("IDLE", "SCHEDULED"):
-        raise ValueError(f"Aircraft is not available (status: {aircraft['status']})")
+    assert_aircraft_dispatchable(aircraft)
     aircraft_type = db.fetch_one(
         "SELECT * FROM aircraft_types WHERE type_id = ?", (aircraft["type_id"],)
     )
@@ -1143,8 +1161,7 @@ def create_chained_detailed_rotation(
     aircraft = get_fleet_aircraft(tail_number)
     if not aircraft:
         raise ValueError(f"Aircraft '{tail_number}' not found in fleet")
-    if aircraft["status"] not in ("IDLE", "SCHEDULED"):
-        raise ValueError(f"Aircraft is not available (status: {aircraft['status']})")
+    assert_aircraft_dispatchable(aircraft)
 
     aircraft_type = db.fetch_one(
         "SELECT * FROM aircraft_types WHERE type_id = ?",
@@ -1410,8 +1427,7 @@ def create_flight_schedule(tail_number, route_id, flight_number, days_of_week, d
     if not aircraft:
         raise ValueError(f"Aircraft '{tail_number}' not found in fleet")
     
-    if aircraft['status'] not in ('IDLE', 'SCHEDULED'):
-        raise ValueError(f"Aircraft is not available (status: {aircraft['status']})")
+    assert_aircraft_dispatchable(aircraft)
     
     # Validate route
     route = get_route(route_id)
