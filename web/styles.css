@@ -799,3 +799,113 @@ table.sched-grid .overlap { color: #9a6208; }
   cursor: pointer;
 }
 .ap-open-route-cancel:hover { color: #e2e8f0; }
+
+/* Hub preview shown while the player types a home hub, before the airline exists. */
+.hub-preview {
+  margin: 10px 0 6px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--lg-bg-color, rgba(165, 158, 158, 0.18));
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.hub-preview .hp-head {
+  color: var(--lg-text);
+  margin-bottom: 6px;
+}
+.hub-preview .hp-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+.hub-preview .hp-label {
+  color: var(--lg-muted);
+  min-width: 96px;
+}
+.hub-preview .hp-icons {
+  letter-spacing: 2px;
+  font-size: 14px;
+}
+.hub-preview .hp-on { color: var(--logo-blue, #2b6cb0); }
+.hub-preview .hp-off { color: var(--lg-muted); opacity: 0.45; }
+.hub-preview .hp-mult {
+  font-weight: 700;
+  color: var(--logo-blue-deep, #1a4a7a);
+  min-width: 44px;
+}
+.hub-preview .hp-sub { color: var(--lg-muted); font-size: 12px; }
+.hub-preview .hp-meta {
+  color: var(--lg-muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.hub-preview .hp-warn { color: #9b5c1f; }
+.hub-preview .hp-ok { color: #1f7a4a; }
+
+/* Departure slots offered when a schedule will not fit at the chosen time. */
+.slot-picks {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.slot-picks .slot-note {
+  color: var(--lg-muted);
+  font-size: 12px;
+}
+.slot-picks .slot-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--logo-blue, #286c94);
+  background: transparent;
+  color: var(--logo-blue-deep, #1b4c69);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.slot-picks .slot-chip:hover {
+  background: var(--logo-blue, #286c94);
+  color: #f7fbff;
+}
+
+/* Pulsing pin on the hub the player is considering, before the airline exists. */
+.hub-candidate-pin {
+  position: relative;
+  pointer-events: none;
+}
+.hub-candidate-pin .hcp-dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--sand-tan, #e1b382);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.hub-candidate-pin .hcp-pulse {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border-radius: 50%;
+  background: var(--sand-tan, #e1b382);
+  opacity: 0.75;
+  animation: hcp-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+@keyframes hcp-ping {
+  0%   { transform: scale(1);   opacity: 0.75; }
+  70%  { transform: scale(3.6); opacity: 0; }
+  100% { transform: scale(3.6); opacity: 0; }
+}
+/* Respect a reduced-motion preference: keep the pin, drop the animation. */
+@media (prefers-reduced-motion: reduce) {
+  .hub-candidate-pin .hcp-pulse { animation: none; opacity: 0.35; transform: scale(2.2); }
+}

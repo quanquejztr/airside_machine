@@ -76,3 +76,14 @@ bts_gravity_band1_nm,800
 bts_gravity_band2_nm,3000
 bts_small_small_damp,1.0
 bts_gravity_quantile_blend,0.75
+aircraft_depreciation_annual_rate,0.06
+aircraft_usage_wear_factor,0.25
+aircraft_usage_reference_hours,5000
+aircraft_condition_penalty,0.85
+aircraft_sale_haircut,0.92
+aircraft_residual_floor,0.15
+lease_early_return_weeks,4
+od_share_default,0.85
+hub_connect_min_routes,4
+hub_connect_full_routes,14
+hub_connect_od_threshold,0.70

@@ -753,12 +753,17 @@ def ensure_slot_allocations_for_week(next_week: int) -> None:
         held = int(r["slots_held"] or 0)
         if held <= 0:
             continue
+        # Upsert, not INSERT OR IGNORE: a row for the new week may already have been
+        # created before settlement ran (spawning and the API both touch it), and
+        # ignoring the conflict would silently drop the carried entitlement.
         db.execute(
             """
-            INSERT OR IGNORE INTO slot_allocations (
+            INSERT INTO slot_allocations (
                 allocation_id, airport_iata, holder_id, game_week,
                 slots_held, used_this_week, below_threshold_weeks
             ) VALUES (?, ?, ?, ?, ?, 0, ?)
+            ON CONFLICT(airport_iata, holder_id, game_week) DO UPDATE
+            SET slots_held = MAX(slot_allocations.slots_held, excluded.slots_held)
             """,
             (
                 str(uuid.uuid4()),
@@ -788,15 +793,78 @@ def slot_auction_units() -> int:
     return max(1, int(_const_num("slot_auction_units", 30.0)))
 
 
+# How far back to look for a previous allocation when materialising a missing week.
+CARRY_FORWARD_LOOKBACK_WEEKS = 8
+
+
+def latest_prior_allocation(iata: str, holder_id: str, game_week: int) -> Optional[dict]:
+    """Most recent allocation row for this holder/airport strictly before ``game_week``."""
+    row = db.fetch_one(
+        """
+        SELECT game_week, slots_held, below_threshold_weeks
+        FROM slot_allocations
+        WHERE airport_iata = ? AND holder_id = ? AND game_week < ? AND game_week >= ?
+        ORDER BY game_week DESC
+        LIMIT 1
+        """,
+        (
+            str(iata).upper().strip(),
+            str(holder_id),
+            int(game_week),
+            int(game_week) - CARRY_FORWARD_LOOKBACK_WEEKS,
+        ),
+    )
+    return dict(row) if row else None
+
+
+def carry_forward_allocation(iata: str, holder_id: str, game_week: int) -> int:
+    """
+    Materialise this week's allocation from the previous one if it is missing.
+
+    Holdings are a standing entitlement: once you hold quota it stays yours until
+    use-it-or-lose-it takes it at a season boundary. Settlement copies each week's
+    rows forward, but it runs asynchronously after the week flip while spawning and
+    the API already read the new week, so anything that reads a holding before
+    settlement lands must be able to heal the gap itself. Without this, a missing
+    row reads as zero and the schedule that was legal last week is refused.
+    """
+    ap = str(iata).upper().strip()
+    hid = str(holder_id)
+    gw = int(game_week)
+    prior = latest_prior_allocation(ap, hid, gw)
+    if not prior:
+        return 0
+    held = int(prior.get("slots_held") or 0)
+    if held <= 0:
+        return 0
+    db.execute(
+        """
+        INSERT INTO slot_allocations (
+            allocation_id, airport_iata, holder_id, game_week,
+            slots_held, used_this_week, below_threshold_weeks
+        ) VALUES (?, ?, ?, ?, ?, 0, ?)
+        ON CONFLICT(airport_iata, holder_id, game_week) DO UPDATE
+        SET slots_held = MAX(slot_allocations.slots_held, excluded.slots_held)
+        """,
+        (str(uuid.uuid4()), ap, hid, gw, held, int(prior.get("below_threshold_weeks") or 0)),
+    )
+    return held
+
+
 def slots_held(iata: str, holder_id: str, game_week: int) -> int:
+    ap = str(iata).upper().strip()
+    hid = str(holder_id)
+    gw = int(game_week)
     row = db.fetch_one(
         """
         SELECT slots_held FROM slot_allocations
         WHERE airport_iata = ? AND holder_id = ? AND game_week = ?
         """,
-        (str(iata).upper().strip(), str(holder_id), int(game_week)),
+        (ap, hid, gw),
     )
-    return int(row["slots_held"] or 0) if row else 0
+    if row:
+        return int(row["slots_held"] or 0)
+    return carry_forward_allocation(ap, hid, gw)
 
 
 def ensure_min_slots_held(
@@ -931,6 +999,13 @@ def grandfather_historic_slot_holdings(game_week: int) -> None:
                 (ap, hid, gw),
             )
             if exists:
+                continue
+            # A holder who already held quota at this airport carries it forward; the
+            # historic grant is a one-time amnesty for schedules that predate quotas,
+            # not a weekly re-baseline. Re-granting "movements flown so far this week"
+            # to an established holder silently caps them at whatever happened to be
+            # spawned at that instant, which then refuses the rest of their schedule.
+            if carry_forward_allocation(ap, hid, gw) > 0:
                 continue
             used = int(sum(hourly_movements_at(ap, gw, holder_id=hid).values()))
             if used <= 0:

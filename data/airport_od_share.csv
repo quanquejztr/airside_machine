@@ -1,0 +1,89 @@
+iata,od_share,note
+# Fraction of an airport's passengers who begin or end their journey there, as opposed
+# to connecting onward. The demand anchors in bts_demand_anchors.csv are SEGMENT traffic
+# and therefore already include connecting passengers, so this column is what separates
+# "people who want to be here" from "people changing planes".
+#
+# travel demand (5-icon bar) = od_share x total
+# transit power (the Nx)     = 1 / od_share
+#
+# TODO VERIFY: every value below is an approximation entered from general knowledge of
+# published O&D shares, not from a sourced dataset. They are directionally right — ATL
+# near 0.30 and LAS near 0.95 are well established — but they should be checked against
+# real figures before being treated as authoritative. Airports absent from this file use
+# the od_share_default constant (0.85), which suits small and regional airports where
+# almost all traffic is local.
+#
+# --- US connecting hubs ---
+ATL,0.30,mega connecting hub
+CLT,0.20,most connection-dependent large US hub
+DFW,0.40,
+ORD,0.45,
+DEN,0.45,
+IAH,0.45,
+PHL,0.50,
+DTW,0.45,
+MSP,0.45,
+SLC,0.35,regional connecting hub
+# --- US mostly origin-destination ---
+LAX,0.75,
+JFK,0.75,
+SFO,0.65,
+SEA,0.65,
+BOS,0.85,
+LGA,0.95,slot-limited and almost pure O&D
+DCA,0.85,
+SAN,0.95,
+PDX,0.85,
+TPA,0.90,
+# --- US leisure destinations ---
+LAS,0.95,pure leisure destination
+MCO,0.95,pure leisure destination
+HNL,0.85,island destination
+FLL,0.90,
+RSW,0.95,
+# --- US other ---
+MIA,0.55,
+PHX,0.60,
+EWR,0.60,
+IAD,0.55,
+ANC,0.75,remote —  little connecting pax
+# --- Europe ---
+LHR,0.65,
+AMS,0.40,major transfer hub
+FRA,0.45,major transfer hub
+CDG,0.55,
+IST,0.45,
+MAD,0.60,
+FCO,0.75,
+MUC,0.55,
+LGW,0.90,
+DUB,0.80,
+CPH,0.60,
+ZRH,0.55,
+VIE,0.55,
+# --- Middle East / Asia-Pacific ---
+DXB,0.35,built as a transfer hub
+DOH,0.20,extreme transfer hub
+AUH,0.40,
+SIN,0.50,
+ICN,0.55,
+HKG,0.55,
+NRT,0.60,
+HND,0.75,
+KUL,0.60,
+BKK,0.70,
+SYD,0.75,
+MEL,0.85,
+PVG,0.65,
+PEK,0.70,
+CAN,0.65,
+DEL,0.70,
+BOM,0.80,
+# --- Americas (non-US) ---
+YYZ,0.65,
+MEX,0.70,
+GRU,0.65,
+BOG,0.55,
+PTY,0.25,Copa's connecting bank
+SCL,0.75,

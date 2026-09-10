@@ -326,6 +326,122 @@ function resetClientWorld() {
   didFitFlights = false;
 }
 
+let hubPreviewMarker = null;
+
+/** Pulse a pin on the candidate hub so it is findable once the map settles. */
+function markHubCandidate(iata) {
+  clearHubCandidateMark();
+  if (!mapInst || !airportDraftLayer) return;
+  const ll = airportLatLon(iata);
+  if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lon)) return;
+  hubPreviewMarker = L.marker([ll.lat, ll.lon], {
+    icon: L.divIcon({
+      className: "hub-candidate-pin",
+      html: `<span class="hcp-pulse"></span><span class="hcp-dot"></span>`,
+      iconSize: [22, 22],
+      iconAnchor: [11, 11],
+    }),
+    interactive: false,
+    keyboard: false,
+    zIndexOffset: 900,
+  }).addTo(airportDraftLayer);
+}
+
+function clearHubCandidateMark() {
+  if (hubPreviewMarker && airportDraftLayer) {
+    try { airportDraftLayer.removeLayer(hubPreviewMarker); } catch (_) { /* layer already gone */ }
+  }
+  hubPreviewMarker = null;
+}
+
+/** Preview the hub the player is typing: fly the map there and show its demand. */
+function wireHubPreview(root) {
+  const input = root.querySelector('input[name="home_hub_iata"]');
+  const panel = root.querySelector("#hub-preview");
+  if (!input || !panel) return;
+
+  let timer = null;
+  let seq = 0;
+  let lastCode = "";
+
+  const render = (p) => {
+    const filled = Number(p.travel_demand_icons) || 0;
+    const max = Number(p.travel_demand_icons_max) || 5;
+    const icons =
+      '<span class="hp-on">' + "●".repeat(filled) + "</span>" +
+      '<span class="hp-off">' + "○".repeat(Math.max(0, max - filled)) + "</span>";
+    const comp = (p.competitors || [])
+      .map((c) => `${escapeHtml(c.name)} (${c.fleet_size})`)
+      .join(", ");
+    const tops = (p.top_destinations || [])
+      .slice(0, 5)
+      .map((d) => escapeHtml(d.iata))
+      .join(" · ");
+    panel.innerHTML = `
+      <div class="hp-head"><b>${escapeHtml(p.iata)}</b> ${escapeHtml(p.city || p.name || "")}</div>
+      <div class="hp-row">
+        <span class="hp-label">Travel demand</span>
+        <span class="hp-icons">${icons}</span>
+        <span class="hp-sub">${Number(p.travel_demand_weekly).toLocaleString()} local pax/wk</span>
+      </div>
+      <div class="hp-row">
+        <span class="hp-label">Transit power</span>
+        <span class="hp-mult">${Number(p.transit_power).toFixed(1)}×</span>
+        <span class="hp-sub">${Number(p.connecting_weekly).toLocaleString()} connecting pax/wk</span>
+      </div>
+      <div class="hp-meta">
+        ${p.reachable_destinations} destinations in range ·
+        ${Math.round((p.business_share || 0) * 100)}% business ·
+        ${p.gates_by_auction
+          ? '<span class="hp-warn">gates by auction</span>'
+          : '<span class="hp-ok">gates open</span>'}
+      </div>
+      ${tops ? `<div class="hp-meta">Biggest markets: ${tops}</div>` : ""}
+      ${comp ? `<div class="hp-meta hp-warn">Based here: ${comp}</div>` : ""}
+    `;
+    panel.hidden = false;
+  };
+
+  const preview = async () => {
+    const raw = String(input.value || "").trim();
+    if (raw.length < 3) {
+      panel.hidden = true;
+      clearHubCandidateMark();
+      lastCode = "";
+      return;
+    }
+    const mine = ++seq;
+    let code;
+    try {
+      code = await resolveAirportCode(raw);
+    } catch (_) {
+      // Still typing, or no match yet — say nothing rather than flash an error.
+      panel.hidden = true;
+      clearHubCandidateMark();
+      return;
+    }
+    if (mine !== seq) return;          // a newer keystroke already superseded this
+    if (code === lastCode) return;
+    lastCode = code;
+    try {
+      const p = await api("/api/hub-profile?iata=" + encodeURIComponent(code));
+      if (mine !== seq) return;
+      render(p);
+      await focusMapOnHub(code, { zoom: 5, duration: 1.0 });
+      if (mine === seq) markHubCandidate(code);
+    } catch (_) {
+      panel.hidden = true;
+      clearHubCandidateMark();
+    }
+  };
+
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(preview, 350);   // wait for a pause in typing
+  });
+  input.addEventListener("blur", preview);
+}
+
 function openAirline() {
   const existing = lastState && lastState.airline;
   const el = openWindow("airline", "Airline", existing
@@ -342,8 +458,9 @@ function openAirline() {
         <label>Airline name</label><input name="name" required placeholder="Smoke Air" />
         <div class="row2">
           <div><label>Callsign (3 letters)</label><input name="callsign" maxlength="3" required placeholder="SMK" /></div>
-          <div><label>Home hub (code, city or name)</label><input name="home_hub_iata" required placeholder="TPA" /></div>
+          <div><label>Home hub (code, city or name)</label><input name="home_hub_iata" required placeholder="TPA" autocomplete="off" /></div>
         </div>
+        <div id="hub-preview" class="hub-preview" hidden></div>
         <p class="muted">Big hubs (SFO, ORD, JFK) need gate auctions before you can fly from them. TPA does not.</p>
         <button type="submit">Create airline</button>
       </form>`);
@@ -377,6 +494,7 @@ function openAirline() {
       } catch (err) { setMsg(el.querySelector(".win-body"), err.message, false); }
     };
   }
+  wireHubPreview(el);
   const form = el.querySelector("form");
   if (!form) return;
   form.onsubmit = async (e) => {
@@ -401,6 +519,8 @@ function openAirline() {
         (lastState.airline && lastState.airline.home_hub_iata) || ""
       ).toUpperCase();
       toast("Airline created");
+      // The candidate pin has done its job; the real hub pin takes over from here.
+      clearHubCandidateMark();
       closeWindow("airline");
       resetClientWorld();
       // Skip the first world-wide flight fit so the hub zoom isn't overridden.
@@ -628,6 +748,10 @@ function routePreviewCard(p) {
       ${flags ? "· " + escapeHtml(flags) : ""}</span></div>`;
   }).join("");
   const market = Number(d.weekly_market_total != null ? d.weekly_market_total : d.total_pax || 0);
+  const yours = Number(d.total_pax != null ? d.total_pax : market);
+  // Say why the market and what you would carry differ, rather than quoting the market
+  // as if it were yours — that gap is what made the preview look wrong after opening.
+  const shortfall = demandShortfallNote(d);
   const src = d.demand_source_badge || "Demand";
   const floorNote = d.market_floor_applied ? " · min market" : "";
   return `
@@ -636,10 +760,11 @@ function routePreviewCard(p) {
         ${Number(p.cost_reference || 0) !== Number(p.total_new_cost || 0)
           ? `<br><span class="muted">one leg would be ${money(p.cost_reference)}</span>` : ""}</div>
       <div><span class="muted">Distance</span><br><b>${Number(p.distance_nm || 0).toLocaleString()} nm</b></div>
-      <div><span class="muted">This week's market</span><br><b>${market.toLocaleString()} pax</b>
+      <div><span class="muted">You would carry</span><br><b>${yours.toLocaleString()} pax</b>
         <br><span class="muted">${escapeHtml(src)}${escapeHtml(floorNote)} ·
         ${Number(d.business_pax || 0).toLocaleString()} business ·
         ${Number(d.leisure_pax || 0).toLocaleString()} leisure</span>
+        ${shortfall ? `<br><span class="muted">of ${market.toLocaleString()} in the market — ${shortfall}</span>` : ""}
         <br><span class="muted">Cabins Y${Number(d.economy_pax || 0)} / W${Number(d.premium_economy_pax || 0)} / J${Number(d.business_cabin_pax || 0)} / F${Number(d.first_pax || 0)}
         (split — not the only number)</span>
         <br><span class="muted">Template ${Number(d.base_demand_business || 0)}B / ${Number(d.base_demand_leisure || 0)}L (internal)</span></div>
@@ -946,6 +1071,72 @@ function scheduleTables(view) {
   return `<p class="muted">Planned schedule (departure order)</p>${list}${grid}`;
 }
 
+/** Offer departure times this chain can actually fly, as one-click chips. */
+async function showSuggestedTimes(el, payloadBase, days, opts = {}) {
+  const slots = $("#so-slots", el);
+  const body = el.querySelector(".win-body");
+  if (!slots) return;
+  slots.hidden = false;
+  slots.innerHTML = '<span class="slot-note">Looking for a free slot…</span>';
+  let out;
+  try {
+    out = await api("/api/schedule/suggest", {
+      method: "POST",
+      body: JSON.stringify({
+        ...payloadBase,
+        days,
+        departure_time: $("#so-time", el).value,
+        limit: 6,
+      }),
+    });
+  } catch (err) {
+    // The chain itself is impossible (range, connectivity, too long): the save error
+    // already said so, so do not pile a second message on top of it.
+    slots.hidden = true;
+    if (opts.announce) setMsg(body, err.message, false);
+    return;
+  }
+  const list = out.suggestions || [];
+  if (!list.length) {
+    slots.innerHTML =
+      '<span class="slot-note">No departure time works for these days. '
+      + "Try fewer days, a shorter chain, or free up the aircraft.</span>";
+    return;
+  }
+  slots.innerHTML =
+    '<span class="slot-note">Works on ' + escapeHtml(days.join(", ")) + ":</span> "
+    + list
+        .map((s) => `<button type="button" class="slot-chip" data-t="${escapeHtml(s.departure_time)}">${escapeHtml(s.departure_time)}</button>`)
+        .join("")
+    + (out.feasible_count > list.length
+        ? `<span class="slot-note">+${out.feasible_count - list.length} more</span>`
+        : "");
+  slots.querySelectorAll(".slot-chip").forEach((btn) => {
+    btn.onclick = () => {
+      $("#so-time", el).value = btn.dataset.t;
+      slots.hidden = true;
+      setMsg(body, `Departure set to ${btn.dataset.t}. Save the schedule to apply it.`, true);
+    };
+  });
+}
+
+/** Phrase the gap between a market and the slice of it a route would actually get. */
+function demandShortfallNote(d) {
+  if (!d) return "";
+  const bits = [];
+  const cap = Number(d.connect_capture != null ? d.connect_capture : 1);
+  if (cap < 0.995) {
+    bits.push(`${Math.round((1 - cap) * 100)}% is connecting traffic you have not earned yet`);
+  }
+  const sb = Number(d.player_share_business != null ? d.player_share_business : 1);
+  const sl = Number(d.player_share_leisure != null ? d.player_share_leisure : 1);
+  const share = Math.min(sb, sl);
+  if (share < 0.995) {
+    bits.push(`competitors take about ${Math.round((1 - share) * 100)}%`);
+  }
+  return bits.join(" · ");
+}
+
 function openScheduleResult(title, data) {
   const u = data.utilization || {};
   openWindow("sched-result", title, `
@@ -1025,6 +1216,8 @@ function openScheduleOptions(preview, chainRaw) {
       <label>First departure (local HH:MM)</label>
       <input id="so-time" type="time" value="08:00" step="60" />
       <button type="button" id="so-detail-go">Save detailed schedule</button>
+      <button type="button" id="so-suggest">Find a time that works</button>
+      <div id="so-slots" class="slot-picks" hidden></div>
     </div>
     <div class="msg"></div>
   `, { width: 1080 });
@@ -1068,7 +1261,20 @@ function openScheduleOptions(preview, chainRaw) {
         }),
       });
       openScheduleResult("Detailed rotation saved", out);
-    } catch (err) { setMsg(body, err.message, false); }
+    } catch (err) {
+      setMsg(body, err.message, false);
+      // A rejection is almost always a timing clash, so offer the way out rather
+      // than leaving the player to hunt for a free slot by trial and error.
+      showSuggestedTimes(el, payloadBase, selectedDays());
+    }
+  };
+  $("#so-suggest", el).onclick = () => {
+    const days = selectedDays();
+    if (!days.length) {
+      setMsg(body, "Pick at least one operating day.", false);
+      return;
+    }
+    showSuggestedTimes(el, payloadBase, days, { announce: true });
   };
   $("#so-clear", el).onclick = async () => {
     try {

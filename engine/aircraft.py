@@ -196,9 +196,16 @@ def buy_aircraft(type_id, tail_number=None, cabin_seats=None):
         INSERT INTO fleet (
             tail_number, type_id, ownership, status,
             current_airport_iata, lease_weekly_cost,
-            lease_weeks_remaining, weeks_since_maintenance, aog_reason
-        ) VALUES (?, ?, 'OWNED', 'IDLE', ?, 0.0, NULL, 0, NULL)
-    """, (tail_number, type_id, airline['home_hub_iata']))
+            lease_weeks_remaining, weeks_since_maintenance, aog_reason,
+            acquired_game_week, purchase_price_paid, total_airborne_hours
+        ) VALUES (?, ?, 'OWNED', 'IDLE', ?, 0.0, NULL, 0, NULL, ?, ?, 0)
+    """, (
+        tail_number,
+        type_id,
+        airline['home_hub_iata'],
+        _current_game_week(),
+        float(purchase_price),
+    ))
 
     if cabin is not None:
         _insert_initial_fleet_cabin(tail_number, type_id, *cabin)
@@ -256,7 +263,10 @@ def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None):
     if not aircraft:
         raise ValueError(f"Aircraft type '{type_id}' not found in catalog.")
     
-    # Check cash and charge the first week now so $0 cash cannot lease.
+    # Require the first week's rent in hand so a broke airline cannot lease, but do not
+    # take it here: charging outside settlement moved real money without it ever appearing
+    # as a cost in week_ledger, so the books showed $0 lease costs while cash fell.
+    # Settlement bills every leased tail, including its first week.
     weekly_cost = float(aircraft['weekly_lease_cost'] or 0)
     if airline['cash'] < weekly_cost:
         raise ValueError(
@@ -281,14 +291,26 @@ def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None):
         INSERT INTO fleet (
             tail_number, type_id, ownership, status,
             current_airport_iata, lease_weekly_cost,
-            lease_weeks_remaining, lease_prepaid, weeks_since_maintenance, aog_reason
-        ) VALUES (?, ?, 'LEASED', 'IDLE', ?, ?, ?, 1, 0, NULL)
-    """, (tail_number, type_id, airline['home_hub_iata'], weekly_cost, weeks))
+            lease_weeks_remaining, lease_prepaid, weeks_since_maintenance, aog_reason,
+            acquired_game_week, purchase_price_paid, total_airborne_hours
+        ) VALUES (?, ?, 'LEASED', 'IDLE', ?, ?, ?, 0, 0, NULL, ?, ?, 0)
+    """, (
+        tail_number,
+        type_id,
+        airline['home_hub_iata'],
+        weekly_cost,
+        weeks,
+        _current_game_week(),
+        # Leased aircraft are never sold, but recording list price keeps the column
+        # meaningful if a lease is ever converted to ownership.
+        float(aircraft['purchase_price'] or 0),
+    ))
 
     if cabin is not None:
         _insert_initial_fleet_cabin(tail_number, type_id, *cabin)
 
-    new_cash = update_cash(-weekly_cost)
+    # Not charged here on purpose — see above. Settlement bills it.
+    new_cash = float((get_airline() or {}).get("cash") or 0.0)
 
     fleet_aircraft = {
         'tail_number': tail_number,
@@ -303,6 +325,214 @@ def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None):
     }
 
     return fleet_aircraft
+
+def _current_game_week() -> int:
+    row = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    return int(row["game_week"] or 1) if row else 1
+
+
+def _fc(key: str, default: float) -> float:
+    try:
+        v = db.get_financial_constant(key)
+        return float(default if v is None else v)
+    except Exception:
+        return float(default)
+
+
+def estimate_resale_value(tail_number: str) -> dict:
+    """What an owned aircraft would fetch, with the reasoning behind the number.
+
+    Value falls with calendar age, with hours flown, and with overdue maintenance, then
+    takes a transaction haircut and is floored at a residual. Returning the breakdown
+    rather than a bare figure lets the UI explain *why* an aircraft is worth what it is.
+    """
+    tail_number = str(tail_number or "").strip().upper()
+    row = db.fetch_one(
+        """
+        SELECT f.tail_number, f.type_id, f.ownership, f.acquired_game_week,
+               f.purchase_price_paid, f.total_airborne_hours, f.weeks_since_maintenance,
+               t.purchase_price, t.maintenance_interval_weeks
+        FROM fleet f JOIN aircraft_types t ON t.type_id = f.type_id
+        WHERE f.tail_number = ?
+        """,
+        (tail_number,),
+    )
+    if not row:
+        raise ValueError(f"Aircraft '{tail_number}' not found in fleet.")
+
+    paid = float(row["purchase_price_paid"] or row["purchase_price"] or 0.0)
+    acquired = int(row["acquired_game_week"] or 1)
+    age_weeks = max(0, _current_game_week() - acquired)
+    hours = float(row["total_airborne_hours"] or 0.0)
+
+    annual_rate = _fc("aircraft_depreciation_annual_rate", 0.06)
+    wear = _fc("aircraft_usage_wear_factor", 0.25)
+    ref_hours = max(1.0, _fc("aircraft_usage_reference_hours", 5000.0))
+    condition_penalty = _fc("aircraft_condition_penalty", 0.85)
+    haircut = _fc("aircraft_sale_haircut", 0.92)
+    floor_frac = _fc("aircraft_residual_floor", 0.15)
+
+    age_factor = (1.0 - annual_rate) ** (age_weeks / 52.0)
+    usage_factor = 1.0 - wear * min(1.0, hours / ref_hours)
+
+    interval = row["maintenance_interval_weeks"]
+    overdue = bool(interval and int(row["weeks_since_maintenance"] or 0) > int(interval))
+    condition_factor = condition_penalty if overdue else 1.0
+
+    value = paid * age_factor * usage_factor * condition_factor * haircut
+    floor_value = paid * floor_frac
+    value = max(value, floor_value)
+
+    return {
+        "tail_number": tail_number,
+        "ownership": str(row["ownership"]),
+        "purchase_price_paid": paid,
+        "age_weeks": age_weeks,
+        "airborne_hours": round(hours, 1),
+        "maintenance_overdue": overdue,
+        "age_factor": round(age_factor, 4),
+        "usage_factor": round(usage_factor, 4),
+        "condition_factor": round(condition_factor, 4),
+        "sale_haircut": haircut,
+        "residual_floor": round(floor_value, 2),
+        "floor_applied": value <= floor_value + 1e-6,
+        "estimated_value": round(value, 2),
+    }
+
+
+def lease_return_penalty(tail_number: str) -> float:
+    """Flat fee for handing a lease back early, in weeks of rent."""
+    row = db.fetch_one(
+        "SELECT lease_weekly_cost FROM fleet WHERE tail_number = ?",
+        (str(tail_number).strip().upper(),),
+    )
+    weekly = float(row["lease_weekly_cost"] or 0.0) if row else 0.0
+    return round(weekly * _fc("lease_early_return_weeks", 4.0), 2)
+
+
+def _tail_has_active_flights(tail_number: str) -> int:
+    """Flights that still have to operate. LANDED/CANCELLED legs are history.
+
+    The auto-ferry home is itself a flight, so counting landed legs would leave every
+    ferried aircraft permanently blocked from disposal.
+    """
+    row = db.fetch_one(
+        """
+        SELECT COUNT(*) AS c FROM flight_segments
+        WHERE tail_number = ?
+          AND status IN ('SCHEDULED', 'DELAYED', 'IN_AIR', 'HOLDING', 'DIVERTED')
+        """,
+        (str(tail_number).strip().upper(),),
+    )
+    return int(row["c"] or 0) if row else 0
+
+
+def disposal_blockers(tail_number: str) -> list:
+    """Why this aircraft cannot be disposed of right now (empty list = ready)."""
+    tail_number = str(tail_number or "").strip().upper()
+    ac = get_fleet_aircraft(tail_number)
+    if not ac:
+        raise ValueError(f"Aircraft '{tail_number}' not found in fleet.")
+    airline = get_airline()
+    hub = str((airline or {}).get("home_hub_iata") or "").upper()
+
+    blockers = []
+    if str(ac.get("status")) == "AOG":
+        blockers.append(
+            f"{tail_number} is AOG ({ac.get('aog_reason') or 'grounded'}). Repair it first."
+        )
+    if str(ac.get("current_airport_iata") or "").upper() != hub:
+        blockers.append(
+            f"{tail_number} is at {ac.get('current_airport_iata')}, not the hub {hub}."
+        )
+    n = _tail_has_active_flights(tail_number)
+    if n:
+        blockers.append(f"{tail_number} still has {n} flight(s) to operate.")
+    return blockers
+
+
+def request_disposal(tail_number: str) -> dict:
+    """Queue an aircraft to be sold (OWNED) or handed back (LEASED) at the next week roll.
+
+    Clears the aircraft's schedule and, if it is away from base, positions it home — so
+    the player can act from anywhere instead of manually unwinding the rotation first.
+    The quote is an estimate: it is recomputed at execution, because the ferry adds hours
+    and those hours reduce the price.
+    """
+    tail_number = str(tail_number or "").strip().upper()
+    ac = get_fleet_aircraft(tail_number)
+    if not ac:
+        raise ValueError(f"Aircraft '{tail_number}' not found in fleet.")
+    if ac.get("pending_disposal"):
+        raise ValueError(f"{tail_number} is already queued for disposal.")
+    if str(ac.get("status")) == "AOG":
+        raise ValueError(
+            f"{tail_number} is AOG ({ac.get('aog_reason') or 'grounded'}) and cannot be "
+            "moved or disposed of. Repair it first."
+        )
+
+    ownership = str(ac.get("ownership") or "").upper()
+    kind = "SELL" if ownership == "OWNED" else "RETURN_LEASE"
+
+    quote = estimate_resale_value(tail_number) if kind == "SELL" else None
+    penalty = lease_return_penalty(tail_number) if kind == "RETURN_LEASE" else 0.0
+
+    from engine.scheduling import cancel_rotation, schedule_ferry_to_hub
+
+    # cancel_rotation already positions a down-route aircraft home and returns that ferry
+    # (it returns True when none was needed). Scheduling another here would collide with
+    # the one it just made, fail, and leave the disposal held at the outstation forever.
+    ferry = None
+    try:
+        res = cancel_rotation(tail_number, wipe_completed_this_week=False)
+        if isinstance(res, dict):
+            ferry = res
+    except Exception:
+        pass
+
+    airline = get_airline() or {}
+    hub = str(airline.get("home_hub_iata") or "").upper()
+    if ferry is None and str(ac.get("current_airport_iata") or "").upper() != hub:
+        try:
+            ferry = schedule_ferry_to_hub(tail_number, hub)
+        except Exception as e:
+            raise ValueError(
+                f"{tail_number} is at {ac.get('current_airport_iata')} and could not be "
+                f"positioned to {hub}: {e}"
+            )
+
+    week = _current_game_week()
+    db.execute(
+        "UPDATE fleet SET pending_disposal = ?, pending_disposal_week = ? WHERE tail_number = ?",
+        (kind, week, tail_number),
+    )
+    return {
+        "tail_number": tail_number,
+        "kind": kind,
+        "requested_week": week,
+        "estimated_value": (quote or {}).get("estimated_value"),
+        "valuation": quote,
+        "penalty": penalty,
+        "ferry": ferry,
+        "blockers": disposal_blockers(tail_number),
+    }
+
+
+def cancel_disposal(tail_number: str) -> dict:
+    """Take an aircraft back off the disposal queue. Its schedule is not restored."""
+    tail_number = str(tail_number or "").strip().upper()
+    ac = get_fleet_aircraft(tail_number)
+    if not ac:
+        raise ValueError(f"Aircraft '{tail_number}' not found in fleet.")
+    if not ac.get("pending_disposal"):
+        raise ValueError(f"{tail_number} is not queued for disposal.")
+    db.execute(
+        "UPDATE fleet SET pending_disposal = NULL, pending_disposal_week = NULL"
+        " WHERE tail_number = ?",
+        (tail_number,),
+    )
+    return {"tail_number": tail_number, "cancelled": True}
+
 
 def get_aircraft_seat_config(tail_number, type_id: str) -> str:
     """
