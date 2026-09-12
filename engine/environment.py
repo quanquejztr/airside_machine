@@ -13,7 +13,12 @@ from typing import Dict, Optional, Set
 from db import db
 
 
-_closed_lock = threading.Lock()
+# RLock, not Lock: several helpers here legitimately call each other while holding it
+# (weather_closure_hits_active_flights -> is_airport_closed_at), and a non-reentrant lock
+# turned that into a permanent self-deadlock of the clock thread. The call below is also
+# restructured so the lock is not held across it, but the reentrant lock keeps the other
+# nine acquisition sites in this module safe against the same mistake.
+_closed_lock = threading.RLock()
 # iata -> absolute game hour when airport reopens
 _closure_until: Dict[str, float] = {}
 
@@ -77,8 +82,16 @@ def weather_closure_hits_active_flights() -> Optional[str]:
     gs = db.fetch_one("SELECT game_hours_elapsed FROM game_state WHERE id = 1")
     ghe = float(gs["game_hours_elapsed"] or 0.0) if gs else 0.0
 
+    # Snapshot under the lock, then evaluate outside it. Calling is_airport_closed_at()
+    # from inside the comprehension re-entered this same lock and deadlocked the clock
+    # thread against the callback worker, which was blocked in expire_closures_before().
     with _closed_lock:
-        closed = [k for k, u in _closure_until.items() if is_airport_closed_at(k, ghe)]
+        snapshot = dict(_closure_until)
+    closed = [
+        k
+        for k, u in snapshot.items()
+        if math.isinf(u) or ghe < u
+    ]
 
     if not closed:
         return None

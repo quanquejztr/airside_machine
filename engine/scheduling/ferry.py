@@ -389,6 +389,36 @@ def schedule_ferry_reposition(
     }
 
 
+def reconcile_tail_location(tail_number: str) -> Optional[str]:
+    """Make `fleet.current_airport_iata` agree with the aircraft's own flight history.
+
+    There are two records of where an aircraft is: the `fleet` column, written by
+    `on_arrival`, and the last arrival in `flight_segments`. They drift apart whenever a
+    leg reaches LANDED without `on_arrival` running for it — settlement catch-up and
+    replayed weeks both do that — and the two then contradict each other.
+
+    That split produced real failures. Repositioning was refused with "the aircraft is at
+    MCO, but this leg departs SFO" for a tail whose own schedule said SFO, and fleet
+    disposal quietly created no ferry home because one source thought the aircraft was
+    already at the hub while the other did not, leaving the sale held forever.
+
+    The flight history wins: it is derived from what actually happened, whereas the column
+    is a cache of it. Returns the reconciled airport.
+    """
+    tail = str(tail_number).strip().upper()
+    pos, _free = tail_position_and_free_hour(tail)
+    if not pos:
+        return None
+    ac = get_fleet_aircraft(tail)
+    current = str((ac or {}).get("current_airport_iata") or "").upper()
+    if current != pos:
+        db.execute(
+            "UPDATE fleet SET current_airport_iata = ? WHERE tail_number = ?",
+            (pos, tail),
+        )
+    return pos
+
+
 def schedule_ferry_to_hub(tail_number: str, hub_iata: str = None) -> Optional[Dict[str, Any]]:
     """
     Position an idle tail back to the hub with a real (flown) leg carrying no passengers.
@@ -412,6 +442,7 @@ def schedule_ferry_to_hub(tail_number: str, hub_iata: str = None) -> Optional[Di
     if not hub:
         return None
 
+    reconcile_tail_location(tail)
     pos, free_hour = tail_position_and_free_hour(tail)
     if not pos or pos == hub:
         return None
@@ -491,23 +522,13 @@ def cancel_rotation(tail_number, *, wipe_completed_this_week: bool = False):
         ("IN_AIR" if still_air and int(still_air["c"] or 0) > 0 else "IDLE", tail_number),
     )
 
-    # Do not strand the aircraft down-route: fly it home once the current trip finishes.
-    ferry = None
-    try:
-        ferry = schedule_ferry_to_hub(tail_number)
-    except Exception:
-        ferry = None
-    if ferry:
-        try:
-            from engine.news_feed import push_news
-
-            push_news(
-                f"↩ {tail_number} positioning {ferry['from']}→{ferry['to']} "
-                f"at {ferry['dep_label']} (no passengers)"
-            )
-        except Exception:
-            pass
-
-    return ferry if ferry else True
+    # No automatic ferry home. Repositioning is the player's decision: a rotation may
+    # deliberately begin away from the hub, so an aircraft parked at an outstation is a
+    # valid state and not something to "correct" on their behalf.
+    #
+    # The old behaviour also made the last ferry undeletable — clearing it re-created it
+    # on the next call — and it swallowed the ValueError raised when the two sources of
+    # aircraft position disagreed, silently leaving tails stranded with no message.
+    return True
 
 

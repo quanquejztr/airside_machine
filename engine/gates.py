@@ -118,15 +118,22 @@ def _turn_hours(minutes: Optional[float]) -> float:
 
 
 def _allocated_gates(iata: str, holder_id: str) -> int:
+    """Stands this holder controls at an airport.
+
+    SUM, not a single row: duplicate ACTIVE rows for one holder used to be possible, and a
+    `fetch_one` then reported the first of them, crediting a two-stand holder with one.
+    A unique index now prevents duplicates and a migration merged the existing ones, but
+    summing is the honest read and costs nothing.
+    """
     row = db.fetch_one(
         """
-        SELECT gate_units
+        SELECT COALESCE(SUM(gate_units), 0) AS n
         FROM airport_gate_allocations
         WHERE airport_iata = ? AND holder_id = ? AND status='ACTIVE'
         """,
         (iata.upper().strip(), str(holder_id)),
     )
-    return int(row["gate_units"] or 0) if row else 0
+    return int(row["n"] or 0) if row else 0
 
 
 def _visit_intervals_for_tail_events(
@@ -526,6 +533,7 @@ def assert_player_gate_capacity_for_new_segments(
     segments: list[dict],
     *,
     replace_tails: bool = True,
+    shortfall_mode: bool = False,
 ) -> None:
     """
     Enforce concurrent gates at each auctioned airport for the new segments.
@@ -538,6 +546,15 @@ def assert_player_gate_capacity_for_new_segments(
     replace_tails: when True (default), existing DB segments for tails in this batch are
     excluded before adding the new plan — used when rescheduling one aircraft. When False,
     new segments are checked against the full week already in the DB (weekly spawn adds).
+
+    shortfall_mode: used by the weekly spawn, where the schedule is already published and
+    the player is not at the keyboard. Instead of refusing — which silently dropped the
+    aircraft's entire week — a shortfall event is opened and the flights are allowed to
+    operate; the player then chooses to buy a stand or pay daily. Interactive scheduling
+    leaves this off, because there the player can still fix the plan before committing it.
+
+    Holding no stand at all at an auctioned airport always raises, in both modes: there is
+    nothing to add a unit to, and operating somewhere you have never bid is not a shortfall.
     """
     gw = int(game_week)
     airports: set[str] = set()
@@ -579,7 +596,27 @@ def assert_player_gate_capacity_for_new_segments(
             peak = player_gate_peak_at_airport(
                 ap, wk, extra_segments=segments, exclude_tails=exclude_tails
             )
-            if peak > cap:
+            if peak <= cap:
+                continue
+            if not shortfall_mode:
+                raise ValueError(
+                    f"Not enough concurrent gates at {ap}. Need peak {peak}, have {cap}. "
+                    f"Bid for more gates or spread departures/arrivals out."
+                )
+            pairs = {
+                (
+                    str(s.get("origin_iata") or "").upper().strip(),
+                    str(s.get("dest_iata") or "").upper().strip(),
+                )
+                for s in (segments or [])
+                if ap
+                in (
+                    str(s.get("origin_iata") or "").upper().strip(),
+                    str(s.get("dest_iata") or "").upper().strip(),
+                )
+            }
+            if record_gate_shortfall(ap, wk, peak, pairs) is None:
+                # Priced at nothing because no unit is held — fall back to refusing.
                 raise ValueError(
                     f"Not enough concurrent gates at {ap}. Need peak {peak}, have {cap}. "
                     f"Bid for more gates or spread departures/arrivals out."
@@ -828,12 +865,24 @@ def submit_gate_bid(auction_id: str, units: int, price_per_unit: float, bidder_i
         )
 
 
-def _upsert_allocation(iata: str, holder_id: str, delta_units: int, *, effective_week: int | None = None) -> None:
+def _upsert_allocation(
+    iata: str,
+    holder_id: str,
+    delta_units: int,
+    *,
+    effective_week: int | None = None,
+    price_per_unit: float | None = None,
+) -> None:
+    """Add stands to a holding, tracking a weighted average of what was paid.
+
+    The average is what a later sale is priced from, so buying two units cheaply and one
+    expensively cannot be sold back as three expensive ones.
+    """
     iata = iata.upper().strip()
     hid = str(holder_id)
     row = db.fetch_one(
         """
-        SELECT allocation_id, gate_units, effective_week
+        SELECT allocation_id, gate_units, effective_week, price_paid_per_unit
         FROM airport_gate_allocations
         WHERE airport_iata = ? AND holder_id = ? AND status = 'ACTIVE'
         """,
@@ -850,6 +899,12 @@ def _upsert_allocation(iata: str, holder_id: str, delta_units: int, *, effective
             """,
             (str(uuid.uuid4()), iata, hid, int(max(0, delta_units)), ew),
         )
+        if price_per_unit is not None:
+            db.execute(
+                "UPDATE airport_gate_allocations SET price_paid_per_unit = ?"
+                " WHERE airport_iata = ? AND holder_id = ? AND status = 'ACTIVE'",
+                (float(price_per_unit), iata, hid),
+            )
         return
     new_units = max(0, int(row["gate_units"] or 0) + int(delta_units))
     # Keep the earlier effective week for existing stands. Pushing it forward when
@@ -857,10 +912,40 @@ def _upsert_allocation(iata: str, holder_id: str, delta_units: int, *, effective
     ew = int(row["effective_week"] or 1)
     if effective_week is not None:
         ew = min(ew, int(effective_week)) if int(row["gate_units"] or 0) > 0 else int(effective_week)
+    old_units = int(row["gate_units"] or 0)
+    if price_per_unit is None or new_units <= 0:
+        db.execute(
+            "UPDATE airport_gate_allocations SET gate_units = ?, effective_week = ?"
+            " WHERE allocation_id = ?",
+            (new_units, ew, str(row["allocation_id"])),
+        )
+        return
+    prior = float(row["price_paid_per_unit"] or 0.0)
+    added = max(0, int(delta_units))
+    avg = ((prior * old_units) + (float(price_per_unit) * added)) / float(new_units)
     db.execute(
-        "UPDATE airport_gate_allocations SET gate_units = ?, effective_week = ? WHERE allocation_id = ?",
-        (new_units, ew, str(row["allocation_id"])),
+        "UPDATE airport_gate_allocations SET gate_units = ?, effective_week = ?,"
+        " price_paid_per_unit = ? WHERE allocation_id = ?",
+        (new_units, ew, round(avg, 2), str(row["allocation_id"])),
     )
+
+
+def _claim_auction(auction_id: str) -> bool:
+    """Atomically take ownership of an auction. True only for the caller that won it.
+
+    One statement, one transaction: the conditional UPDATE and the row count that proves
+    it applied happen together, so concurrent resolvers cannot both believe the auction
+    is theirs. Everything else about resolution is safe to run once and only once.
+    """
+    from db.db import get_cursor
+
+    with get_cursor() as cur:
+        cur.execute(
+            "UPDATE airport_gate_auctions SET status = 'RESOLVED'"
+            " WHERE auction_id = ? AND status = 'OPEN'",
+            (str(auction_id),),
+        )
+        return int(cur.rowcount or 0) == 1
 
 
 def resolve_closing_gate_auctions(completed_game_week: int) -> int:
@@ -879,6 +964,19 @@ def resolve_closing_gate_auctions(completed_game_week: int) -> int:
         aid = str(a["auction_id"])
         iata = str(a["airport_iata"]).upper()
         avail = int(a["units_available"] or 0)
+        # Claim the auction BEFORE awarding anything, in one statement, and only proceed
+        # if this call is the one that flipped it out of OPEN.
+        #
+        # The `status = 'OPEN'` filter on the SELECT above is not enough on its own:
+        # awarding and marking RESOLVED were separate commits, so two callers could both
+        # read OPEN and both award. That is not hypothetical — `player_gate_bids()` calls
+        # resolve_overdue_gate_auctions() on the HTTP thread whenever the Gates window is
+        # polled, entirely outside `_settlement_lock`, so a player with that window open
+        # at the week roll raced the settlement thread. The result was every stand awarded
+        # twice and charged twice: a 1-unit bid at ARN, CDG, ZRH, SVO and others became
+        # 2 stands for $16,000, and concurrent inserts left duplicate allocation rows.
+        if not _claim_auction(aid):
+            continue
         player_bid = db.fetch_one(
             """
             SELECT units_requested, price_per_unit
@@ -927,7 +1025,9 @@ def resolve_closing_gate_auctions(completed_game_week: int) -> int:
                 db.execute("UPDATE competitors SET cash = cash - ? WHERE competitor_id = ?", (cost, bidder))
             # New/increased gates become effective next week, and should not be evaluated
             # by the utilization rule for the week that just ended.
-            _upsert_allocation(iata, bidder, take, effective_week=next_week)
+            _upsert_allocation(
+                iata, bidder, take, effective_week=next_week, price_per_unit=price
+            )
             remaining -= take
             if bidder != "PLAYER" and take > 0:
                 try:
@@ -943,7 +1043,7 @@ def resolve_closing_gate_auctions(completed_game_week: int) -> int:
                     )
                 except Exception:
                     pass
-        db.execute("UPDATE airport_gate_auctions SET status = 'RESOLVED' WHERE auction_id = ?", (aid,))
+        # Already marked RESOLVED by the claim above.
         n += 1
         if player_bid:
             want_u = int(player_bid["units_requested"] or 0)
@@ -1126,3 +1226,660 @@ def increment_player_used_for_airport(iata: str) -> None:
         (str(row["allocation_id"]),),
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Gate shortfalls: buy a stand outright, or pay daily until it clears.
+#
+# Running short of stands used to drop the aircraft's entire week silently. The
+# flights now operate regardless and the cost surfaces as a choice: pay once for a
+# permanent extra unit, or accrue a daily penalty until the peak fits again — either
+# because the player won a unit at auction or thinned the schedule.
+#
+# Cash moves the moment each charge lands rather than at settlement, so these two
+# figures are reported in week_ledger but deliberately kept out of `pretax`, exactly
+# as asset_sale_proceeds and lease_return_penalties are. Folding them into pretax
+# while also charging cash live would deduct them twice.
+# ---------------------------------------------------------------------------
+
+GATE_SHORTFALL_OPEN_STATUSES = ("PENDING", "DECLINED")
+
+
+def emergency_gate_fee_rate() -> float:
+    return _fc("emergency_gate_fee_rate", 0.20)
+
+
+def emergency_gate_penalty_rate_per_day() -> float:
+    return _fc("emergency_gate_penalty_rate_per_day", 0.10)
+
+
+def gate_shortfall_penalty_total_multiplier() -> float:
+    """Total penalty across the week, as a multiple of the outright price. >= 1.0."""
+    return max(1.0, _fc("gate_shortfall_penalty_total_multiplier", 1.0))
+
+
+def _chargeable_days_left(game_hours_elapsed: float | None = None) -> int:
+    """Daily charges remaining before the week rolls, counting today's boundary onward."""
+    if game_hours_elapsed is None:
+        row = db.fetch_one("SELECT game_hours_elapsed FROM game_state WHERE id = 1")
+        game_hours_elapsed = float(row["game_hours_elapsed"] or 0.0) if row else 0.0
+    day_of_week = int((float(game_hours_elapsed) % 168.0) // 24.0)
+    return max(1, 7 - day_of_week)
+
+
+def gate_shortfall_penalty_schedule(fee: float, days_total: int) -> List[float]:
+    """Escalating daily charges whose sum is the outright price (times the multiplier).
+
+    A flat rate made declining strictly cheaper than buying, so the purchase branch was
+    never worth taking. The charge now ramps linearly — day k of D costs
+    ``fee * k / (D(D+1)/2)`` — which has two properties worth keeping:
+
+      * the sum over the whole week is exactly the outright price, and since declining
+        leaves the player with no stand at the end of it, buying strictly dominates;
+      * it costs least on the first day and most on the last, so acting early is cheap
+        and procrastinating is expensive, whenever the shortfall is detected.
+    """
+    d = max(1, int(days_total))
+    total = float(fee) * gate_shortfall_penalty_total_multiplier()
+    denom = d * (d + 1) / 2.0
+    return [round(total * k / denom, 2) for k in range(1, d + 1)]
+
+
+def _route_pair_revenue_prev_week(iata: str, game_week: int, route_pairs: set[tuple[str, str]]) -> float:
+    """Last week's gross revenue on the route pairs that caused the shortfall.
+
+    Both directions count: a stand is occupied by the arrival and the departure of the
+    same rotation, so charging only the leg that happened to trip the check first would
+    make the fee depend on spawn ordering.
+    """
+    prev = int(game_week) - 1
+    if prev < 1 or not route_pairs:
+        return 0.0
+    endpoints: set[str] = set()
+    for a, b in route_pairs:
+        endpoints.add(a)
+        endpoints.add(b)
+    if not endpoints:
+        return 0.0
+    marks = ",".join("?" for _ in endpoints)
+    rows = db.fetch_all(
+        f"""
+        SELECT COALESCE(fs.origin_iata, r.origin_iata) AS oi,
+               COALESCE(fs.dest_iata,   r.dest_iata)   AS di,
+               fs.revenue_gross AS rev
+        FROM flight_segments fs
+        JOIN routes r ON r.route_id = fs.route_id
+        WHERE fs.game_week = ?
+          AND fs.status != 'CANCELLED'
+          AND COALESCE(fs.origin_iata, r.origin_iata) IN ({marks})
+          AND COALESCE(fs.dest_iata,   r.dest_iata)   IN ({marks})
+        """,
+        (prev, *endpoints, *endpoints),
+    )
+    total = 0.0
+    for r in rows or []:
+        pair = (str(r["oi"] or "").upper(), str(r["di"] or "").upper())
+        if pair in route_pairs or (pair[1], pair[0]) in route_pairs:
+            total += float(r["rev"] or 0.0)
+    return float(total)
+
+
+def gate_shortfall_fee(
+    iata: str,
+    game_week: int,
+    route_pairs: set[tuple[str, str]] | None = None,
+) -> Dict[str, float]:
+    """Fee for one more stand at `iata`, and the per-day cost of going without.
+
+    fee = route-pair revenue last week x rate x units already held at THIS airport,
+    floored at the auction's minimum unit price x units held. Keying the multiplier to
+    the units held at the airport in question — not the whole network — keeps the charge
+    proportional to the presence that created the shortfall, so a quiet outstation stays
+    cheap while a station you have built up is expensive.
+    """
+    ap = str(iata).upper().strip()
+    gw = int(game_week)
+    units = max(0, _allocated_gates(ap, "PLAYER"))
+    basis = _route_pair_revenue_prev_week(ap, gw, route_pairs or set())
+    fee = basis * emergency_gate_fee_rate() * float(units)
+    floor = _fc("gate_min_price_per_unit", 5000.0) * float(units)
+    fee = max(fee, floor)
+    days_left = _chargeable_days_left()
+    schedule = gate_shortfall_penalty_schedule(fee, days_left)
+    return {
+        "route_revenue_basis": round(basis, 2),
+        "gates_held": units,
+        "fee_amount": round(fee, 2),
+        "penalty_days_total": days_left,
+        "penalty_schedule": schedule,
+        "penalty_total_if_declined": round(sum(schedule), 2),
+        "daily_penalty": schedule[0] if schedule else 0.0,
+    }
+
+
+def _current_game_day() -> int:
+    row = db.fetch_one("SELECT game_hours_elapsed FROM game_state WHERE id = 1")
+    try:
+        return int(float(row["game_hours_elapsed"] or 0.0) // 24.0) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def record_gate_shortfall(
+    iata: str,
+    game_week: int,
+    peak_needed: int,
+    route_pairs: set[tuple[str, str]] | None = None,
+) -> Optional[dict]:
+    """Open a shortfall event, or return the one already open for this airport/week.
+
+    Idempotent by (airport, holder, week): the weekly spawn runs more than once — at
+    launch and again from settlement — and must not open a second event or re-price the
+    first one after the player has answered it.
+    """
+    ap = str(iata).upper().strip()
+    gw = int(game_week)
+    existing = db.fetch_one(
+        """
+        SELECT * FROM gate_shortfall_events
+        WHERE airport_iata = ? AND holder_id = 'PLAYER' AND game_week = ?
+        """,
+        (ap, gw),
+    )
+    if existing:
+        return dict(existing)
+
+    priced = gate_shortfall_fee(ap, gw, route_pairs)
+    if int(priced["gates_held"]) <= 0:
+        # No stand at all here is a different problem: there is nothing to add one to,
+        # and the fee would price at zero. Callers keep raising in that case.
+        return None
+    event_id = str(uuid.uuid4())
+    day = _current_game_day()
+    db.execute(
+        """
+        INSERT INTO gate_shortfall_events (
+            event_id, airport_iata, holder_id, game_week, detected_game_day,
+            peak_needed, gates_held, route_revenue_basis, fee_amount, daily_penalty,
+            status, penalty_days_charged, penalty_accrued, penalty_days_total
+        ) VALUES (?, ?, 'PLAYER', ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, ?)
+        """,
+        (
+            event_id, ap, gw, day, int(peak_needed), int(priced["gates_held"]),
+            float(priced["route_revenue_basis"]), float(priced["fee_amount"]),
+            float(priced["daily_penalty"]), int(priced["penalty_days_total"]),
+        ),
+    )
+    _notify_player(
+        gw,
+        "GATE_SHORTFALL",
+        f"{ap}: your schedule needs {int(peak_needed)} stands but you hold "
+        f"{int(priced['gates_held'])}. The flights are operating. Buy a permanent extra "
+        f"stand for ${priced['fee_amount']:,.0f}, or pay a daily penalty that starts at "
+        f"${priced['daily_penalty']:,.0f} and rises each day — "
+        f"${priced['penalty_total_if_declined']:,.0f} if you wait out the week, and you "
+        f"would still hold no extra stand.",
+    )
+    return dict(
+        db.fetch_one("SELECT * FROM gate_shortfall_events WHERE event_id = ?", (event_id,))
+    )
+
+
+def open_gate_shortfalls(game_week: int | None = None, *, reconcile: bool = True) -> List[dict]:
+    """Shortfall events still awaiting a decision or still accruing.
+
+    `reconcile` closes any whose peak already fits the stands held — the player won a
+    unit at auction, bought one, or thinned the schedule. Without it the prompt kept
+    asking for a decision that no longer existed, because closing them depended entirely
+    on the daily hook having run.
+    """
+    if reconcile:
+        _close_cleared_gate_shortfalls()
+    marks = ",".join("?" for _ in GATE_SHORTFALL_OPEN_STATUSES)
+    if game_week is None:
+        rows = db.fetch_all(
+            f"SELECT * FROM gate_shortfall_events WHERE status IN ({marks})"
+            " ORDER BY game_week DESC, airport_iata",
+            tuple(GATE_SHORTFALL_OPEN_STATUSES),
+        )
+    else:
+        rows = db.fetch_all(
+            f"SELECT * FROM gate_shortfall_events WHERE game_week = ? AND status IN ({marks})"
+            " ORDER BY airport_iata",
+            (int(game_week), *GATE_SHORTFALL_OPEN_STATUSES),
+        )
+    return [dict(r) for r in rows or []]
+
+
+def _close_cleared_gate_shortfalls() -> List[str]:
+    """Mark open shortfalls RESOLVED once the airport's peak fits the stands held."""
+    marks = ",".join("?" for _ in GATE_SHORTFALL_OPEN_STATUSES)
+    rows = db.fetch_all(
+        f"SELECT event_id, airport_iata, game_week FROM gate_shortfall_events"
+        f" WHERE status IN ({marks})",
+        tuple(GATE_SHORTFALL_OPEN_STATUSES),
+    )
+    closed: List[str] = []
+    for r in rows or []:
+        ap = str(r["airport_iata"]).upper()
+        try:
+            if not _shortfall_cleared(ap, int(r["game_week"])):
+                continue
+        except Exception:
+            continue
+        db.execute(
+            "UPDATE gate_shortfall_events SET status = 'RESOLVED', resolved_game_day = ?"
+            " WHERE event_id = ?",
+            (_current_game_day(), str(r["event_id"])),
+        )
+        closed.append(ap)
+        _notify_player(
+            int(r["game_week"]),
+            "GATE_SHORTFALL",
+            f"{ap}: stand shortfall cleared — no further penalty.",
+        )
+    return closed
+
+
+def resolve_gate_shortfall(event_id: str, accept: bool) -> Dict[str, Any]:
+    """Buy the stand (accept) or elect to pay daily instead (decline).
+
+    Accepting adds a permanent unit — the player owns it as if won at auction — and
+    charges through update_cash, which refuses to overdraft: an optional purchase must
+    not be able to bankrupt the airline. Penalties already accrued are not refunded,
+    since those days were genuinely flown short.
+    """
+    from engine.setup import update_cash
+
+    row = db.fetch_one("SELECT * FROM gate_shortfall_events WHERE event_id = ?", (str(event_id),))
+    if not row:
+        raise ValueError("Unknown gate shortfall.")
+    ev = dict(row)
+    if str(ev["status"]) not in GATE_SHORTFALL_OPEN_STATUSES:
+        return {"event_id": ev["event_id"], "status": ev["status"], "changed": False}
+
+    ap = str(ev["airport_iata"]).upper()
+    if not accept:
+        db.execute(
+            "UPDATE gate_shortfall_events SET status = 'DECLINED' WHERE event_id = ?",
+            (str(event_id),),
+        )
+        return {"event_id": ev["event_id"], "status": "DECLINED", "changed": True}
+
+    fee = float(ev["fee_amount"] or 0.0)
+    update_cash(-fee)          # raises ValueError if it would overdraft
+    alloc = db.fetch_one(
+        """
+        SELECT allocation_id, gate_units FROM airport_gate_allocations
+        WHERE airport_iata = ? AND holder_id = 'PLAYER' AND status = 'ACTIVE'
+        """,
+        (ap,),
+    )
+    if alloc:
+        db.execute(
+            "UPDATE airport_gate_allocations SET gate_units = ? WHERE allocation_id = ?",
+            (int(alloc["gate_units"] or 0) + 1, str(alloc["allocation_id"])),
+        )
+    db.execute(
+        """
+        UPDATE gate_shortfall_events
+        SET status = 'PAID', resolved_game_day = ?
+        WHERE event_id = ?
+        """,
+        (_current_game_day(), str(event_id)),
+    )
+    _notify_player(
+        int(ev["game_week"]),
+        "GATE_SHORTFALL",
+        f"{ap}: bought an extra stand for ${fee:,.0f}. You now hold "
+        f"{_allocated_gates(ap, 'PLAYER')} — it is yours permanently.",
+    )
+    return {"event_id": ev["event_id"], "status": "PAID", "charged": fee, "changed": True}
+
+
+def _shortfall_cleared(iata: str, game_week: int) -> bool:
+    """True once the week's scheduled peak fits inside the stands actually held."""
+    ap = str(iata).upper().strip()
+    return player_gate_peak_at_airport(ap, int(game_week)) <= _allocated_gates(ap, "PLAYER")
+
+
+def accrue_gate_shortfall_penalties(game_day: int | None = None) -> Dict[str, Any]:
+    """Charge one day of penalty per open shortfall. Wired to the clock's on_day.
+
+    Called once per game day. `last_charged_game_day` makes it idempotent, so a repeated
+    or replayed day cannot double-charge. An event closes as RESOLVED the moment the peak
+    fits again — winning a unit at auction or thinning the schedule stops the bleeding
+    without the player having to come back and dismiss anything.
+
+    Penalties use apply_settlement_cash, not update_cash: this charge is involuntary and
+    must land even if it pushes the airline negative, the same way operating losses do.
+    """
+    from engine.setup import apply_settlement_cash
+
+    day = int(_current_game_day() if game_day is None else game_day)
+    charged = 0.0
+    resolved: List[str] = []
+    billed: List[str] = []
+    for ev in open_gate_shortfalls(reconcile=False):
+        ap = str(ev["airport_iata"]).upper()
+        gw = int(ev["game_week"])
+        if int(ev["last_charged_game_day"] or -1) >= day:
+            continue
+        if _shortfall_cleared(ap, gw):
+            db.execute(
+                """
+                UPDATE gate_shortfall_events
+                SET status = 'RESOLVED', resolved_game_day = ?
+                WHERE event_id = ?
+                """,
+                (day, str(ev["event_id"])),
+            )
+            resolved.append(ap)
+            _notify_player(gw, "GATE_SHORTFALL", f"{ap}: stand shortfall cleared — no further penalty.")
+            continue
+        # Past the end of the week the schedule is a new one; stop charging the old event.
+        if day // 7 + 1 > gw:
+            db.execute(
+                "UPDATE gate_shortfall_events SET status = 'RESOLVED', resolved_game_day = ?"
+                " WHERE event_id = ?",
+                (day, str(ev["event_id"])),
+            )
+            continue
+        k = int(ev["penalty_days_charged"] or 0)          # 0-based index of today's charge
+        d_total = int(ev["penalty_days_total"] or 7)
+        schedule = gate_shortfall_penalty_schedule(float(ev["fee_amount"] or 0.0), d_total)
+        # Past the planned ramp (a week that ran longer than expected) keep charging the
+        # final, highest tranche rather than dropping to nothing.
+        amount = schedule[k] if k < len(schedule) else (schedule[-1] if schedule else 0.0)
+        if amount <= 0:
+            continue
+        apply_settlement_cash(-amount)
+        db.execute(
+            """
+            UPDATE gate_shortfall_events
+            SET penalty_days_charged = penalty_days_charged + 1,
+                penalty_accrued = penalty_accrued + ?,
+                last_charged_game_day = ?
+            WHERE event_id = ?
+            """,
+            (amount, day, str(ev["event_id"])),
+        )
+        charged += amount
+        billed.append(ap)
+    if billed:
+        _notify_player(
+            _current_week_for_notice(),
+            "GATE_SHORTFALL",
+            "Stand shortfall penalty charged for " + ", ".join(sorted(set(billed)))
+            + f": ${charged:,.0f} today.",
+        )
+    return {"game_day": day, "charged": round(charged, 2), "resolved": resolved, "billed": billed}
+
+
+def _current_week_for_notice() -> int:
+    row = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    try:
+        return int(row["game_week"] or 1) if row else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def gate_shortfall_week_totals(game_week: int) -> Dict[str, float]:
+    """Fees paid and penalties accrued in one week, for the ledger."""
+    row = db.fetch_one(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN status = 'PAID' THEN fee_amount ELSE 0 END), 0) AS fees,
+          COALESCE(SUM(penalty_accrued), 0) AS penalties
+        FROM gate_shortfall_events
+        WHERE game_week = ?
+        """,
+        (int(game_week),),
+    )
+    return {
+        "emergency_gate_fees": float(row["fees"] or 0.0) if row else 0.0,
+        "gate_shortfall_penalties": float(row["penalties"] or 0.0) if row else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Selling a stand back.
+#
+# The opposite lever to the emergency purchase above. It matters because
+# utilisation is gate-hours / (gate_units * 168): shedding a unit *raises* the
+# score at that station, so a stop below the retention threshold is better sold
+# than surrendered for nothing after three weeks of grace.
+#
+# The sale is queued and executed at the week roll, deliberately AFTER the new
+# week's segments have spawned, because that is the first moment the next week's
+# true peak is knowable. Checking only the spawned present would let a player
+# sell a stand their published schedule needs.
+# ---------------------------------------------------------------------------
+
+
+def gate_sale_haircut() -> float:
+    return _fc("gate_sale_haircut", 0.85)
+
+
+def _player_home_hub() -> str:
+    row = db.fetch_one("SELECT home_hub_iata FROM airline WHERE id = 1")
+    return str(row["home_hub_iata"]).upper().strip() if row and row["home_hub_iata"] else ""
+
+
+def _weeks_with_player_segments_at(iata: str) -> List[int]:
+    """Weeks that currently hold player movements at this airport, present and future."""
+    gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    cur = int(gs["game_week"] or 1) if gs else 1
+    rows = db.fetch_all(
+        """
+        SELECT DISTINCT fs.game_week AS w
+        FROM flight_segments fs
+        JOIN routes r ON r.route_id = fs.route_id
+        WHERE fs.status != 'CANCELLED'
+          AND fs.game_week >= ?
+          AND (COALESCE(fs.origin_iata, r.origin_iata) = ?
+            OR COALESCE(fs.dest_iata,   r.dest_iata)   = ?)
+        """,
+        (cur, str(iata).upper().strip(), str(iata).upper().strip()),
+    )
+    weeks = {int(r["w"]) for r in rows or []}
+    weeks.add(cur)
+    return sorted(weeks)
+
+
+def gate_sale_blockers(iata: str, units: int = 1) -> List[str]:
+    """Reasons this sale must be refused outright. Empty list means it may be queued.
+
+    These are hard refusals, unlike aircraft disposal blockers, because there is no
+    recovery path: unlike a schedule the engine can unwind for you, a stand you no longer
+    hold cannot be conjured back mid-week.
+    """
+    ap = str(iata).upper().strip()
+    n = max(1, int(units))
+    out: List[str] = []
+    held = _allocated_gates(ap, "PLAYER")
+    if held <= 0:
+        out.append(f"You hold no stands at {ap}.")
+        return out
+    if n > held:
+        out.append(f"You hold {held} stand(s) at {ap}, cannot sell {n}.")
+        return out
+
+    remaining = held - n
+    gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+    cur = int(gs["game_week"] or 1) if gs else 1
+
+    row = db.fetch_one(
+        """
+        SELECT effective_week, pending_sale_units FROM airport_gate_allocations
+        WHERE airport_iata = ? AND holder_id = 'PLAYER' AND status = 'ACTIVE'
+        """,
+        (ap,),
+    )
+    if row and int(row["pending_sale_units"] or 0) > 0:
+        out.append(f"A sale at {ap} is already queued for the next week roll.")
+    if row and int(row["effective_week"] or 1) > cur:
+        out.append(
+            f"Stands at {ap} become effective in week {int(row['effective_week'])}; "
+            "they cannot be sold before then."
+        )
+
+    if remaining <= 0:
+        hub = _player_home_hub()
+        if ap == hub:
+            out.append(f"{ap} is your home hub — you cannot sell your last stand there.")
+        busy = [w for w in _weeks_with_player_segments_at(ap)
+                if player_gate_peak_at_airport(ap, w) > 0]
+        if busy:
+            out.append(
+                f"Selling your last stand at {ap} would leave you operating there with no "
+                f"allocation; flights are scheduled in week(s) "
+                f"{', '.join(str(w) for w in busy)}."
+            )
+
+    for w in _weeks_with_player_segments_at(ap):
+        peak = player_gate_peak_at_airport(ap, w)
+        if peak > remaining:
+            out.append(
+                f"Week {w} needs {peak} concurrent stands at {ap}; selling would leave "
+                f"{remaining}."
+            )
+
+    if [e for e in open_gate_shortfalls() if str(e["airport_iata"]).upper() == ap]:
+        out.append(
+            f"There is an unresolved stand shortfall at {ap}; settle it before selling."
+        )
+    return out
+
+
+def gate_sale_quote(iata: str, units: int = 1) -> Dict[str, Any]:
+    """What selling `units` stands at this airport would pay, and why it might be refused."""
+    ap = str(iata).upper().strip()
+    n = max(1, int(units))
+    held = _allocated_gates(ap, "PLAYER")
+    row = db.fetch_one(
+        """
+        SELECT price_paid_per_unit, pending_sale_units, effective_week
+        FROM airport_gate_allocations
+        WHERE airport_iata = ? AND holder_id = 'PLAYER' AND status = 'ACTIVE'
+        """,
+        (ap,),
+    )
+    paid = float(row["price_paid_per_unit"] or 0.0) if row else 0.0
+    # Units predating price tracking have no recorded cost; the auction floor is the
+    # only defensible stand-in, and it is what they would have cost at minimum.
+    if paid <= 0:
+        paid = _fc("gate_min_price_per_unit", 5000.0)
+    haircut = gate_sale_haircut()
+    weeks = _weeks_with_player_segments_at(ap)
+    return {
+        "airport_iata": ap,
+        "units": n,
+        "gates_held": held,
+        "gates_after": max(0, held - n),
+        "price_paid_per_unit": round(paid, 2),
+        "haircut": haircut,
+        "proceeds": round(paid * haircut * n, 2),
+        "pending_sale_units": int(row["pending_sale_units"] or 0) if row else 0,
+        "peak_by_week": {str(w): player_gate_peak_at_airport(ap, w) for w in weeks},
+        "blockers": gate_sale_blockers(ap, n),
+    }
+
+
+def request_gate_sale(iata: str, units: int = 1) -> Dict[str, Any]:
+    """Queue a stand sale for the next week roll. Refuses if any blocker applies."""
+    ap = str(iata).upper().strip()
+    n = max(1, int(units))
+    blockers = gate_sale_blockers(ap, n)
+    if blockers:
+        raise ValueError(blockers[0])
+    db.execute(
+        "UPDATE airport_gate_allocations SET pending_sale_units = ?"
+        " WHERE airport_iata = ? AND holder_id = 'PLAYER' AND status = 'ACTIVE'",
+        (n, ap),
+    )
+    q = gate_sale_quote(ap, n)
+    _notify_player(
+        _current_week_for_notice(),
+        "GATE_SALE",
+        f"{ap}: {n} stand(s) queued for sale at {q['proceeds']:,.0f}. Completes at the "
+        f"next week roll, and can be cancelled until then.",
+    )
+    return {"airport_iata": ap, "units": n, "proceeds": q["proceeds"], "status": "PENDING"}
+
+
+def cancel_gate_sale(iata: str) -> Dict[str, Any]:
+    ap = str(iata).upper().strip()
+    db.execute(
+        "UPDATE airport_gate_allocations SET pending_sale_units = 0"
+        " WHERE airport_iata = ? AND holder_id = 'PLAYER' AND status = 'ACTIVE'",
+        (ap,),
+    )
+    return {"airport_iata": ap, "status": "CANCELLED"}
+
+
+def pending_gate_sales() -> List[dict]:
+    rows = db.fetch_all(
+        """
+        SELECT airport_iata, gate_units, pending_sale_units, price_paid_per_unit
+        FROM airport_gate_allocations
+        WHERE holder_id = 'PLAYER' AND status = 'ACTIVE' AND pending_sale_units > 0
+        ORDER BY airport_iata
+        """
+    )
+    return [dict(r) for r in rows or []]
+
+
+def process_pending_gate_sales() -> Dict[str, Any]:
+    """Execute queued stand sales. MUST run after the new week's segments have spawned.
+
+    Re-validates rather than trusting the request: a week has passed and the schedule may
+    have grown, so a sale that was safe when queued may no longer be. A sale that no
+    longer qualifies is *held*, not silently dropped — the player keeps the stand and is
+    told why, and the queued sale stays for them to cancel or retry.
+    """
+    from engine.setup import apply_settlement_cash
+
+    sold = 0
+    proceeds_total = 0.0
+    held_back: List[str] = []
+    for row in pending_gate_sales():
+        ap = str(row["airport_iata"]).upper()
+        n = int(row["pending_sale_units"] or 0)
+        if n <= 0:
+            continue
+        blockers = gate_sale_blockers(ap, n)
+        # "Already queued" is the request-time guard; it must not block execution.
+        blockers = [b for b in blockers if "already queued" not in b.lower()]
+        if blockers:
+            held_back.append(ap)
+            _notify_player(
+                _current_week_for_notice(),
+                "GATE_SALE",
+                f"{ap}: stand sale held — {blockers[0]} The stand is still yours.",
+            )
+            continue
+        q = gate_sale_quote(ap, n)
+        amount = float(q["proceeds"])
+        db.execute(
+            """
+            UPDATE airport_gate_allocations
+            SET gate_units = MAX(0, gate_units - ?), pending_sale_units = 0
+            WHERE airport_iata = ? AND holder_id = 'PLAYER' AND status = 'ACTIVE'
+            """,
+            (n, ap),
+        )
+        apply_settlement_cash(amount)
+        sold += n
+        proceeds_total += amount
+        _notify_player(
+            _current_week_for_notice(),
+            "GATE_SALE",
+            f"{ap}: sold {n} stand(s) for {amount:,.0f}. You now hold "
+            f"{_allocated_gates(ap, 'PLAYER')}.",
+        )
+    return {
+        "units_sold": sold,
+        "proceeds": round(proceeds_total, 2),
+        "held": held_back,
+    }

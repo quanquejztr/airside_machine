@@ -681,6 +681,117 @@ def _repair_us_airport_timezones() -> None:
     )
 
 
+def _merge_duplicate_gate_allocations() -> None:
+    """Collapse duplicate ACTIVE gate rows per (airport, holder), then forbid new ones.
+
+    `airport_gate_allocations` only ever had `allocation_id` as its key, so nothing stopped
+    a second ACTIVE row appearing for the same holder at the same airport. When it did,
+    `_allocated_gates` — a `fetch_one` — reported only the first row, so a player holding
+    two stands at CDG was credited with one: schedules refused, and under FEATURE-05 a
+    shortfall could charge them for a stand they already owned. Weekly enforcement iterates
+    rows, so the airport was also judged twice, each row dividing the whole airport's
+    gate-hours by its own unit count.
+
+    Units are summed into the earliest row (keeping the earliest effective_week, so merging
+    cannot re-grace a holding), the extras are deleted, and a unique index makes the state
+    unrepresentable from here on.
+    """
+    rows = fetch_all(
+        """
+        SELECT airport_iata, holder_id, COUNT(*) AS n
+        FROM airport_gate_allocations
+        WHERE status = 'ACTIVE'
+        GROUP BY airport_iata, holder_id
+        HAVING COUNT(*) > 1
+        """
+    )
+    for r in rows or []:
+        dupes = fetch_all(
+            """
+            SELECT allocation_id, gate_units, effective_week, below_threshold_weeks
+            FROM airport_gate_allocations
+            WHERE airport_iata = ? AND holder_id = ? AND status = 'ACTIVE'
+            ORDER BY effective_week, allocation_id
+            """,
+            (r["airport_iata"], r["holder_id"]),
+        )
+        if not dupes or len(dupes) < 2:
+            continue
+        keep = dupes[0]
+        total = sum(int(d["gate_units"] or 0) for d in dupes)
+        # Keep the worst streak: merging must not wipe out an accumulating low-use record.
+        worst = max(int(d["below_threshold_weeks"] or 0) for d in dupes)
+        execute(
+            "UPDATE airport_gate_allocations SET gate_units = ?, below_threshold_weeks = ?"
+            " WHERE allocation_id = ?",
+            (total, worst, str(keep["allocation_id"])),
+        )
+        for d in dupes[1:]:
+            execute(
+                "DELETE FROM airport_gate_allocations WHERE allocation_id = ?",
+                (str(d["allocation_id"]),),
+            )
+    try:
+        execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_alloc_holder_airport_active"
+            " ON airport_gate_allocations(airport_iata, holder_id, status)"
+        )
+    except Exception:
+        # A residual duplicate would make the index fail; the sum-based read still copes.
+        pass
+    _add_column_if_missing(
+        "airport_gate_allocations", "price_paid_per_unit", "REAL NOT NULL DEFAULT 0"
+    )
+    _add_column_if_missing(
+        "airport_gate_allocations", "pending_sale_units", "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+def _add_gate_shortfall_tables() -> None:
+    """Emergency-gate purchases and the daily penalty for running short of stands.
+
+    A gate shortfall no longer drops the schedule: the flights spawn, an event is
+    recorded, and the player chooses between buying a permanent extra unit outright or
+    paying a daily penalty until the shortfall clears. One event per airport per week —
+    spawning is idempotent and re-runs, so the UNIQUE key is what stops a re-run from
+    charging twice.
+    """
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS gate_shortfall_events (
+            event_id TEXT PRIMARY KEY,
+            airport_iata TEXT NOT NULL,
+            holder_id TEXT NOT NULL DEFAULT 'PLAYER',
+            game_week INTEGER NOT NULL,
+            detected_game_day INTEGER NOT NULL,
+            peak_needed INTEGER NOT NULL,
+            gates_held INTEGER NOT NULL,
+            route_revenue_basis REAL NOT NULL DEFAULT 0,
+            fee_amount REAL NOT NULL DEFAULT 0,
+            daily_penalty REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'PENDING'
+                CHECK(status IN ('PENDING','PAID','DECLINED','RESOLVED')),
+            penalty_days_charged INTEGER NOT NULL DEFAULT 0,
+            penalty_accrued REAL NOT NULL DEFAULT 0,
+            last_charged_game_day INTEGER,
+            resolved_game_day INTEGER,
+            UNIQUE(airport_iata, holder_id, game_week)
+        )
+        """
+    )
+    execute(
+        "CREATE INDEX IF NOT EXISTS idx_gate_shortfall_open"
+        " ON gate_shortfall_events(status, game_week)"
+    )
+    for col in ("emergency_gate_fees", "gate_shortfall_penalties"):
+        _add_column_if_missing("week_ledger", col, "REAL NOT NULL DEFAULT 0")
+    # How many daily charges the shortfall has before the week rolls. The penalty ramps
+    # up across exactly these days so the total equals the price of buying outright.
+    _add_column_if_missing(
+        "gate_shortfall_events", "penalty_days_total", "INTEGER NOT NULL DEFAULT 7"
+    )
+
+
 def _repair_slot_allocation_carry_forward() -> None:
     """Restore slot entitlements that were re-baselined at a week flip.
 
@@ -1630,6 +1741,14 @@ def ensure_schema_migrations():
         pass
     try:
         _repair_slot_allocation_carry_forward()
+    except Exception:
+        pass
+    try:
+        _add_gate_shortfall_tables()
+    except Exception:
+        pass
+    try:
+        _merge_duplicate_gate_allocations()
     except Exception:
         pass
     try:

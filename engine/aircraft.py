@@ -478,21 +478,29 @@ def request_disposal(tail_number: str) -> dict:
     penalty = lease_return_penalty(tail_number) if kind == "RETURN_LEASE" else 0.0
 
     from engine.scheduling import cancel_rotation, schedule_ferry_to_hub
+    from engine.scheduling.ferry import reconcile_tail_location
+
+    # Disposal is the one place the engine genuinely needs the aircraft at a specific
+    # airport — it can only be sold or handed back at the hub — so it positions the
+    # aircraft explicitly. Reconcile first: a stale fleet location made this ferry a
+    # no-op, and the disposal was then held at the outstation forever.
+    reconcile_tail_location(tail_number)
 
     # cancel_rotation already positions a down-route aircraft home and returns that ferry
     # (it returns True when none was needed). Scheduling another here would collide with
     # the one it just made, fail, and leave the disposal held at the outstation forever.
     ferry = None
     try:
-        res = cancel_rotation(tail_number, wipe_completed_this_week=False)
-        if isinstance(res, dict):
-            ferry = res
+        cancel_rotation(tail_number, wipe_completed_this_week=False)
     except Exception:
         pass
 
     airline = get_airline() or {}
     hub = str(airline.get("home_hub_iata") or "").upper()
-    if ferry is None and str(ac.get("current_airport_iata") or "").upper() != hub:
+    # Re-read the location: clearing the plan changes where the flight history says the
+    # aircraft ends up, and the value captured before the clear is stale.
+    where = reconcile_tail_location(tail_number) or str(ac.get("current_airport_iata") or "").upper()
+    if where != hub:
         try:
             ferry = schedule_ferry_to_hub(tail_number, hub)
         except Exception as e:

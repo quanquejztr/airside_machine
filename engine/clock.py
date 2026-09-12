@@ -705,9 +705,16 @@ def start_game_clock(
     on_departure=None,
     on_arrival=None,
     *,
+    on_day=None,
     on_ai_departure=None,
     on_ai_arrival=None,
 ):
+    """Start (or return) the global clock.
+
+    `on_day` is forwarded like every other callback. GameClock has accepted it since the
+    milestone loop was written, but this factory silently did not pass it on, so any
+    caller supplying it got a TypeError and nothing daily ever ran.
+    """
     global _global_clock
     if _global_clock is not None and _global_clock.is_alive():
         try:
@@ -723,6 +730,7 @@ def start_game_clock(
     resume_from = game_time["game_hours_elapsed"] if game_time else 0.0
     _global_clock = GameClock(
         on_week=on_week,
+        on_day=on_day,
         on_tick=on_tick,
         on_departure=on_departure,
         on_arrival=on_arrival,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import uuid
 from typing import Any, Dict, List, Optional
 
 from db import db
@@ -633,6 +634,44 @@ def _catch_up_missing_settlements_body(*, limit: Optional[int] = None) -> Dict[s
     }
 
 
+def _report_spawn_failure(game_week: int, stage: str, exc: Exception) -> None:
+    """Make a failed week-roll spawn announce itself.
+
+    These failures used to be caught into a dict field nothing reads — no notification,
+    no ticker line, no log. The visible result was every aircraft showing 0.0h/168h and
+    an empty map, which reads to the player as "my schedules were deleted" rather than
+    "one step failed". Worse, the cause was unrecoverable afterwards, so the same failure
+    could not be diagnosed even once it was noticed.
+
+    The ticker is in-memory only, so the durable record goes to player_notifications.
+    """
+    import traceback as _tb
+
+    detail = f"{type(exc).__name__}: {exc}"
+    try:
+        from engine.news_feed import push_news
+
+        push_news(f"⚠ Week {int(game_week)} {stage} failed: {detail}")
+    except Exception:
+        pass
+    try:
+        db.execute(
+            """
+            INSERT INTO player_notifications (notification_id, game_week, type, route_pair_id, body, read)
+            VALUES (?, ?, 'SPAWN_FAILURE', NULL, ?, 0)
+            """,
+            (
+                str(uuid.uuid4()),
+                int(game_week),
+                f"Week {int(game_week)} {stage} failed — schedules for this week were not "
+                f"created. Your saved rotations are intact; restarting the game respawns "
+                f"them. Cause: {detail} | {_tb.format_exc(limit=3)[-500:]}",
+            ),
+        )
+    except Exception:
+        pass
+
+
 def spawn_segments_for_calendar_week(new_calendar_week: int) -> Dict[str, Any]:
     """
     Spawn player + AI segments for a calendar week on the clock thread at week flip.
@@ -652,14 +691,17 @@ def spawn_segments_for_calendar_week(new_calendar_week: int) -> Dict[str, Any]:
         out["schedule_reset_to_baseline"] = reset_operational_schedule_for_new_calendar_week(gw)
     except Exception as e:
         out["schedule_reset_error"] = str(e)
+        _report_spawn_failure(gw, "schedule reset", e)
     try:
         out["spawn"] = spawn_rotation_segments_for_week(gw)
     except Exception as e:
         out["spawn_error"] = str(e)
+        _report_spawn_failure(gw, "schedule spawn", e)
     try:
         out["spawn_ai"] = spawn_ai_segments_for_week(gw)
     except Exception as e:
         out["spawn_ai_error"] = str(e)
+        _report_spawn_failure(gw, "AI schedule spawn", e)
     return out
 
 
@@ -686,10 +728,24 @@ def enqueue_settlement_after_week_boundary(new_calendar_week: int) -> None:
             result["schedule_reset_to_baseline"] = reset_operational_schedule_for_new_calendar_week(
                 new_calendar_week
             )
-            sp = spawn_rotation_segments_for_week(new_calendar_week)
+            try:
+                sp = spawn_rotation_segments_for_week(new_calendar_week)
+            except Exception as e:
+                _report_spawn_failure(new_calendar_week, "schedule spawn", e)
+                raise
             result["spawn"] = sp
             result["spawn_ai"] = spawn_ai_segments_for_week(new_calendar_week)
             result["new_calendar_week"] = new_calendar_week
+            # Deliberately after the spawn: a stand sale is validated against the new
+            # week's real peak, which does not exist until its segments are on the board.
+            # Selling against the old week would let the player shed a stand their
+            # published schedule needs.
+            try:
+                from engine.gates import process_pending_gate_sales
+
+                result["gate_sales"] = process_pending_gate_sales()
+            except Exception as e:
+                result["gate_sales_error"] = str(e)
             try:
                 from engine.events import schedule_weekly_events
 
@@ -1010,14 +1066,24 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
             except Exception:
                 pass
 
+    # Cash for these already moved when each charge landed, so they are reported here
+    # and kept out of pretax — the same treatment asset sales and lease returns get.
+    try:
+        from engine.gates import gate_shortfall_week_totals
+
+        gate_shortfall_totals = gate_shortfall_week_totals(completed_game_week)
+    except Exception:
+        gate_shortfall_totals = {}
+
     db.execute(
         """
         INSERT INTO week_ledger (
             game_week, revenue_gross, excise_tax, segment_fees, security_fees,
             pfc_fees, landing_fees, gate_fees, fuel_cost, lease_costs,
             maintenance_costs, loan_payments, corporate_tax, net_income,
-            cash_end_of_week, asset_sale_proceeds, lease_return_penalties
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cash_end_of_week, asset_sale_proceeds, lease_return_penalties,
+            emergency_gate_fees, gate_shortfall_penalties
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             completed_game_week,
@@ -1037,6 +1103,8 @@ def _run_settlement_impl(completed_game_week: int) -> Dict[str, Any]:
             cash_end,
             float(disposals.get("proceeds") or 0.0),
             float(disposals.get("penalties") or 0.0),
+            float(gate_shortfall_totals.get("emergency_gate_fees") or 0.0),
+            float(gate_shortfall_totals.get("gate_shortfall_penalties") or 0.0),
         ),
     )
 
