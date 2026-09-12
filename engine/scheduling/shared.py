@@ -90,25 +90,42 @@ def _assert_new_segment_airport_limits(
     *,
     replace_tails: bool = True,
     ferry: bool = False,
+    gate_shortfall_mode: bool = False,
 ) -> None:
     """Gate concurrency and slot hourly caps. Raises ValueError on failure.
 
     ferry=True: repositioning legs skip gate-allocation and weekly slot-quota
     checks (aircraft already sits at the spoke). Hourly runway capacity still applies.
+
+    gate_shortfall_mode=True: a gate shortage opens a payable shortfall event rather than
+    refusing the segments. Runway slots are deliberately excluded from this — an hourly
+    movement cap is the airport authority's limit, and no amount of money creates runway
+    capacity, so slots keep hard-blocking.
     """
     from engine.gates import assert_player_gate_capacity_for_new_segments as _assert_gates
     from engine.slots import assert_player_slots_for_new_segments
 
     if not ferry:
-        _assert_gates(int(game_week), segs, replace_tails=replace_tails)
+        _assert_gates(
+            int(game_week),
+            segs,
+            replace_tails=replace_tails,
+            shortfall_mode=gate_shortfall_mode,
+        )
     assert_player_slots_for_new_segments(int(game_week), segs, ferry=ferry)
 
 
 def _assert_incremental_spawn_airport_limits(game_week: int, segs: list) -> None:
-    """Gate/slot check for weekly spawn adds (DB rows kept; no tail exclusion)."""
+    """Gate/slot check for weekly spawn adds (DB rows kept; no tail exclusion).
+
+    The published schedule is already committed and the week is already running, so a
+    gate shortage here bills rather than blocks.
+    """
     new_segs = _filter_new_spawn_segments(int(game_week), segs)
     if not new_segs:
         return
-    _assert_new_segment_airport_limits(int(game_week), new_segs, replace_tails=False)
+    _assert_new_segment_airport_limits(
+        int(game_week), new_segs, replace_tails=False, gate_shortfall_mode=True
+    )
 
 

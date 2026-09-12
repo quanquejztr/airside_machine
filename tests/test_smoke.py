@@ -753,7 +753,32 @@ class TestFerry(unittest.TestCase):
             (str(uuid.uuid4()), iata, units),
         )
 
-    def test_clearing_a_plan_sends_the_tail_home_with_no_revenue(self):
+    def test_clearing_a_plan_leaves_the_tail_where_it_is(self):
+        """Clearing must not reposition: a rotation may deliberately start away from base."""
+        with TempSave() as db:
+            db.ensure_schema_migrations()
+            from server import game_api as api
+            hub_row = db.fetch_one("SELECT home_hub_iata FROM airline WHERE id = 1")
+            tail_row = db.fetch_one("SELECT tail_number FROM fleet LIMIT 1")
+            if not hub_row or not tail_row:
+                self.skipTest("need an airline and a tail in the save")
+            hub = str(hub_row["home_hub_iata"]).upper()
+            tail = tail_row["tail_number"]
+            away = "SFO" if hub != "SFO" else "JFK"
+            db.execute("DELETE FROM flight_segments WHERE tail_number = ?", (tail,))
+            db.execute("UPDATE fleet SET current_airport_iata=?, status='IDLE' WHERE tail_number=?",
+                       (away, tail))
+
+            out = api.assign_schedule({"tail_number": tail, "mode": "clear"})
+            self.assertTrue(out.get("ok"), out.get("error"))
+            self.assertIsNone(
+                db.fetch_one("SELECT 1 FROM flight_segments WHERE tail_number=? AND is_ferry=1", (tail,)),
+                "clearing must not create a ferry")
+            loc = db.fetch_one("SELECT current_airport_iata FROM fleet WHERE tail_number=?", (tail,))
+            self.assertEqual(away, str(loc["current_airport_iata"]).upper(),
+                             "the aircraft stays where the player left it")
+
+    def test_an_explicit_ferry_carries_no_revenue_but_still_costs(self):
         with TempSave() as db:
             db.ensure_schema_migrations()
             from server import game_api as api
@@ -771,10 +796,10 @@ class TestFerry(unittest.TestCase):
             db.execute("UPDATE fleet SET current_airport_iata=?, status='IDLE' WHERE tail_number=?",
                        (away, tail))
 
-            out = api.assign_schedule({"tail_number": tail, "mode": "clear"})
-            self.assertTrue(out.get("ok"), out.get("error"))
-            ferry = out.get("ferry")
-            self.assertIsNotNone(ferry, "a tail away from hub should be repositioned")
+            from engine.scheduling import schedule_ferry_to_hub
+
+            ferry = schedule_ferry_to_hub(tail, hub)
+            self.assertIsNotNone(ferry, "an explicit reposition must still be possible")
             self.assertEqual(hub, ferry["to"])
 
             seg = db.fetch_one(
@@ -3716,3 +3741,954 @@ class TestFlightNumbers(unittest.TestCase):
                 )
             }
             self.assertEqual({"ZZZ7777", "ZZZ7778"}, fns)
+
+
+# ---------------------------------------------------------------------------
+# Gate shortfalls: bill instead of dropping the schedule (FEATURE-05).
+# ---------------------------------------------------------------------------
+class TestGateShortfall(unittest.TestCase):
+    """A stand shortage bills the player rather than silently deleting their week."""
+
+    AP = "ORD"
+
+    def _setup(self, db, *, units=1):
+        """One stand at ORD and two tails wanting it at the same moment."""
+        import uuid as _uuid
+        db.execute("DELETE FROM gate_shortfall_events")
+        db.execute(
+            "DELETE FROM airport_gate_allocations WHERE airport_iata=? AND holder_id='PLAYER'",
+            (self.AP,),
+        )
+        if units > 0:
+            db.execute(
+                """INSERT INTO airport_gate_allocations
+                   (allocation_id, airport_iata, holder_id, gate_units, used_this_week,
+                    scheduled_this_week, below_threshold_weeks, effective_week, status)
+                   VALUES (?, ?, 'PLAYER', ?, 0, 0, 0, 1, 'ACTIVE')""",
+                (str(_uuid.uuid4()), self.AP, int(units)),
+            )
+        segs = []
+        for i, tail in enumerate(("N001", "N002")):
+            segs.append({"tail_number": tail, "origin_iata": "BOS", "dest_iata": self.AP,
+                         "dep_abs": 400.0 + i * 0.1, "arr_abs": 402.0 + i * 0.1,
+                         "turn_minutes": 45})
+            segs.append({"tail_number": tail, "origin_iata": self.AP, "dest_iata": "BOS",
+                         "dep_abs": 402.75 + i * 0.1, "arr_abs": 404.75 + i * 0.1,
+                         "turn_minutes": 45})
+        return segs
+
+    def test_scheduling_still_refuses_but_spawn_bills(self):
+        """The player can fix a plan they are still writing; a published week must fly."""
+        with fresh_game() as g:
+            from engine.gates import (assert_player_gate_capacity_for_new_segments,
+                                      open_gate_shortfalls)
+            segs = self._setup(g.db)
+            with self.assertRaises(ValueError):
+                assert_player_gate_capacity_for_new_segments(3, segs, replace_tails=False)
+            self.assertEqual([], open_gate_shortfalls(),
+                             "a refused interactive edit must not bill the player")
+
+            assert_player_gate_capacity_for_new_segments(
+                3, segs, replace_tails=False, shortfall_mode=True)
+            # reconcile=False: these segments are a proposal, never inserted, so the live
+            # peak is 0 and reconciliation would rightly close the event on read.
+            open_now = open_gate_shortfalls(reconcile=False)
+            self.assertEqual(1, len(open_now))
+            self.assertEqual(self.AP, open_now[0]["airport_iata"])
+            self.assertEqual(2, int(open_now[0]["peak_needed"]))
+
+    def test_repeated_spawn_does_not_open_a_second_event(self):
+        """Spawn runs at launch and again from settlement; it must not bill twice."""
+        with fresh_game() as g:
+            from engine.gates import (assert_player_gate_capacity_for_new_segments,
+                                      open_gate_shortfalls)
+            segs = self._setup(g.db)
+            for _ in range(3):
+                assert_player_gate_capacity_for_new_segments(
+                    3, segs, replace_tails=False, shortfall_mode=True)
+            self.assertEqual(1, len(open_gate_shortfalls(reconcile=False)))
+
+    def test_no_allocation_at_all_still_hard_blocks(self):
+        """Operating where you have never bid is not a shortfall — there is nothing to add to."""
+        with fresh_game() as g:
+            from engine.gates import (assert_player_gate_capacity_for_new_segments,
+                                      open_gate_shortfalls)
+            segs = self._setup(g.db, units=0)
+            with self.assertRaises(ValueError):
+                assert_player_gate_capacity_for_new_segments(
+                    3, segs, replace_tails=False, shortfall_mode=True)
+            self.assertEqual([], open_gate_shortfalls())
+
+    def test_fee_scales_with_units_at_that_airport_and_has_a_floor(self):
+        """fee = route revenue x rate x units HELD HERE, floored at the auction minimum."""
+        with fresh_game() as g:
+            from engine.gates import gate_shortfall_fee, emergency_gate_fee_rate
+            self._setup(g.db, units=3)
+            priced = gate_shortfall_fee(self.AP, 3, {("BOS", self.AP)})
+            floor = float(g.db.get_financial_constant("gate_min_price_per_unit") or 5000) * 3
+            self.assertEqual(3, priced["gates_held"])
+            expected = max(priced["route_revenue_basis"] * emergency_gate_fee_rate() * 3, floor)
+            self.assertAlmostEqual(expected, priced["fee_amount"], places=2)
+            self.assertGreaterEqual(priced["fee_amount"], floor,
+                                    "the auction minimum is the floor")
+
+    def test_paying_grants_a_permanent_unit_and_stops_the_penalty(self):
+        with fresh_game() as g:
+            from engine.gates import (_allocated_gates, accrue_gate_shortfall_penalties,
+                                      record_gate_shortfall, resolve_gate_shortfall)
+            from engine.setup import get_airline
+            self._setup(g.db)
+            ev = record_gate_shortfall(self.AP, 3, 2, {("BOS", self.AP)})
+            cash0 = float(get_airline()["cash"])
+            out = resolve_gate_shortfall(ev["event_id"], accept=True)
+            self.assertEqual("PAID", out["status"])
+            self.assertAlmostEqual(float(ev["fee_amount"]), cash0 - float(get_airline()["cash"]),
+                                   places=2, msg="the fee must actually leave cash")
+            self.assertEqual(2, _allocated_gates(self.AP, "PLAYER"),
+                             "paying adds a unit the player keeps")
+            self.assertEqual(0.0, accrue_gate_shortfall_penalties(20)["charged"],
+                             "a paid shortfall must not keep charging")
+
+    def test_declining_accrues_daily_and_is_replay_safe(self):
+        with fresh_game() as g:
+            from engine.gates import (accrue_gate_shortfall_penalties, record_gate_shortfall,
+                                      resolve_gate_shortfall)
+            import uuid as _uuid
+            self._setup(g.db)
+            # Real rows on a real route, so the daily re-check sees a genuine shortfall.
+            rid = g.open_route(g.hub, self.AP)
+            for i, tail in enumerate(("N001", "N002")):
+                g.db.execute(
+                    """INSERT INTO flight_segments
+                       (segment_id, game_week, day_of_week, tail_number, route_id,
+                        origin_iata, dest_iata, flight_number, scheduled_dep_time,
+                        scheduled_arr_time, scheduled_dep_game_hour, scheduled_arr_game_hour,
+                        baseline_dep_game_hour, baseline_arr_game_hour, status,
+                        pax_business, pax_leisure, revenue_gross, excise_tax, segment_fee,
+                        security_fee, pfc_fee, landing_fee, gate_fee, fuel_cost,
+                        net_contribution)
+                       VALUES (?,?,'MON',?,?,?,?,?,'08:00','09:30',?,?,?,?,'SCHEDULED',
+                               0,0,0,0,0,0,0,0,0,0,0)""",
+                    (str(_uuid.uuid4()), 3, tail, rid, g.hub, self.AP, f"T{i}",
+                     400.0 + i * 0.1, 402.0 + i * 0.1, 400.0 + i * 0.1, 402.0 + i * 0.1),
+                )
+            from engine.gates import gate_shortfall_penalty_schedule
+
+            ev = record_gate_shortfall(self.AP, 3, 2, {("BOS", self.AP)})
+            sched = gate_shortfall_penalty_schedule(
+                float(ev["fee_amount"]), int(ev["penalty_days_total"]))
+            resolve_gate_shortfall(ev["event_id"], accept=False)
+
+            # The charge ramps: day two costs more than day one.
+            self.assertAlmostEqual(sched[0], accrue_gate_shortfall_penalties(14)["charged"], places=2)
+            self.assertAlmostEqual(sched[1], accrue_gate_shortfall_penalties(15)["charged"], places=2)
+            self.assertEqual(0.0, accrue_gate_shortfall_penalties(15)["charged"],
+                             "the same game day must never be charged twice")
+            row = g.db.fetch_one(
+                "SELECT penalty_days_charged d, penalty_accrued a FROM gate_shortfall_events"
+                " WHERE event_id = ?", (ev["event_id"],))
+            self.assertEqual(2, int(row["d"]))
+            self.assertAlmostEqual(sched[0] + sched[1], float(row["a"]), places=2)
+
+    def test_winning_a_gate_closes_the_shortfall_without_the_player_acting(self):
+        """Fixing the underlying problem should stop the bleeding on its own."""
+        with fresh_game() as g:
+            from engine.gates import (accrue_gate_shortfall_penalties, record_gate_shortfall,
+                                      resolve_gate_shortfall)
+            self._setup(g.db)
+            ev = record_gate_shortfall(self.AP, 3, 2, {("BOS", self.AP)})
+            resolve_gate_shortfall(ev["event_id"], accept=False)
+            g.db.execute(
+                "UPDATE airport_gate_allocations SET gate_units = 2"
+                " WHERE airport_iata = ? AND holder_id = 'PLAYER'", (self.AP,))
+            self.assertEqual(0.0, accrue_gate_shortfall_penalties(14)["charged"])
+            self.assertEqual(
+                "RESOLVED",
+                g.db.fetch_one("SELECT status FROM gate_shortfall_events WHERE event_id = ?",
+                               (ev["event_id"],))["status"])
+
+    def test_week_totals_feed_the_ledger(self):
+        with fresh_game() as g:
+            from engine.gates import (gate_shortfall_week_totals, record_gate_shortfall,
+                                      resolve_gate_shortfall)
+            self._setup(g.db)
+            ev = record_gate_shortfall(self.AP, 3, 2, {("BOS", self.AP)})
+            resolve_gate_shortfall(ev["event_id"], accept=True)
+            totals = gate_shortfall_week_totals(3)
+            self.assertAlmostEqual(float(ev["fee_amount"]),
+                                   totals["emergency_gate_fees"], places=2)
+            self.assertEqual(0.0, totals["gate_shortfall_penalties"])
+
+
+class TestSpawnFailureIsVisible(unittest.TestCase):
+    """A failed week-roll spawn must announce itself, not look like deleted schedules."""
+
+    def test_spawn_failure_writes_a_notification(self):
+        import engine.settlement as S
+
+        with fresh_game() as g:
+            real = S.spawn_rotation_segments_for_week if hasattr(S, "spawn_rotation_segments_for_week") else None
+            import engine.scheduling as SCH
+            original = SCH.spawn_rotation_segments_for_week
+
+            def boom(_gw):
+                raise RuntimeError("database is locked")
+
+            SCH.spawn_rotation_segments_for_week = boom
+            try:
+                out = S.spawn_segments_for_calendar_week(3)
+            finally:
+                SCH.spawn_rotation_segments_for_week = original
+                if real is not None:
+                    S.spawn_rotation_segments_for_week = real
+
+            self.assertIn("spawn_error", out, "the failure must still be reported to the caller")
+            notes = g.db.fetch_all(
+                "SELECT body FROM player_notifications WHERE type = 'SPAWN_FAILURE' AND game_week = 3"
+            )
+            self.assertTrue(notes, "a failed spawn must leave a durable notification")
+            body = str(notes[0]["body"])
+            self.assertIn("database is locked", body, "the cause must be recorded for diagnosis")
+            self.assertIn("intact", body, "tell the player their rotations are not lost")
+
+    def test_successful_spawn_writes_no_failure_notification(self):
+        import engine.settlement as S
+
+        with fresh_game() as g:
+            S.spawn_segments_for_calendar_week(3)
+            self.assertEqual(
+                [],
+                g.db.fetch_all("SELECT 1 FROM player_notifications WHERE type = 'SPAWN_FAILURE'"),
+                "a clean spawn must stay silent",
+            )
+
+
+class TestWeekRollSkippedOnRestart(unittest.TestCase):
+    """A server started inside a week whose roll already fired must still get flights.
+
+    GameClock sets last_week = int(ghe // 168) + 1, and on_week only fires when the
+    calendar week exceeds it. Starting inside week N therefore never fires on_week(N),
+    so spawn_segments_for_calendar_week(N) never runs. Nothing raises — the step simply
+    does not happen — which is why no error handler ever caught it.
+    """
+
+    def test_clock_started_inside_a_week_does_not_fire_that_week_roll(self):
+        from engine.clock import GameClock
+
+        with fresh_game() as g:
+            g.db.execute("UPDATE game_state SET game_hours_elapsed = ?, game_week = ? WHERE id = 1",
+                         (700.0, 5))
+            clk = GameClock()
+            clk.running = False
+            self.assertEqual(5, clk.last_week,
+                             "last_week initialises to the week already in progress")
+            clk.game_hours_elapsed = 700.0
+            fired = clk._collect_milestones_locked()
+            self.assertEqual([], [k for k, _ in fired if k == "week"],
+                             "the in-progress week's roll can never fire — hence the safety net")
+
+    def test_web_bootstrap_heals_a_week_with_no_player_flights(self):
+        import server.game_http as H
+
+        with fresh_game() as g:
+            tail = g.lease()
+            # A non-auctioned spoke, so the rotation needs no gate allocation.
+            g.open_route(g.hub, "BUF")
+            g.open_route("BUF", g.hub)
+            from engine.scheduling import assign_rotation
+            assign_rotation(tail, [f"{g.hub}-BUF", f"BUF-{g.hub}"])
+            g.db.execute("DELETE FROM flight_segments WHERE game_week = 3")
+            g.db.execute("UPDATE game_state SET game_week = 3, game_hours_elapsed = 350 WHERE id = 1")
+            H._player_spawn_healed_week = None
+
+            self.assertEqual(0, g.db.fetch_one(
+                "SELECT COUNT(*) n FROM flight_segments WHERE game_week=3")["n"])
+            H._heal_player_segments_if_missing()
+            after = g.db.fetch_one("SELECT COUNT(*) n FROM flight_segments WHERE game_week=3")["n"]
+            self.assertGreater(after, 0, "a week with templates but no flights must be rebuilt")
+
+            H._heal_player_segments_if_missing()
+            self.assertEqual(after, g.db.fetch_one(
+                "SELECT COUNT(*) n FROM flight_segments WHERE game_week=3")["n"],
+                "the once-per-week guard must make repeat calls free")
+
+
+class TestWeatherClosureDeadlock(unittest.TestCase):
+    """Regression: an active weather closure deadlocked the clock thread on itself.
+
+    `weather_closure_hits_active_flights` held the non-reentrant `_closed_lock` and called
+    `is_airport_closed_at` from inside a comprehension, which acquired the same lock. The
+    clock thread hung permanently and the callback worker piled up behind it in
+    `expire_closures_before`. It only triggered while a closure was active, which is why
+    it presented as the game freezing at an arbitrary moment.
+    """
+
+    def test_active_closure_does_not_hang_the_caller(self):
+        import threading as _th
+        import engine.environment as env
+
+        with fresh_game():
+            env.clear_all_closures()
+            env.set_closure_until("BOS", 9_999_999.0)
+            try:
+                done = _th.Event()
+                err = []
+
+                def call():
+                    try:
+                        env.weather_closure_hits_active_flights()
+                    except Exception as e:      # pragma: no cover - surfaced via err
+                        err.append(e)
+                    finally:
+                        done.set()
+
+                t = _th.Thread(target=call, daemon=True)
+                t.start()
+                self.assertTrue(
+                    done.wait(timeout=10),
+                    "weather_closure_hits_active_flights deadlocked with a closure active",
+                )
+                self.assertEqual([], err)
+            finally:
+                env.clear_all_closures()
+
+    def test_closure_lock_is_reentrant(self):
+        """Nine other call sites share this lock; reentrancy stops the same mistake."""
+        import engine.environment as env
+
+        with env._closed_lock:
+            with env._closed_lock:
+                pass
+
+    def test_closed_set_still_correct_with_a_closure_active(self):
+        """The lock fix must not change which airports read as closed."""
+        import engine.environment as env
+
+        with fresh_game():
+            env.clear_all_closures()
+            try:
+                env.set_closure_until("BOS", 500.0)
+                self.assertTrue(env.is_airport_closed_at("BOS", 400.0))
+                self.assertFalse(env.is_airport_closed_at("BOS", 600.0))
+                self.assertFalse(env.is_airport_closed_at("ORD", 400.0))
+            finally:
+                env.clear_all_closures()
+
+
+class TestFleetDisposalApi(unittest.TestCase):
+    """The endpoints the Fleet window drives (FEATURE-01 UI)."""
+
+    def _ready_tail(self, g):
+        """A tail at the hub with no remaining flights."""
+        tail = g.lease()
+        g.db.execute("DELETE FROM flight_segments WHERE tail_number = ?", (tail,))
+        g.db.execute("UPDATE fleet SET current_airport_iata = ? WHERE tail_number = ?",
+                     (g.hub, tail))
+        return tail
+
+    def test_quote_prices_a_lease_return_and_a_sale(self):
+        from server import game_api as api
+
+        with fresh_game() as g:
+            leased = self._ready_tail(g)
+            q = api.fleet_disposal_quote(leased)
+            self.assertTrue(q["ok"])
+            self.assertEqual("RETURN_LEASE", q["kind"])
+            self.assertGreater(float(q["penalty"]), 0.0, "early return costs something")
+
+            owned = g.buy()
+            g.db.execute("DELETE FROM flight_segments WHERE tail_number = ?", (owned,))
+            q2 = api.fleet_disposal_quote(owned)
+            self.assertEqual("SELL", q2["kind"])
+            self.assertGreater(float(q2["valuation"]["estimated_value"]), 0.0)
+
+    def test_queue_then_cancel_round_trip(self):
+        from server import game_api as api
+
+        with fresh_game() as g:
+            tail = self._ready_tail(g)
+            self.assertTrue(api.dispose_aircraft({"tail_number": tail})["ok"])
+            row = g.db.fetch_one("SELECT pending_disposal p FROM fleet WHERE tail_number = ?", (tail,))
+            self.assertEqual("RETURN_LEASE", row["p"])
+
+            # The Fleet list drives the pending badge off this field.
+            listed = [r for r in api.list_fleet()["fleet"] if r["tail_number"] == tail][0]
+            self.assertEqual("RETURN_LEASE", listed["pending_disposal"])
+
+            self.assertTrue(api.cancel_aircraft_disposal({"tail_number": tail})["ok"])
+            self.assertIsNone(
+                g.db.fetch_one("SELECT pending_disposal p FROM fleet WHERE tail_number = ?", (tail,))["p"]
+            )
+
+    def test_blockers_do_not_prevent_disposal(self):
+        """Regression on the UI contract: blockers are advisory, not a gate.
+
+        request_disposal cancels the rotation and ferries the aircraft home itself, so a
+        tail away from base with flights still to operate can be disposed of. An earlier
+        draft of the Fleet window disabled the confirm button whenever `blockers` was
+        non-empty, which refused an action the engine supports.
+        """
+        from server import game_api as api
+
+        with fresh_game() as g:
+            tail = g.lease()
+            g.db.execute("UPDATE fleet SET current_airport_iata = 'LAX' WHERE tail_number = ?", (tail,))
+            self.assertTrue(api.fleet_disposal_quote(tail)["blockers"],
+                            "away from base should report a blocker")
+            out = api.dispose_aircraft({"tail_number": tail})
+            self.assertTrue(out["ok"], "the engine handles the ferry home; do not refuse this")
+
+    def test_double_queue_is_rejected(self):
+        from server import game_api as api
+
+        with fresh_game() as g:
+            tail = self._ready_tail(g)
+            self.assertTrue(api.dispose_aircraft({"tail_number": tail})["ok"])
+            second = api.dispose_aircraft({"tail_number": tail})
+            self.assertFalse(second["ok"], "already queued must be refused")
+            self.assertIn("already", str(second.get("error", "")).lower())
+
+
+class TestGateSale(unittest.TestCase):
+    """Selling a stand back — the opposite lever to the emergency purchase."""
+
+    AP = "ORD"
+
+    def _hold(self, db, units, *, price=8000.0, eff=1):
+        import uuid as _uuid
+        db.execute("DELETE FROM airport_gate_allocations WHERE airport_iata=? AND holder_id='PLAYER'",
+                   (self.AP,))
+        db.execute(
+            """INSERT INTO airport_gate_allocations
+               (allocation_id, airport_iata, holder_id, gate_units, used_this_week,
+                scheduled_this_week, below_threshold_weeks, effective_week, status,
+                price_paid_per_unit, pending_sale_units)
+               VALUES (?, ?, 'PLAYER', ?, 0, 0, 0, ?, 'ACTIVE', ?, 0)""",
+            (str(_uuid.uuid4()), self.AP, int(units), int(eff), float(price)),
+        )
+
+    def test_quote_prices_from_what_was_paid(self):
+        from engine.gates import gate_sale_haircut, gate_sale_quote
+
+        with fresh_game() as g:
+            self._hold(g.db, 2, price=8000.0)
+            q = gate_sale_quote(self.AP, 1)
+            self.assertEqual(2, q["gates_held"])
+            self.assertEqual(1, q["gates_after"])
+            self.assertAlmostEqual(8000.0 * gate_sale_haircut(), q["proceeds"], places=2)
+
+    def test_untracked_units_fall_back_to_the_auction_floor(self):
+        """Stands predating price tracking have no cost recorded."""
+        from engine.gates import gate_sale_haircut, gate_sale_quote
+
+        with fresh_game() as g:
+            self._hold(g.db, 2, price=0.0)
+            floor = float(g.db.get_financial_constant("gate_min_price_per_unit") or 5000)
+            self.assertAlmostEqual(floor * gate_sale_haircut(),
+                                   gate_sale_quote(self.AP, 1)["proceeds"], places=2)
+
+    def test_last_stand_is_refused_while_flights_use_it(self):
+        """At zero units the spawn hard-blocks with no penalty path, so this must never happen."""
+        from engine.gates import gate_sale_blockers, request_gate_sale
+        import uuid as _uuid
+
+        with fresh_game() as g:
+            self._hold(g.db, 1)
+            rid = g.open_route(g.hub, self.AP)
+            g.db.execute(
+                """INSERT INTO flight_segments
+                   (segment_id, game_week, day_of_week, tail_number, route_id, origin_iata,
+                    dest_iata, flight_number, scheduled_dep_time, scheduled_arr_time,
+                    scheduled_dep_game_hour, scheduled_arr_game_hour, baseline_dep_game_hour,
+                    baseline_arr_game_hour, status, pax_business, pax_leisure, revenue_gross,
+                    excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee,
+                    fuel_cost, net_contribution)
+                   VALUES (?,1,'MON','N1',?,?,?,'T1','08:00','09:30',10.0,11.5,10.0,11.5,
+                           'SCHEDULED',0,0,0,0,0,0,0,0,0,0,0)""",
+                (str(_uuid.uuid4()), rid, g.hub, self.AP),
+            )
+            blockers = gate_sale_blockers(self.AP, 1)
+            self.assertTrue(any("no allocation" in b.lower() for b in blockers), blockers)
+            with self.assertRaises(ValueError):
+                request_gate_sale(self.AP, 1)
+
+    def test_peak_above_the_remainder_is_refused(self):
+        from engine.gates import gate_sale_blockers
+
+        with fresh_game() as g:
+            self._hold(g.db, 2)
+            import engine.gates as G
+            real = G.player_gate_peak_at_airport
+            G.player_gate_peak_at_airport = lambda ap, w, **k: 2 if str(ap) == self.AP else 0
+            try:
+                blockers = gate_sale_blockers(self.AP, 1)
+            finally:
+                G.player_gate_peak_at_airport = real
+            self.assertTrue(any("concurrent stands" in b for b in blockers), blockers)
+
+    def test_home_hub_last_stand_is_protected(self):
+        from engine.gates import gate_sale_blockers
+
+        with fresh_game() as g:
+            self.AP = g.hub
+            self._hold(g.db, 1)
+            self.assertTrue(any("home hub" in b for b in gate_sale_blockers(g.hub, 1)))
+
+    def test_not_yet_effective_stands_cannot_be_sold(self):
+        from engine.gates import gate_sale_blockers
+
+        with fresh_game() as g:
+            g.db.execute("UPDATE game_state SET game_week = 3 WHERE id = 1")
+            self._hold(g.db, 2, eff=4)
+            self.assertTrue(any("effective" in b for b in gate_sale_blockers(self.AP, 1)))
+
+    def test_queue_execute_and_cancel(self):
+        from engine.gates import (_allocated_gates, cancel_gate_sale, process_pending_gate_sales,
+                                  request_gate_sale)
+        from engine.setup import get_airline
+
+        with fresh_game() as g:
+            self._hold(g.db, 2, price=8000.0)
+            request_gate_sale(self.AP, 1)
+            self.assertEqual(2, _allocated_gates(self.AP, "PLAYER"),
+                             "queuing must not remove the stand yet")
+
+            cancel_gate_sale(self.AP)
+            self.assertEqual({"units_sold": 0, "proceeds": 0.0, "held": []},
+                             process_pending_gate_sales(),
+                             "a cancelled sale must not execute")
+
+            request_gate_sale(self.AP, 1)
+            cash0 = float(get_airline()["cash"])
+            out = process_pending_gate_sales()
+            self.assertEqual(1, out["units_sold"])
+            self.assertEqual(1, _allocated_gates(self.AP, "PLAYER"))
+            self.assertAlmostEqual(out["proceeds"], float(get_airline()["cash"]) - cash0, places=2)
+
+    def test_sale_is_held_if_the_new_week_needs_the_stand(self):
+        """Re-validated on execution: a schedule grown since queuing must veto the sale."""
+        from engine.gates import (_allocated_gates, process_pending_gate_sales,
+                                  request_gate_sale)
+        import engine.gates as G
+
+        with fresh_game() as g:
+            self._hold(g.db, 2)
+            request_gate_sale(self.AP, 1)
+            real = G.player_gate_peak_at_airport
+            G.player_gate_peak_at_airport = lambda ap, w, **k: 2 if str(ap) == self.AP else 0
+            try:
+                out = process_pending_gate_sales()
+            finally:
+                G.player_gate_peak_at_airport = real
+            self.assertEqual(0, out["units_sold"])
+            self.assertIn(self.AP, out["held"])
+            self.assertEqual(2, _allocated_gates(self.AP, "PLAYER"),
+                             "a held sale must leave the stand with the player")
+
+    def _insert_dupes(self, g, n=2):
+        """Recreate the old broken state, which the unique index now forbids."""
+        import uuid as _uuid
+        g.db.execute("DROP INDEX IF EXISTS idx_gate_alloc_holder_airport_active")
+        g.db.execute("DELETE FROM airport_gate_allocations WHERE airport_iata=? AND holder_id='PLAYER'",
+                     (self.AP,))
+        for _ in range(n):
+            g.db.execute(
+                """INSERT INTO airport_gate_allocations
+                   (allocation_id, airport_iata, holder_id, gate_units, used_this_week,
+                    scheduled_this_week, below_threshold_weeks, effective_week, status)
+                   VALUES (?, ?, 'PLAYER', 1, 0, 0, 0, 1, 'ACTIVE')""",
+                (str(_uuid.uuid4()), self.AP),
+            )
+
+    def test_duplicate_rows_are_summed_not_read_first(self):
+        """Regression: two ACTIVE rows made _allocated_gates report only the first.
+
+        The live save had exactly this at CDG — two rows of one unit each — so the game
+        credited one stand against two paid for. Schedules were refused, and under
+        FEATURE-05 a shortfall could charge for a stand already owned.
+        """
+        from engine.gates import _allocated_gates
+
+        with fresh_game() as g:
+            self._insert_dupes(g)
+            self.assertEqual(2, _allocated_gates(self.AP, "PLAYER"),
+                             "the sum, not the first row, is what the player holds")
+
+    def test_migration_merges_duplicates(self):
+        with fresh_game() as g:
+            self._insert_dupes(g)
+            g.db._merge_duplicate_gate_allocations()
+            rows = g.db.fetch_all(
+                "SELECT gate_units FROM airport_gate_allocations WHERE airport_iata=?"
+                " AND holder_id='PLAYER' AND status='ACTIVE'", (self.AP,))
+            self.assertEqual(1, len(rows), "duplicates must collapse into one row")
+            self.assertEqual(2, int(rows[0]["gate_units"]), "units must be preserved")
+
+    def test_duplicates_cannot_be_created_any_more(self):
+        """The unique index makes the broken state unrepresentable going forward."""
+        import sqlite3
+        import uuid as _uuid
+
+        with fresh_game() as g:
+            self._hold(g.db, 1)
+            with self.assertRaises(sqlite3.IntegrityError):
+                g.db.execute(
+                    """INSERT INTO airport_gate_allocations
+                       (allocation_id, airport_iata, holder_id, gate_units, used_this_week,
+                        scheduled_this_week, below_threshold_weeks, effective_week, status)
+                       VALUES (?, ?, 'PLAYER', 1, 0, 0, 0, 1, 'ACTIVE')""",
+                    (str(_uuid.uuid4()), self.AP),
+                )
+
+
+class TestGateAuctionDoubleAward(unittest.TestCase):
+    """Regression: a 1-unit bid could win 2 stands and be charged twice.
+
+    `resolve_closing_gate_auctions` filtered on status='OPEN', but awarding and marking
+    RESOLVED were separate commits, so two callers could both read OPEN and both award.
+    `player_gate_bids()` calls `resolve_overdue_gate_auctions()` on the HTTP thread every
+    time the Gates window polls — outside `_settlement_lock` — so a player with that
+    window open at the week roll raced the settlement thread. The live save showed ARN,
+    CDG, ZRH and SVO each with 2 stands from 1-unit bids, two award notifications apiece,
+    and $16,000 charged for one requested stand.
+    """
+
+    AP = "ORD"
+
+    def _auction_with_player_bid(self, g, week=1, units_available=10):
+        import uuid as _uuid
+        aid = str(_uuid.uuid4())
+        g.db.execute("DELETE FROM airport_gate_allocations WHERE airport_iata=? AND holder_id='PLAYER'",
+                     (self.AP,))
+        g.db.execute(
+            """INSERT INTO airport_gate_auctions
+               (auction_id, airport_iata, opens_week, closes_week, units_available,
+                current_price_per_unit, status)
+               VALUES (?, ?, ?, ?, ?, 8000.0, 'OPEN')""",
+            (aid, self.AP, week, week, int(units_available)),
+        )
+        g.db.execute(
+            """INSERT INTO airport_gate_bids
+               (bid_id, auction_id, bidder_id, units_requested, price_per_unit, submitted_week)
+               VALUES (?, ?, 'PLAYER', 1, 8000.0, ?)""",
+            (str(_uuid.uuid4()), aid, week),
+        )
+        return aid
+
+    def test_sequential_double_resolution_awards_once(self):
+        from engine.gates import _allocated_gates, resolve_closing_gate_auctions
+
+        with fresh_game() as g:
+            self._auction_with_player_bid(g)
+            resolve_closing_gate_auctions(1)
+            resolve_closing_gate_auctions(1)
+            self.assertEqual(1, _allocated_gates(self.AP, "PLAYER"),
+                             "a 1-unit bid must yield exactly 1 stand")
+
+    def test_concurrent_resolution_awards_once(self):
+        """Two threads, as the settlement thread and the Gates poll actually raced."""
+        import threading as _th
+        from engine.gates import _allocated_gates, resolve_closing_gate_auctions
+        from engine.setup import get_airline
+
+        with fresh_game() as g:
+            self._auction_with_player_bid(g)
+            cash0 = float(get_airline()["cash"])
+            start = _th.Barrier(2)
+
+            def run():
+                start.wait()
+                try:
+                    resolve_closing_gate_auctions(1)
+                except Exception:
+                    pass
+
+            ts = [_th.Thread(target=run) for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(timeout=20)
+
+            self.assertEqual(1, _allocated_gates(self.AP, "PLAYER"),
+                             "concurrent resolvers must not both award")
+            spent = cash0 - float(get_airline()["cash"])
+            self.assertAlmostEqual(8000.0, spent, delta=1.0,
+                                   msg="the player must be charged once, not twice")
+            rows = g.db.fetch_all(
+                "SELECT allocation_id FROM airport_gate_allocations WHERE airport_iata=?"
+                " AND holder_id='PLAYER' AND status='ACTIVE'", (self.AP,))
+            self.assertEqual(1, len(rows), "concurrent inserts must not duplicate the row")
+
+    def test_claim_is_exclusive(self):
+        from engine.gates import _claim_auction
+
+        with fresh_game() as g:
+            aid = self._auction_with_player_bid(g)
+            self.assertTrue(_claim_auction(aid), "first caller wins the auction")
+            self.assertFalse(_claim_auction(aid), "second caller must be refused")
+
+    def test_one_award_notification_per_auction(self):
+        from engine.gates import resolve_closing_gate_auctions
+
+        with fresh_game() as g:
+            self._auction_with_player_bid(g)
+            resolve_closing_gate_auctions(1)
+            resolve_closing_gate_auctions(1)
+            notes = g.db.fetch_all(
+                "SELECT body FROM player_notifications WHERE type='GATE_AUCTION' AND body LIKE ?",
+                (f"%{self.AP}%",))
+            won = [n for n in notes if "WON" in str(n["body"])]
+            self.assertEqual(1, len(won), f"one award, one notification; got {len(won)}")
+
+
+class TestNoAutoFerryHome(unittest.TestCase):
+    """Clearing a plan must never reposition the aircraft on the player's behalf.
+
+    A rotation may deliberately begin away from the hub, so an aircraft parked at an
+    outstation is a valid state. The old `cancel_rotation` ended with an unconditional
+    `schedule_ferry_to_hub`, which also made the last ferry undeletable: clearing it
+    simply created another.
+    """
+
+    def _away(self, g, tail, where="SFO"):
+        import uuid as _uuid
+        rid = g.open_route(g.hub, where)
+        g.db.execute(
+            """INSERT INTO flight_segments
+               (segment_id, game_week, day_of_week, tail_number, route_id, origin_iata,
+                dest_iata, flight_number, scheduled_dep_time, scheduled_arr_time,
+                scheduled_dep_game_hour, scheduled_arr_game_hour, baseline_dep_game_hour,
+                baseline_arr_game_hour, status, pax_business, pax_leisure, revenue_gross,
+                excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee,
+                fuel_cost, net_contribution)
+               VALUES (?,1,'MON',?,?,?,?,'F1','08:00','11:00',8.0,11.0,8.0,11.0,
+                       'LANDED',0,0,0,0,0,0,0,0,0,0,0)""",
+            (str(_uuid.uuid4()), tail, rid, g.hub, where),
+        )
+        g.db.execute("UPDATE game_state SET game_hours_elapsed = 20.0 WHERE id = 1")
+        return where
+
+    def test_clear_does_not_create_a_ferry(self):
+        from engine.scheduling import cancel_rotation
+
+        with fresh_game() as g:
+            tail = g.lease()
+            self._away(g, tail)
+            cancel_rotation(tail, wipe_completed_this_week=False)
+            ferries = g.db.fetch_all(
+                "SELECT 1 FROM flight_segments WHERE tail_number = ? AND is_ferry = 1", (tail,))
+            self.assertEqual([], ferries, "clearing must not reposition the aircraft")
+
+    def test_repeated_clear_stays_empty(self):
+        """The loop: each clear used to re-create the ferry it had just removed."""
+        from engine.scheduling import cancel_rotation
+
+        with fresh_game() as g:
+            tail = g.lease()
+            self._away(g, tail)
+            for _ in range(3):
+                cancel_rotation(tail, wipe_completed_this_week=False)
+                self.assertEqual(
+                    [], g.db.fetch_all(
+                        "SELECT 1 FROM flight_segments WHERE tail_number = ? AND is_ferry = 1", (tail,)),
+                    "no ferry may reappear on any clear")
+
+    def test_explicit_reposition_still_works(self):
+        """Removing the automatic ferry must not remove the deliberate one."""
+        from engine.scheduling import schedule_ferry_to_hub
+
+        with fresh_game() as g:
+            tail = g.lease()
+            self._away(g, tail)
+            out = schedule_ferry_to_hub(tail, g.hub)
+            self.assertIsNotNone(out, "a player-initiated reposition must still be possible")
+            self.assertEqual(g.hub, str(out["to"]).upper())
+
+
+class TestTailLocationReconciliation(unittest.TestCase):
+    """One aircraft, one position. The two records used to drift and contradict."""
+
+    def test_stale_fleet_column_is_corrected_from_history(self):
+        from engine.scheduling.ferry import reconcile_tail_location
+
+        with fresh_game() as g:
+            tail = g.lease()
+            TestNoAutoFerryHome()._away(g, tail, "SFO")
+            # A leg can reach LANDED without on_arrival running (settlement catch-up),
+            # leaving this column behind.
+            g.db.execute("UPDATE fleet SET current_airport_iata = 'MCO' WHERE tail_number = ?", (tail,))
+            self.assertEqual("SFO", reconcile_tail_location(tail))
+            self.assertEqual("SFO", g.db.fetch_one(
+                "SELECT current_airport_iata a FROM fleet WHERE tail_number = ?", (tail,))["a"])
+
+    def test_position_lookup_ignores_the_week_tag(self):
+        """A leg departing one week and arriving the next carries the departure's week.
+
+        Filtering on `game_week` hid such a leg from the positioning validator while
+        `tail_position_and_free_hour` still saw it, so the two disagreed and repositioning
+        was refused for a tail whose own schedule was consistent.
+        """
+        import uuid as _uuid
+        from engine.scheduling.rotation import _initial_airport_before_first_event
+
+        with fresh_game() as g:
+            tail = g.lease()
+            rid = g.open_route(g.hub, "SFO")
+            # Departs hour 836 (week 5), arrives 841 (week 6), tagged week 5.
+            g.db.execute(
+                """INSERT INTO flight_segments
+                   (segment_id, game_week, day_of_week, tail_number, route_id, origin_iata,
+                    dest_iata, flight_number, scheduled_dep_time, scheduled_arr_time,
+                    scheduled_dep_game_hour, scheduled_arr_game_hour, baseline_dep_game_hour,
+                    baseline_arr_game_hour, status, pax_business, pax_leisure, revenue_gross,
+                    excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee,
+                    fuel_cost, net_contribution)
+                   VALUES (?,5,'MON',?,?,?,'SFO','F9','08:00','13:00',836.0,841.09,836.0,841.09,
+                           'LANDED',0,0,0,0,0,0,0,0,0,0,0)""",
+                (str(_uuid.uuid4()), tail, rid, g.hub),
+            )
+            # Asked about week 6, the week-5-tagged leg must still count.
+            self.assertEqual("SFO", _initial_airport_before_first_event(tail, 6, 900.0),
+                             "position is a function of absolute time, not of the week label")
+
+
+class TestGateShortfallEscalatingPenalty(unittest.TestCase):
+    """Declining must never be the cheap option.
+
+    A flat daily rate made waiting out the week cost 70% of the outright price, so the
+    purchase branch was never worth taking. The charge now ramps so the week's total is
+    the outright price — and since declining ends with no stand, buying dominates.
+    """
+
+    def test_schedule_sums_to_the_outright_price(self):
+        from engine.gates import gate_shortfall_penalty_schedule
+
+        for days in (1, 2, 4, 7, 9):
+            sched = gate_shortfall_penalty_schedule(100_000.0, days)
+            self.assertEqual(days, len(sched))
+            self.assertAlmostEqual(100_000.0, sum(sched), delta=1.0,
+                                   msg=f"{days}-day ramp must total the buy price")
+
+    def test_schedule_escalates(self):
+        from engine.gates import gate_shortfall_penalty_schedule
+
+        sched = gate_shortfall_penalty_schedule(680_742.0, 7)
+        for a, b in zip(sched, sched[1:]):
+            self.assertLess(a, b, "each day must cost more than the last")
+        self.assertLess(sched[0], 680_742.0 / 7, "day one is cheaper than a flat split")
+
+    def test_multiplier_makes_declining_strictly_worse(self):
+        from engine.gates import gate_shortfall_penalty_schedule
+
+        with fresh_game() as g:
+            g.db.execute(
+                "INSERT OR REPLACE INTO financial_constants (key, value) VALUES (?, ?)",
+                ("gate_shortfall_penalty_total_multiplier", 1.5))
+            self.assertAlmostEqual(
+                150_000.0, sum(gate_shortfall_penalty_schedule(100_000.0, 7)), delta=1.0)
+
+    def test_detected_late_in_the_week_still_totals_the_price(self):
+        """Fewer days left means steeper days, not a discount for being caught late."""
+        from engine.gates import gate_shortfall_penalty_schedule
+
+        late = gate_shortfall_penalty_schedule(680_742.0, 2)
+        early = gate_shortfall_penalty_schedule(680_742.0, 7)
+        self.assertAlmostEqual(sum(late), sum(early), delta=1.0)
+        self.assertGreater(late[0], early[0], "a late shortfall bites harder per day")
+
+    def test_accrual_follows_the_ramp(self):
+        from engine.gates import (accrue_gate_shortfall_penalties, gate_shortfall_penalty_schedule,
+                                  record_gate_shortfall, resolve_gate_shortfall)
+        import engine.gates as G
+
+        with fresh_game() as g:
+            import uuid as _uuid
+            g.db.execute(
+                """INSERT INTO airport_gate_allocations
+                   (allocation_id, airport_iata, holder_id, gate_units, used_this_week,
+                    scheduled_this_week, below_threshold_weeks, effective_week, status)
+                   VALUES (?, 'ORD', 'PLAYER', 1, 0, 0, 0, 1, 'ACTIVE')""",
+                (str(_uuid.uuid4()),))
+            ev = record_gate_shortfall("ORD", 1, 2, {("BOS", "ORD")})
+            resolve_gate_shortfall(ev["event_id"], accept=False)
+            sched = gate_shortfall_penalty_schedule(
+                float(ev["fee_amount"]), int(ev["penalty_days_total"]))
+
+            real = G.player_gate_peak_at_airport
+            G.player_gate_peak_at_airport = lambda ap, w, **k: 2 if str(ap) == "ORD" else 0
+            try:
+                charged = [accrue_gate_shortfall_penalties(d)["charged"] for d in (1, 2, 3)]
+            finally:
+                G.player_gate_peak_at_airport = real
+            for i, amount in enumerate(charged):
+                self.assertAlmostEqual(sched[i], amount, delta=1.0,
+                                       msg=f"day {i + 1} must charge the ramped amount")
+            self.assertLess(charged[0], charged[-1], "the charge escalates day over day")
+
+
+class TestShortfallClosesWhenFixed(unittest.TestCase):
+    """A shortfall the player has already fixed must stop asking for a decision.
+
+    Closing it used to depend entirely on the clock's daily hook, and that hook was wired
+    in main.py but NOT in the web server — so under the UI it never ran: shortfalls never
+    resolved and no penalty was ever charged either. The prompt kept offering a choice
+    that no longer existed.
+    """
+
+    AP = "ORD"
+
+    def _event_with_gates(self, g, units):
+        import uuid as _uuid
+        from engine.gates import record_gate_shortfall
+        g.db.execute("DELETE FROM airport_gate_allocations WHERE airport_iata=? AND holder_id='PLAYER'",
+                     (self.AP,))
+        g.db.execute(
+            """INSERT INTO airport_gate_allocations
+               (allocation_id, airport_iata, holder_id, gate_units, used_this_week,
+                scheduled_this_week, below_threshold_weeks, effective_week, status)
+               VALUES (?, ?, 'PLAYER', ?, 0, 0, 0, 1, 'ACTIVE')""",
+            (str(_uuid.uuid4()), self.AP, int(units)))
+        # Two tails on the stand at once, so the peak is genuinely 2 and the shortfall
+        # is real rather than instantly self-clearing.
+        rid = g.open_route(g.hub, self.AP)
+        for i, tail in enumerate(("N001", "N002")):
+            g.db.execute(
+                """INSERT INTO flight_segments
+                   (segment_id, game_week, day_of_week, tail_number, route_id, origin_iata,
+                    dest_iata, flight_number, scheduled_dep_time, scheduled_arr_time,
+                    scheduled_dep_game_hour, scheduled_arr_game_hour, baseline_dep_game_hour,
+                    baseline_arr_game_hour, status, pax_business, pax_leisure, revenue_gross,
+                    excise_tax, segment_fee, security_fee, pfc_fee, landing_fee, gate_fee,
+                    fuel_cost, net_contribution)
+                   VALUES (?,1,'MON',?,?,?,?,?,'08:00','09:30',?,?,?,?,'SCHEDULED',
+                           0,0,0,0,0,0,0,0,0,0,0)""",
+                (str(_uuid.uuid4()), tail, rid, g.hub, self.AP, f"T{i}",
+                 10.0 + i * 0.1, 12.0 + i * 0.1, 10.0 + i * 0.1, 12.0 + i * 0.1))
+        return record_gate_shortfall(self.AP, 1, 2, {("BOS", self.AP)})
+
+    def test_buying_a_stand_elsewhere_closes_the_prompt(self):
+        from engine.gates import open_gate_shortfalls
+
+        with fresh_game() as g:
+            ev = self._event_with_gates(g, 1)
+            self.assertEqual(1, len(open_gate_shortfalls()), "opens while short")
+            # Player acquires the stand by another route (auction win, grant, or purchase).
+            g.db.execute("UPDATE airport_gate_allocations SET gate_units = 2"
+                         " WHERE airport_iata = ? AND holder_id = 'PLAYER'", (self.AP,))
+            self.assertEqual([], open_gate_shortfalls(),
+                             "a fixed shortfall must not keep prompting")
+            self.assertEqual("RESOLVED", g.db.fetch_one(
+                "SELECT status s FROM gate_shortfall_events WHERE event_id = ?",
+                (ev["event_id"],))["s"])
+            self.assertEqual(0.0, float(g.db.fetch_one(
+                "SELECT penalty_accrued a FROM gate_shortfall_events WHERE event_id = ?",
+                (ev["event_id"],))["a"]), "nothing may be charged for a shortfall never suffered")
+
+    def test_web_server_wires_the_daily_hook(self):
+        """The accrual hook must exist on the web path, not only in main.py."""
+        import inspect
+        import server.game_http as H
+
+        self.assertTrue(hasattr(H, "_on_day_roll"), "web server needs a daily handler")
+        src = inspect.getsource(H._start_runtime_clock)
+        self.assertIn("on_day=", src, "the daily hook must be passed to start_game_clock")

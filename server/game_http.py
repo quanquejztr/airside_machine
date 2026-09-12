@@ -26,6 +26,8 @@ _server_lock = threading.Lock()
 _ai_boot_lock = threading.Lock()
 _ai_boot_started = False
 _ops_seeded = False
+_player_spawn_healed_week: int | None = None
+_player_spawn_lock = threading.Lock()
 
 
 def _seed_auctions_and_flights() -> None:
@@ -105,6 +107,71 @@ def _on_week_roll(new_week: int) -> None:
     enqueue_settlement_after_week_boundary(new_week)
 
 
+def _heal_player_segments_if_missing() -> None:
+    """Spawn the current week's player flights if the week roll never fired.
+
+    GameClock sets ``last_week = int(ghe // 168) + 1`` at construction, and the milestone
+    loop only fires ``on_week`` when the calendar week exceeds it. So a server started
+    while the clock already sits inside week N never fires on_week(N), and
+    ``spawn_segments_for_calendar_week`` never runs for that week. Nothing raises — the
+    step simply does not happen — so no error path can catch it.
+
+    ``main.py`` has always had this net for the CLI; the web server did not, and the AI
+    had its own self-heal in ``_ai_bootstrap_bg``. The result was a week with a full AI
+    schedule and no player flights at all: every aircraft reading 0.0h/168h, which looks
+    like deleted schedules rather than a step that was skipped.
+
+    Spawning is idempotent and dedupes, so this is safe to attempt whenever the current
+    week looks empty. Guarded to once per week per process to keep it off the hot path.
+    """
+    global _player_spawn_healed_week
+    try:
+        from engine.scheduling import spawn_rotation_segments_for_week
+
+        gs = db.fetch_one("SELECT game_week FROM game_state WHERE id = 1")
+        cur_week = int(gs["game_week"]) if gs and gs["game_week"] is not None else 1
+        with _player_spawn_lock:
+            if _player_spawn_healed_week == cur_week:
+                return
+            _player_spawn_healed_week = cur_week
+        tpl = db.fetch_one("SELECT COUNT(*) AS n FROM weekly_rotations")
+        if int((tpl["n"] if tpl else 0) or 0) <= 0:
+            return
+        out = spawn_rotation_segments_for_week(cur_week)
+        made = int((out or {}).get("inserted") or 0)
+        # A normal mid-week start inserts nothing, because the roll already spawned this
+        # week. Anything created here means the roll did not run, so say so — a week that
+        # silently has no player flights is the failure this exists to catch.
+        if made > 0:
+            try:
+                from engine.news_feed import push_news
+
+                push_news(
+                    f"Week {cur_week} player schedule was missing and has been rebuilt "
+                    f"({made} flights) — the week roll did not run for this week."
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _on_day_roll(game_day: int) -> None:
+    """Charge a day of any open stand shortfall, and close the ones already cleared.
+
+    main.py wired this for the CLI; the web server did not, so under the UI the daily
+    accrual never ran at all: shortfalls never resolved themselves and no penalty was
+    ever charged. Same shape of gap as the missing week-roll safety net in BUGFIX-10 —
+    behaviour attached to one entry point and not the other.
+    """
+    try:
+        from engine.gates import accrue_gate_shortfall_penalties
+
+        accrue_gate_shortfall_penalties(int(game_day))
+    except Exception:
+        pass
+
+
 def _start_runtime_clock(*, full_bootstrap: bool):
     from engine.clock import get_global_clock, start_game_clock
     from engine.scheduling import on_arrival, on_departure
@@ -128,12 +195,17 @@ def _start_runtime_clock(*, full_bootstrap: bool):
 
     existing = start_game_clock(
         on_week=_on_week_roll,
+        on_day=_on_day_roll,
         on_tick=on_fuel_tick,
         on_departure=on_departure,
         on_arrival=on_arrival,
         on_ai_departure=ai_on_departure_cb,
         on_ai_arrival=ai_on_arrival_cb,
     )
+
+    # Must run in BOTH modes: the gap appears at process start, and a lightweight
+    # session may never take the full-bootstrap path.
+    _heal_player_segments_if_missing()
 
     if not full_bootstrap:
         return existing
@@ -346,6 +418,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/books":
             self._send_json(api.books_status())
             return
+        if path == "/api/gates/sale-quote":
+            self._send_json(api.gate_sale_quote_api(q.get("iata", ""), q.get("units", "1")))
+            return
+        if path == "/api/gates/shortfalls":
+            self._send_json(api.gate_shortfalls())
+            return
         if path == "/api/books/pending":
             self._send_json(api.pop_week_summaries())
             return
@@ -378,6 +456,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/clock":
             ensure_runtime_clock()
             self._send_json(api.set_clock(body))
+            return
+        if path == "/api/gates/sell":
+            self._send_json(api.sell_gate(body))
+            return
+        if path == "/api/gates/sell/cancel":
+            self._send_json(api.cancel_gate_sale_api(body))
+            return
+        if path == "/api/gates/shortfalls/resolve":
+            self._send_json(api.resolve_gate_shortfall_request(body))
             return
         if path == "/api/fleet":
             self._send_json(api.acquire_aircraft(body))

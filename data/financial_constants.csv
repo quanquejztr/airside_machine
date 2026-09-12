@@ -55,6 +55,10 @@ gate_utilization_threshold_nonhub,0.02
 gate_utilization_grace_weeks,3
 gate_min_price_per_unit,5000
 gate_price_step,1000
+emergency_gate_fee_rate,0.20
+emergency_gate_penalty_rate_per_day,0.10
+gate_shortfall_penalty_total_multiplier,1.0
+gate_sale_haircut,0.85
 bts_target_market_share,1.30
 bts_ref_year,2019
 bts_growth_rate,0.02

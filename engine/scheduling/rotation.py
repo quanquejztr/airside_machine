@@ -263,28 +263,60 @@ def merge_quick_weekly_template(tail_number, new_leg_dicts, game_week):
     )
 
 
-def _initial_airport_before_first_event(tail_number, game_week, first_dep_game_hour):
-    """Where the aircraft is immediately before the chronologically first event at first_dep_game_hour."""
+def _initial_airport_before_first_event(
+    tail_number, game_week, first_dep_game_hour, *, default_origin=None
+):
+    """Where the aircraft is immediately before the chronologically first event at first_dep_game_hour.
+
+    Selected by absolute departure hour, NOT by the `game_week` tag. A leg of a chain that
+    departs in one week and arrives in the next carries the departure's week, so filtering
+    on the tag made such a leg invisible here while `tail_position_and_free_hour` — which
+    orders purely by arrival hour — still saw it. The two then disagreed about where the
+    aircraft was, and repositioning failed with "the aircraft is at MCO, but this leg
+    departs SFO" for a tail whose own schedule said SFO. Same defect class as the gate
+    intervals fixed in BUGFIX-08: position is a function of absolute time, not of a label.
+    """
     row = db.fetch_one(
         """
         SELECT fs.route_id
         FROM flight_segments fs
-        WHERE fs.tail_number = ? AND fs.game_week = ?
+        WHERE fs.tail_number = ?
           AND fs.status IN ('SCHEDULED', 'IN_AIR', 'LANDED')
           AND fs.scheduled_dep_game_hour < ?
         ORDER BY fs.scheduled_dep_game_hour DESC
         LIMIT 1
         """,
-        (tail_number, game_week, first_dep_game_hour),
+        (tail_number, first_dep_game_hour),
     )
     if row:
         rt = get_route(row["route_id"])
         if rt:
             return str(rt["dest_iata"]).upper()
+
+    # Nothing departed earlier. What answers this depends on *when* is being asked about.
+    #
+    # A departure at or after the present is a plan, and the aircraft's actual location is
+    # exactly the right constraint: refusing a first leg that departs somewhere the
+    # aircraft is not is the whole point of this check.
+    #
+    # A departure in the past is a different question — "where did it start" — and the
+    # location column cannot answer it, because it describes now. Using it there produced a
+    # bogus "the aircraft is at SFO, but this leg departs TPA" on a timeline that already
+    # happened and was perfectly valid. That only stayed hidden while the column was
+    # usually stale; reconciling it against flight history surfaced it. For a historical
+    # hour the timeline's own first leg is the answer: the aircraft must have been at that
+    # origin to have flown it.
+    gs = db.fetch_one("SELECT game_hours_elapsed FROM game_state WHERE id = 1")
+    now = float(gs["game_hours_elapsed"] or 0.0) if gs else 0.0
     ac = get_fleet_aircraft(tail_number)
     loc = ac.get("current_airport_iata") if ac else None
+
+    if float(first_dep_game_hour) < now and default_origin:
+        return str(default_origin).upper()
     if loc:
         return str(loc).upper()
+    if default_origin:
+        return str(default_origin).upper()
     airline = db.fetch_one("SELECT home_hub_iata FROM airline WHERE id = 1")
     if airline and airline.get("home_hub_iata"):
         return str(airline["home_hub_iata"]).upper()
@@ -333,7 +365,9 @@ def validate_position_timeline_for_new_legs(tail_number, game_week, new_legs_od)
     if not events:
         return
 
-    pos = _initial_airport_before_first_event(tail_number, game_week, events[0][0])
+    pos = _initial_airport_before_first_event(
+        tail_number, game_week, events[0][0], default_origin=events[0][2]
+    )
     for dep, arr, o, d in events:
         if pos is not None and pos != o:
             hint = ""

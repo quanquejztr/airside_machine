@@ -251,6 +251,68 @@ function closeWindow(id) {
   if (el) el.remove();
 }
 
+let standAlertSeen = new Set();
+
+function renderStandAlert(events) {
+  const el = document.getElementById("stand-alert");
+  if (!el) return;
+  const open = (events || []).filter((e) => String(e.status) === "PENDING");
+  if (!open.length) { el.hidden = true; el.innerHTML = ""; return; }
+
+  const ev = open[0];
+  const ramp = (ev.penalty_schedule || []).map((a, i) =>
+    `d${i + 1} ${money(a)}`).join("  ·  ");
+  const more = open.length > 1 ? ` <span class="sa-body">(+${open.length - 1} more)</span>` : "";
+  el.innerHTML = `
+    <div class="sa-title">Stand shortfall at ${escapeHtml(String(ev.airport_iata))}${more}</div>
+    <div class="sa-body">Your schedule needs ${Number(ev.peak_needed)} stands, you hold
+      ${Number(ev.gates_held)}. The flights are operating either way.</div>
+    ${ramp ? `<div class="sa-ramp">Daily penalty rises: ${ramp}</div>` : ""}
+    <div class="sa-body sa-ramp">Waiting out the week costs
+      <b>${money(ev.penalty_total_if_declined)}</b> and leaves you with no extra stand.</div>
+    <div class="sa-actions">
+      <button type="button" class="primary" data-sa-pay="${escapeHtml(String(ev.event_id))}">
+        Buy the stand — ${money(ev.fee_amount)}</button>
+      <button type="button" data-sa-no="${escapeHtml(String(ev.event_id))}">Pay daily instead</button>
+    </div>`;
+  el.hidden = false;
+
+  el.querySelectorAll("[data-sa-pay], [data-sa-no]").forEach((btn) => {
+    btn.onclick = async () => {
+      const accept = btn.hasAttribute("data-sa-pay");
+      const id = btn.getAttribute("data-sa-pay") || btn.getAttribute("data-sa-no");
+      el.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      try {
+        const out = await api("/api/gates/shortfalls/resolve", {
+          method: "POST", body: JSON.stringify({ event_id: id, accept }),
+        });
+        if (out && out.ok === false) throw new Error(out.error || "Could not apply that.");
+        toast(accept ? "Stand purchased — it is yours permanently."
+                     : "Paying the daily penalty instead.");
+        el.hidden = true; el.innerHTML = "";      // dismissed once decided
+        refreshStandAlert().catch(() => {});
+      } catch (e) {
+        el.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+        toast(e.message || "Could not apply that.");
+      }
+    };
+  });
+}
+
+async function refreshStandAlert() {
+  try {
+    const data = await api("/api/gates/shortfalls");
+    const open = (data.shortfalls || []).filter((e) => String(e.status) === "PENDING");
+    open.forEach((e) => {
+      if (!standAlertSeen.has(e.event_id)) {
+        standAlertSeen.add(e.event_id);
+        toast(`Stand shortfall at ${e.airport_iata} — decide before the penalty rises`);
+      }
+    });
+    renderStandAlert(data.shortfalls || []);
+  } catch (e) { /* a transient poll failure must not blank the alert */ }
+}
+
 async function refreshHud() {
   const seq = ++hudSeq;
   let s;
@@ -711,22 +773,152 @@ function openFleet() {
       return;
     }
     el.querySelector(".win-body").innerHTML = `<p class="muted">Click a tail to see its weekly schedule.</p>
-      <table class="grid"><thead><tr><th>Tail</th><th>Type</th><th>Own</th><th>Lease left</th><th>Status</th><th>At</th></tr></thead><tbody>${
-      rows.map((r) => `<tr>
+      <table class="grid"><thead><tr><th>Tail</th><th>Type</th><th>Own</th><th>Lease left</th><th>Status</th><th>At</th><th></th></tr></thead><tbody>${
+      rows.map((r) => {
+        const owned = String(r.ownership || "").toUpperCase() === "OWNED";
+        const pending = !!r.pending_disposal;
+        const label = owned ? "Sell" : "End lease";
+        const cell = pending
+          ? `<span class="disposal-pending" title="Executes at the next week roll">${
+              escapeHtml(String(r.pending_disposal) === "SELL" ? "Sale" : "Return")
+            } pending</span>`
+          : `<button type="button" class="link-btn" data-dispose="${escapeHtml(r.tail_number)}">${label}</button>`;
+        return `<tr>
         <td><span class="tail-link" tabindex="0" role="button" data-tail="${escapeHtml(r.tail_number)}">${escapeHtml(r.tail_number)}</span></td>
         <td>${escapeHtml(r.type_id)}</td>
         <td>${escapeHtml(fleetOwnershipLabel(r))}</td>
         <td>${escapeHtml(fleetLeaseWeeksLabel(r))}</td>
         <td>${escapeHtml(r.status)}</td>
         <td>${escapeHtml(r.current_airport_iata || "")}</td>
-      </tr>`).join("")
+        <td>${cell}</td>
+      </tr>`;
+      }).join("")
     }</tbody></table>`;
     el.querySelectorAll(".tail-link").forEach((n) => {
       const go = () => openTailGrid(n.dataset.tail);
       n.onclick = go;
       n.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
     });
+    el.querySelectorAll("[data-dispose]").forEach((n) => {
+      n.onclick = () => openDisposal(n.dataset.dispose, openFleet);
+    });
+    el.querySelectorAll(".disposal-pending").forEach((n) => {
+      n.style.cursor = "pointer";
+      n.onclick = () => {
+        const tr = n.closest("tr");
+        const tail = tr && tr.querySelector(".tail-link");
+        if (tail) openDisposal(tail.dataset.tail, openFleet);
+      };
+    });
   }).catch((err) => { el.querySelector(".win-body").innerHTML = `<div class="err">${err.message}</div>`; });
+}
+
+function disposalMoneyRows(q) {
+  if (q.kind === "SELL") {
+    const v = q.valuation || {};
+    const pct = (x) => `${(Number(x || 0) * 100).toFixed(1)}%`;
+    return `
+      <div class="books-stack">
+        ${booksMoneyRow("Paid originally", v.purchase_price_paid)}
+        <div class="hud-tip-row"><span>Age</span><b>${Number(v.age_weeks || 0)} wk · ${pct(v.age_factor)}</b></div>
+        <div class="hud-tip-row"><span>Hours flown</span><b>${Number(v.airborne_hours || 0).toFixed(1)} h · ${pct(v.usage_factor)}</b></div>
+        <div class="hud-tip-row"><span>Condition</span><b>${
+          v.maintenance_overdue ? `maintenance overdue · ${pct(v.condition_factor)}` : "good"
+        }</b></div>
+        <div class="hud-tip-row"><span>Sale haircut</span><b>${pct(v.sale_haircut)}</b></div>
+        <div class="hud-tip-row" style="font-weight:700;margin-top:4px;border-top:1px solid rgba(0,0,0,.08);padding-top:6px">
+          <span>You receive</span><b>${money(v.estimated_value)}</b>
+        </div>
+      </div>
+      ${v.floor_applied ? `<p class="muted">Floored at the residual minimum of ${money(v.residual_floor)}.</p>` : ""}`;
+  }
+  return `
+    <div class="books-stack">
+      <div class="hud-tip-row" style="font-weight:700">
+        <span>Early return penalty</span><b class="neg">${money(q.penalty)}</b>
+      </div>
+    </div>
+    <p class="muted">Charged for handing the lease back before its term ends. Weekly rent stops after the return.</p>`;
+}
+
+function openDisposal(tail, onDone) {
+  const el = openWindow("disposal", `Dispose ${tail}`, `<div class="muted">Loading…</div>`, { width: 460 });
+  const paint = () => {
+    api("/api/fleet/disposal-quote?tail=" + encodeURIComponent(tail)).then((q) => {
+      const body = el.querySelector(".win-body");
+      const blockers = q.blockers || [];
+      const pending = q.pending_disposal;
+      const isSell = q.kind === "SELL";
+      const verb = isSell ? "Sell" : "End lease on";
+
+      if (pending) {
+        body.innerHTML = `
+          <p><b>${escapeHtml(tail)}</b> — ${escapeHtml(String(pending) === "SELL" ? "sale" : "lease return")}
+            is queued and executes at the next week roll.</p>
+          ${disposalMoneyRows(q)}
+          <div class="gate-shortfall-actions" style="margin-top:10px">
+            <button type="button" id="dsp-cancel">Cancel this ${escapeHtml(String(pending) === "SELL" ? "sale" : "return")}</button>
+          </div>`;
+        $("#dsp-cancel", el).onclick = async () => {
+          try {
+            const out = await api("/api/fleet/dispose/cancel", {
+              method: "POST", body: JSON.stringify({ tail_number: tail }),
+            });
+            if (out && out.ok === false) throw new Error(out.error || "Could not cancel.");
+            toast(`${tail} kept in the fleet.`);
+            paint();
+            if (onDone) onDone();
+          } catch (e) { toast(e.message || "Could not cancel."); }
+        };
+        return;
+      }
+
+      // These are NOT a gate. request_disposal cancels the rotation and ferries the
+      // aircraft home itself, so the player can act from anywhere. Showing them as
+      // blockers and disabling the button would refuse an action the engine supports —
+      // so they are presented as what confirming is about to do.
+      const blockerBlock = blockers.length
+        ? `<div class="disposal-blockers"><p><b>Confirming will also:</b></p><ul>${
+            blockers.map((b) => `<li>${escapeHtml(b)}</li>`).join("")
+          }</ul><p class="muted">Remaining flights are cancelled and the aircraft is
+            ferried back to base automatically.</p></div>`
+        : "";
+
+      body.innerHTML = `
+        <p>${escapeHtml(verb)} <b>${escapeHtml(tail)}</b>?</p>
+        ${disposalMoneyRows(q)}
+        ${blockerBlock}
+        <p class="muted">Takes effect at the next week roll, and you can cancel until then.
+          ${isSell ? "The figure is an estimate — it is recomputed on completion, and any ferry home adds hours that reduce it." : ""}</p>
+        <div class="gate-shortfall-actions" style="margin-top:10px">
+          <button type="button" id="dsp-go">${escapeHtml(isSell ? "Confirm sale" : "Confirm return")}</button>
+          <button type="button" class="ghost" id="dsp-close">Keep it</button>
+        </div>`;
+
+      $("#dsp-close", el).onclick = () => el.remove();
+      const go = $("#dsp-go", el);
+      if (go) {
+        go.onclick = async () => {
+          go.disabled = true;
+          try {
+            const out = await api("/api/fleet/dispose", {
+              method: "POST", body: JSON.stringify({ tail_number: tail }),
+            });
+            if (out && out.ok === false) throw new Error(out.error || "Could not queue that.");
+            toast(`${tail} queued — completes at the next week roll.`);
+            paint();
+            if (onDone) onDone();
+          } catch (e) {
+            go.disabled = false;
+            toast(e.message || "Could not queue that.");
+          }
+        };
+      }
+    }).catch((err) => {
+      el.querySelector(".win-body").innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
+    });
+  };
+  paint();
 }
 
 function routePreviewCard(p) {
@@ -1699,6 +1891,71 @@ function openSchedule() {
   };
 }
 
+function openGateSale(iata, onDone) {
+  const el = openWindow("gate-sale", `Sell a stand at ${iata}`, `<div class="muted">Loading…</div>`, { width: 460 });
+  api("/api/gates/sale-quote?iata=" + encodeURIComponent(iata)).then((q) => {
+    const body = el.querySelector(".win-body");
+    const blockers = q.blockers || [];
+    const peaks = q.peak_by_week || {};
+    const peakRows = Object.keys(peaks).length
+      ? `<div class="books-stack">${Object.keys(peaks).sort().map((w) =>
+          `<div class="hud-tip-row"><span>Week ${escapeHtml(w)} peak</span><b>${Number(peaks[w])} of ${Number(q.gates_held)}</b></div>`
+        ).join("")}</div>`
+      : "";
+
+    // Unlike aircraft disposal, these ARE a gate. A stand you no longer hold cannot be
+    // conjured back mid-week, and at zero stands the weekly spawn hard-blocks with no
+    // penalty path at all — so a refused sale stays refused.
+    const blockerBlock = blockers.length
+      ? `<div class="disposal-blockers"><p><b>Cannot sell this stand</b></p><ul>${
+          blockers.map((b) => `<li>${escapeHtml(b)}</li>`).join("")
+        }</ul></div>`
+      : "";
+
+    body.innerHTML = `
+      <p>Sell one stand at <b>${escapeHtml(q.airport_iata)}</b>?
+        You hold ${Number(q.gates_held)} and would keep ${Number(q.gates_after)}.</p>
+      <div class="books-stack">
+        ${booksMoneyRow("Paid per stand", q.price_paid_per_unit)}
+        <div class="hud-tip-row"><span>Resale</span><b>${(Number(q.haircut || 0) * 100).toFixed(0)}%</b></div>
+        <div class="hud-tip-row" style="font-weight:700;margin-top:4px;border-top:1px solid rgba(0,0,0,.08);padding-top:6px">
+          <span>You receive</span><b>${money(q.proceeds)}</b>
+        </div>
+      </div>
+      ${peakRows}
+      ${blockerBlock}
+      <p class="muted">Completes at the next week roll and is re-checked then, so a schedule
+        you add in the meantime cannot strand you. Fewer stands also raises this station's
+        utilisation, which protects the rest from the use-it-or-lose-it rule.</p>
+      <div class="gate-shortfall-actions" style="margin-top:10px">
+        <button type="button" id="gs-go" ${blockers.length ? "disabled" : ""}>Sell for ${money(q.proceeds)}</button>
+        <button type="button" class="ghost" id="gs-close">Keep it</button>
+      </div>`;
+
+    $("#gs-close", el).onclick = () => el.remove();
+    const go = $("#gs-go", el);
+    if (go && !blockers.length) {
+      go.onclick = async () => {
+        go.disabled = true;
+        try {
+          const out = await api("/api/gates/sell", {
+            method: "POST", body: JSON.stringify({ airport_iata: q.airport_iata, units: 1 }),
+          });
+          if (out && out.ok === false) throw new Error(out.error || "Could not queue that.");
+          toast(`${q.airport_iata}: stand queued for sale.`);
+          el.remove();
+          if (onDone) onDone();
+        } catch (e) {
+          go.disabled = false;
+          toast(e.message || "Could not queue that.");
+        }
+      };
+    }
+  }).catch((err) => {
+    el.querySelector(".win-body").innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
+  });
+}
+
 function openGates() {
   const el = openWindow("gates", "Gate auctions", `<div class="muted">Loading…</div>`, { width: 560 });
   const render = async () => {
@@ -1716,9 +1973,15 @@ function openGates() {
           `<li>Wk ${n.game_week} · ${escapeHtml(n.body || "")}</li>`
         ).join("")}</ul>`
       : "";
-    const held = (gates.gates || []).map((g) =>
-      `<tr><td>${escapeHtml(g.airport_iata || "")}</td><td>${g.gate_units}</td><td>${g.effective_week}</td></tr>`
-    ).join("") || `<tr><td colspan="3" class="muted">None yet</td></tr>`;
+    const held = (gates.gates || []).map((g) => {
+      const ap = String(g.airport_iata || "");
+      const pending = Number(g.pending_sale_units || 0);
+      const cell = pending > 0
+        ? `<span class="disposal-pending" title="Completes at the next week roll">Sale pending</span>
+           <button type="button" class="link-btn" data-gate-unsell="${escapeHtml(ap)}">cancel</button>`
+        : `<button type="button" class="link-btn" data-gate-sell="${escapeHtml(ap)}">Sell one</button>`;
+      return `<tr><td>${escapeHtml(ap)}</td><td>${g.gate_units}</td><td>${g.effective_week}</td><td>${cell}</td></tr>`;
+    }).join("") || `<tr><td colspan="4" class="muted">None yet</td></tr>`;
     const myBids = (bids.bids || []).map((b) =>
       `<tr><td>${escapeHtml(b.airport_iata || "")}</td><td>${b.units_requested}</td><td>${money(b.price_per_unit)}</td><td>wk ${b.closes_week}</td></tr>`
     ).join("") || `<tr><td colspan="4" class="muted">None</td></tr>`;
@@ -1743,8 +2006,24 @@ function openGates() {
       <table class="grid"><thead><tr><th>Airport</th><th>Units</th><th>$/unit</th><th>Closes</th></tr></thead><tbody>${myBids}</tbody></table>
       ${recent ? `<p>Recent closed bids</p><table class="grid"><thead><tr><th>Airport</th><th>Units</th><th>$/unit</th><th>Status</th></tr></thead><tbody>${recent}</tbody></table>` : ""}
       <p>Held stands</p>
-      <table class="grid"><thead><tr><th>Airport</th><th>Units</th><th>From wk</th></tr></thead><tbody>${held}</tbody></table>`;
+      <table class="grid"><thead><tr><th>Airport</th><th>Units</th><th>From wk</th><th></th></tr></thead><tbody>${held}</tbody></table>`;
     attachAirportPicker($("#g-iata", el));
+    el.querySelectorAll("[data-gate-sell]").forEach((b) => {
+      b.onclick = () => openGateSale(b.getAttribute("data-gate-sell"), render);
+    });
+    el.querySelectorAll("[data-gate-unsell]").forEach((b) => {
+      b.onclick = async () => {
+        const ap = b.getAttribute("data-gate-unsell");
+        try {
+          const out = await api("/api/gates/sell/cancel", {
+            method: "POST", body: JSON.stringify({ airport_iata: ap }),
+          });
+          if (out && out.ok === false) throw new Error(out.error || "Could not cancel.");
+          toast(`${ap}: stand sale cancelled.`);
+          render();
+        } catch (e) { toast(e.message || "Could not cancel."); }
+      };
+    });
     el.querySelectorAll("tbody tr[data-iata]").forEach((tr) => {
       tr.onclick = () => {
         $("#g-iata", el).value = tr.dataset.iata;
@@ -2024,6 +2303,38 @@ function openBooks() {
       const shock = f.shock_pending
         ? `<p class="err">Fuel shock: ${escapeHtml(f.shock_message || "pending")} <button type="button" id="bk-ack">Ack</button></p>`
         : "";
+      const sf = data.gate_shortfalls || {};
+      const sfTotals = sf.totals || {};
+      const gateShortfallBlock = (sf.open || []).map((ev) => {
+        const decided = String(ev.status) === "DECLINED";
+        const accrued = Number(ev.penalty_accrued || 0);
+        const accruedLine = accrued > 0
+          ? ` · already paid ${money(accrued)} over ${Number(ev.penalty_days_charged || 0)} day(s)`
+          : "";
+        return `<div class="gate-shortfall" data-sf="${escapeHtml(String(ev.event_id))}">
+            <p><b>${escapeHtml(String(ev.airport_iata))}</b> needs
+              ${Number(ev.peak_needed)} stands, you hold ${Number(ev.gates_held)}.
+              Your flights are operating.</p>
+            <p class="muted">Buy one permanently for <b>${money(ev.fee_amount)}</b>,
+              or pay <b>${money(ev.daily_penalty)}</b> per day until it clears${accruedLine}.</p>
+            <div class="gate-shortfall-actions">
+              <button type="button" data-sf-pay="${escapeHtml(String(ev.event_id))}">
+                Buy stand — ${money(ev.fee_amount)}</button>
+              ${decided
+                ? `<span class="muted">Paying daily${accruedLine ? "" : " from today"}</span>`
+                : `<button type="button" class="ghost" data-sf-no="${escapeHtml(String(ev.event_id))}">
+                     Pay daily instead</button>`}
+            </div>
+          </div>`;
+      }).join("");
+      // The actionable prompt lives in the header alert, not here: a charge that grows
+      // every game day should not be waiting behind a tab the player may never open.
+      const gateShortfallSection = "";
+      const sfFee = Number(sfTotals.emergency_gate_fees || 0);
+      const sfPen = Number(sfTotals.gate_shortfall_penalties || 0);
+      const gateLedgerRows =
+        (sfFee ? booksMoneyRow("Emergency stands", sfFee) : "") +
+        (sfPen ? booksMoneyRow("Stand penalties", sfPen) : "");
       const netCls = Number(w.net_income || 0) < 0 ? "neg" : "";
       el.querySelector(".win-body").innerHTML = `
         ${settleLine}
@@ -2039,12 +2350,14 @@ function openBooks() {
           ${booksMoneyRow("Leases", w.lease_costs)}
           ${booksMoneyRow("Loans", w.loan_payments)}
           ${booksMoneyRow("Corp tax", w.corporate_tax)}
+          ${gateLedgerRows}
           <div class="hud-tip-row" style="font-weight:700;margin-top:4px;border-top:1px solid rgba(0,0,0,.08);padding-top:6px">
             <span>Net</span><b class="${netCls}">${signedMoney(w.net_income)}</b>
           </div>
           ${booksMoneyRow(w.cash_row_label || "Cash", w.cash_end_of_week)}
         </div>
         ${prevLine}
+        ${gateShortfallSection}
         <hr class="books-rule" />
         <p><b>Fuel</b> · spot <b>$${Number(f.spot_bbl || 0).toFixed(2)}/bbl</b>
           · all-in ~$${Number(f.spot_gal || 0).toFixed(3)}/gal</p>
@@ -2105,6 +2418,25 @@ function openBooks() {
       if (dipClear) dipClear.onclick = () => runFuel({ action: "clear_dip" }, "Dip alert cleared");
       const ack = $("#bk-ack", el);
       if (ack) ack.onclick = () => runFuel({ action: "ack_shock" }, "Shock acknowledged");
+      el.querySelectorAll("[data-sf-pay], [data-sf-no]").forEach((btn) => {
+        btn.onclick = async () => {
+          const accept = btn.hasAttribute("data-sf-pay");
+          const id = btn.getAttribute("data-sf-pay") || btn.getAttribute("data-sf-no");
+          btn.disabled = true;
+          try {
+            const out = await api("/api/gates/shortfalls/resolve", {
+              method: "POST",
+              body: JSON.stringify({ event_id: id, accept }),
+            });
+            if (out && out.ok === false) throw new Error(out.error || "Could not apply that.");
+            toast(accept ? "Stand purchased — it is yours permanently." : "Paying the daily penalty instead.");
+            paint();
+          } catch (err) {
+            btn.disabled = false;
+            toast(err.message || "Could not apply that.");
+          }
+        };
+      });
     }).catch((err) => {
       el.querySelector(".win-body").innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
     });
@@ -3306,4 +3638,6 @@ refreshHud().catch((err) => toast(err.message));
 loadMap().catch((err) => toast(err.message));
 scheduleMapPoll();
 setInterval(() => { refreshHud().catch(() => {}); }, 4000);
+setInterval(() => { refreshStandAlert().catch(() => {}); }, 6000);
+refreshStandAlert().catch(() => {});
 setInterval(paintHudTime, 250);

@@ -220,17 +220,28 @@ class TestScheduling(LifecycleBase):
         )
         self.assertEqual(len(route_ids), len(rows))
 
-    def test_clear_removes_plan_and_repositions(self):
+    def test_clear_removes_plan_and_leaves_the_tail_put(self):
+        """Clearing removes the plan and nothing else.
+
+        It used to end with an automatic ferry to the hub, which made the last ferry
+        undeletable — clearing it created another. Repositioning is the player's call,
+        because a rotation may deliberately begin away from base.
+        """
         from engine.scheduling import assign_rotation, cancel_rotation
         assign_rotation(self.tail, [self.out_id])          # one-way: ends at the spoke
         self.g.fly_all()
         loc = self.db.fetch_one("SELECT current_airport_iata FROM fleet WHERE tail_number=?", (self.tail,))
         self.assertEqual(self.spoke, str(loc["current_airport_iata"]))
-        res = cancel_rotation(self.tail, wipe_completed_this_week=True)
-        self.assertIsInstance(res, dict, "a tail away from hub should get a ferry")
-        self.assertEqual(self.HUB, res["to"])
+        cancel_rotation(self.tail, wipe_completed_this_week=True)
         self.assertIsNone(self.db.fetch_one(
-            "SELECT 1 FROM weekly_rotations WHERE tail_number = ?", (self.tail,)))
+            "SELECT 1 FROM weekly_rotations WHERE tail_number = ?", (self.tail,)),
+            "the template must be gone")
+        self.assertIsNone(self.db.fetch_one(
+            "SELECT 1 FROM flight_segments WHERE tail_number = ? AND is_ferry = 1", (self.tail,)),
+            "no ferry may be created on the player's behalf")
+        loc2 = self.db.fetch_one("SELECT current_airport_iata FROM fleet WHERE tail_number=?", (self.tail,))
+        self.assertEqual(self.spoke, str(loc2["current_airport_iata"]),
+                         "the aircraft stays at the spoke")
 
 
 class TestFlyingAndSettlement(LifecycleBase):

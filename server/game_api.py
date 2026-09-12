@@ -1549,6 +1549,101 @@ def place_gate_bid(body: dict) -> dict:
     return _ok({"auction_id": aid, "units": units, "price_per_unit": price})
 
 
+def gate_shortfalls() -> dict:
+    """Open stand shortfalls awaiting a Pay / Decline decision, plus what each costs."""
+    from engine.gates import gate_shortfall_penalty_schedule, open_gate_shortfalls
+
+    out = []
+    for ev in open_gate_shortfalls():
+        fee = float(ev.get("fee_amount") or 0.0)
+        days_total = int(ev.get("penalty_days_total") or 7)
+        charged = int(ev.get("penalty_days_charged") or 0)
+        schedule = gate_shortfall_penalty_schedule(fee, days_total)
+        out.append(
+            {
+                "event_id": ev.get("event_id"),
+                "airport_iata": ev.get("airport_iata"),
+                "game_week": ev.get("game_week"),
+                "peak_needed": ev.get("peak_needed"),
+                "gates_held": ev.get("gates_held"),
+                "fee_amount": fee,
+                "route_revenue_basis": float(ev.get("route_revenue_basis") or 0.0),
+                "status": ev.get("status"),
+                "penalty_days_total": days_total,
+                "penalty_days_charged": charged,
+                "penalty_schedule": schedule,
+                # What the remaining days cost, so the choice shown is the one still open
+                # rather than the one that was open when the shortfall was detected.
+                "penalty_total_if_declined": round(sum(schedule[charged:]), 2),
+                "daily_penalty": (
+                    schedule[charged] if charged < len(schedule)
+                    else (schedule[-1] if schedule else 0.0)
+                ),
+                "penalty_accrued": float(ev.get("penalty_accrued") or 0.0),
+            }
+        )
+    return _ok({"week": current_game_week(), "shortfalls": out})
+
+
+def resolve_gate_shortfall_request(body: dict) -> dict:
+    """Buy the extra stand (accept=true) or elect to pay the daily penalty instead."""
+    from engine.gates import resolve_gate_shortfall
+
+    event_id = str(body.get("event_id") or "").strip()
+    if not event_id:
+        return _err("event_id is required.")
+    accept = bool(body.get("accept"))
+    try:
+        return _ok(resolve_gate_shortfall(event_id, accept))
+    except Exception as e:
+        return _err(str(e))
+
+
+def gate_sale_quote_api(iata: str, units: str = "1") -> dict:
+    """What selling stands at this airport pays, and why it might be refused."""
+    from engine.gates import gate_sale_quote
+
+    ap = str(iata or "").strip().upper()
+    if not ap:
+        return _err("iata is required.")
+    try:
+        n = max(1, int(units or 1))
+    except (TypeError, ValueError):
+        n = 1
+    try:
+        return _ok(gate_sale_quote(ap, n))
+    except Exception as e:
+        return _err(str(e))
+
+
+def sell_gate(body: dict) -> dict:
+    from engine.gates import request_gate_sale
+
+    ap = str(body.get("airport_iata") or "").strip().upper()
+    if not ap:
+        return _err("airport_iata is required.")
+    try:
+        n = max(1, int(body.get("units") or 1))
+    except (TypeError, ValueError):
+        n = 1
+    try:
+        return _ok(request_gate_sale(ap, n))
+    except Exception as e:
+        return _err(str(e))
+
+
+def cancel_gate_sale_api(body: dict) -> dict:
+    from engine.gates import cancel_gate_sale
+
+    ap = str(body.get("airport_iata") or "").strip().upper()
+    if not ap:
+        return _err("airport_iata is required.")
+    try:
+        return _ok(cancel_gate_sale(ap))
+    except Exception as e:
+        return _err(str(e))
+
+
 def player_gate_bids() -> dict:
     from engine.gates import resolve_overdue_gate_auctions
 
@@ -1588,7 +1683,8 @@ def player_gates() -> dict:
         mtt = 0.5
     rows = db.fetch_all(
         """
-        SELECT airport_iata, gate_units, effective_week, status
+        SELECT airport_iata, gate_units, effective_week, status,
+               COALESCE(pending_sale_units, 0) AS pending_sale_units
         FROM airport_gate_allocations
         WHERE holder_id = 'PLAYER' AND status = 'ACTIVE'
         ORDER BY airport_iata
@@ -2076,11 +2172,23 @@ def books_status() -> dict:
         "catchup_errors": (catchup or {}).get("errors") or [],
     }
     reputation = preview_reputation(cal)
+    try:
+        from engine.gates import gate_shortfall_week_totals, open_gate_shortfalls
+
+        wk_no = int((week or {}).get("game_week") or calendar_week_from_state())
+        shortfalls = {
+            "open": open_gate_shortfalls(),
+            "totals": gate_shortfall_week_totals(wk_no),
+        }
+    except Exception:
+        shortfalls = {"open": [], "totals": {}}
+
     return _ok({
         "week": week,
         "fuel": fuel,
         "settlement": settlement,
         "reputation": reputation,
+        "gate_shortfalls": _json_safe(shortfalls),
     })
 
 

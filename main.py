@@ -150,6 +150,15 @@ def ensure_game_clock():
             pass
         enqueue_settlement_after_week_boundary(new_week)
 
+    def on_day_roll(game_day):
+        """Charge one day of any open gate-stand shortfall, and close cleared ones."""
+        try:
+            from engine.gates import accrue_gate_shortfall_penalties
+
+            accrue_gate_shortfall_penalties(int(game_day))
+        except Exception:
+            pass
+
     def on_fuel_tick(game_hours_elapsed, speed_multiplier):
         try:
             from engine import fuel as fuel_mod
@@ -166,6 +175,7 @@ def ensure_game_clock():
 
     clock = start_game_clock(
         on_week=on_week_roll,
+        on_day=on_day_roll,
         on_tick=on_fuel_tick,
         on_departure=on_departure,
         on_arrival=on_arrival,
