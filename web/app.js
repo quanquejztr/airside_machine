@@ -504,15 +504,103 @@ function wireHubPreview(root) {
   input.addEventListener("blur", preview);
 }
 
+async function paintHubs(el) {
+  const box = $("#al-hubs", el);
+  if (!box) return;
+  try {
+    const st = await api("/api/hubs");
+    const hubs = st.hubs || [];
+    const need = Number(st.required_routes_per_hub || 10);
+    const rows = hubs.map((h) => {
+      const tag = h.is_primary ? "primary" : `opened wk ${Number(h.opened_game_week)}`;
+      // "Young" is worth showing: a hub under the route bar is still judged by the
+      // gentler non-hub utilisation rule, which is what keeps its starter stands alive.
+      const state = h.mature ? "" : ` &middot; <span class="muted">young</span>`;
+      return `<div class="hud-tip-row">
+        <span><b>${escapeHtml(String(h.iata))}</b> <span class="muted">${escapeHtml(tag)}</span>${state}</span>
+        <b class="${h.meets_requirement ? "" : "neg"}">${Number(h.routes)} / ${need} routes</b>
+      </div>`;
+    }).join("");
+    const blocked = hubs.filter((h) => !h.meets_requirement);
+    const note = st.can_open_another
+      ? `<p class="muted">Every hub meets the ${need}-route requirement — you can open another.</p>`
+      : `<p class="muted">Each hub needs ${need} routes before you may open another. Short: ${
+          blocked.map((h) => escapeHtml(String(h.iata))).join(", ")}.</p>`;
+    box.innerHTML = `<p><b>Hubs</b></p><div class="books-stack">${rows}</div>${note}
+      <div class="row2" style="margin-top:8px">
+        <div><label>New hub (code, city or name)</label>
+          <input id="al-hub-iata" placeholder="LHR" autocomplete="off"
+                 ${st.can_open_another ? "" : "disabled"} /></div>
+        <div style="align-self:end">
+          <button type="button" id="al-hub-open" ${st.can_open_another ? "" : "disabled"}>Open hub</button>
+        </div>
+      </div>
+      <div id="al-hub-preview" class="hub-preview" hidden></div>`;
+
+    const input = $("#al-hub-iata", el);
+    if (input && typeof attachAirportPicker === "function") attachAirportPicker(input);
+    const prev = $("#al-hub-preview", el);
+    const showPreview = async () => {
+      const code = String((input && input.value) || "").trim().toUpperCase();
+      if (code.length < 3) { prev.hidden = true; return; }
+      try {
+        const p = await api("/api/hubs/preview?iata=" + encodeURIComponent(code));
+        if (p.ok === false) { prev.hidden = true; return; }
+        const grants = [];
+        if (p.grants_gates) grants.push(`${p.grants_gates} stand(s)`);
+        if (p.grants_slots) grants.push(`${p.grants_slots} weekly movements`);
+        prev.innerHTML = `<p><b>${escapeHtml(String(p.iata))}</b>
+            ${escapeHtml(p.city || "")}${p.country ? ", " + escapeHtml(p.country) : ""}</p>
+          <p class="muted">${grants.length
+              ? "Grants " + grants.join(" + ")
+              : "No starter capacity — not a gate-auction or slot-controlled airport"}
+            &middot; ${Number(p.routes_here)} of your routes already touch it</p>
+          ${(p.blockers || []).length
+            ? `<p class="err">${(p.blockers || []).map(escapeHtml).join(" ")}</p>` : ""}`;
+        prev.hidden = false;
+      } catch (e) { prev.hidden = true; }
+    };
+    if (input) { input.oninput = showPreview; input.onchange = showPreview; }
+
+    const btn = $("#al-hub-open", el);
+    if (btn) {
+      btn.onclick = async () => {
+        const code = String((input && input.value) || "").trim().toUpperCase();
+        if (!code) { toast("Enter an airport."); return; }
+        btn.disabled = true;
+        try {
+          const out = await api("/api/hubs/open", {
+            method: "POST", body: JSON.stringify({ iata: code }),
+          });
+          if (out && out.ok === false) throw new Error(out.error || "Could not open that hub.");
+          const g = out.granted || {};
+          const bits = [];
+          if (g.gates) bits.push(`${g.gates} stand(s)`);
+          if (g.slots) bits.push(`${g.slots} weekly movements`);
+          toast(`${code} opened as a hub${bits.length ? " — " + bits.join(" and ") + " granted" : ""}.`);
+          paintHubs(el);
+        } catch (e) {
+          btn.disabled = false;
+          toast(e.message || "Could not open that hub.");
+        }
+      };
+    }
+  } catch (e) {
+    box.innerHTML = `<p class="err">${escapeHtml(e.message || "Could not load hubs")}</p>`;
+  }
+}
+
 function openAirline() {
   const existing = lastState && lastState.airline;
   const el = openWindow("airline", "Airline", existing
     ? `<p><b>${escapeHtml(existing.name)}</b> (${escapeHtml(existing.callsign)})</p>
-       <p>Hub ${escapeHtml(existing.home_hub_iata)}</p>
        <p>Cash ${money(existing.cash)}</p>
        <p>Reputation <b>${Number(existing.reputation_score).toFixed(0)}</b> / 100
          · brand <b>${Number(existing.brand_power || 1).toFixed(2)}×</b></p>
        <p class="muted">Debt ${money(existing.total_debt)} · credit ${existing.credit_score}</p>
+       <hr class="books-rule" />
+       <div id="al-hubs"><p class="muted">Loading hubs…</p></div>
+       <hr class="books-rule" />
        <p class="muted">Reset keeps this name, callsign, and hub. Week, cash, fleet, and routes go back to a new-game start. Delete removes the airline so you can found another.</p>
        <button type="button" id="al-reset">Reset airline</button>
        <button type="button" id="al-delete" class="danger">Delete airline</button>`
@@ -526,6 +614,7 @@ function openAirline() {
         <p class="muted">Big hubs (SFO, ORD, JFK) need gate auctions before you can fly from them. TPA does not.</p>
         <button type="submit">Create airline</button>
       </form>`);
+  if ($("#al-hubs", el)) paintHubs(el);
   const resetBtn = $("#al-reset", el);
   if (resetBtn) {
     resetBtn.onclick = async () => {

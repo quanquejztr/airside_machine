@@ -402,8 +402,18 @@ def reconfigure(tail_number, eco, prem_eco, biz, first):
         return False, 0.0, f"Aircraft must be IDLE (currently {fleet_aircraft['status']})"
     
     # Check location
-    if fleet_aircraft['current_airport_iata'] != airline['home_hub_iata']:
-        return False, 0.0, f"Aircraft must be at home hub {airline['home_hub_iata']} (currently at {fleet_aircraft['current_airport_iata']})"
+    try:
+        from engine.hubs import hub_codes
+
+        hubs = [str(h).upper() for h in hub_codes()]
+    except Exception:
+        hubs = [str(airline['home_hub_iata']).upper()]
+    where = str(fleet_aircraft['current_airport_iata'] or "").upper()
+    if where not in hubs:
+        return False, 0.0, (
+            f"Aircraft must be at one of your hubs ({', '.join(hubs)}); "
+            f"currently at {where or '?'}"
+        )
     
     # Get aircraft type and EEC limit
     aircraft_type = get_aircraft_type(fleet_aircraft['type_id'])

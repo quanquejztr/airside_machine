@@ -819,14 +819,14 @@ def _route_preview_detail(origin: str, dest: str, prev: dict) -> dict:
     if fwd_has and rev_has:
         reason = "You already operate both directions — nothing to buy."
     elif fwd_has or rev_has:
-        reason = ("You already operate one direction of this hub pair, so the return leg is "
+        reason = ("You already operate one direction of this pair, so the return leg is "
                   "added free.")
     elif total <= 0 and free_legs:
-        reason = "Companion leg of a hub pair — covered by the other direction's fee."
-    elif prev.get("mode") == "hub_pair":
-        reason = ("One acquisition fee opens both directions because your hub is on this pair.")
+        reason = "Companion leg of the pair — covered by the other direction's fee."
+    elif prev.get("hub_involved"):
+        reason = ("One acquisition fee opens both directions, and your hub is on this pair.")
     else:
-        reason = "Neither airport is your hub, so only this one direction is opened."
+        reason = "One acquisition fee opens both directions."
     out["cost_reason"] = reason
     out["already_operated"] = bool(fwd_has and rev_has)
 
@@ -1595,6 +1595,42 @@ def resolve_gate_shortfall_request(body: dict) -> dict:
     accept = bool(body.get("accept"))
     try:
         return _ok(resolve_gate_shortfall(event_id, accept))
+    except Exception as e:
+        return _err(str(e))
+
+
+def hubs_status() -> dict:
+    """Hubs held, the unlock condition, and progress toward opening another."""
+    from engine.hubs import hub_open_status
+
+    if not setup.airline_exists():
+        return _err("Create an airline first.")
+    try:
+        return _ok(hub_open_status())
+    except Exception as e:
+        return _err(str(e))
+
+
+def hub_open_preview(iata: str) -> dict:
+    from engine.hubs import preview_hub
+
+    ap = str(iata or "").strip().upper()
+    if not ap:
+        return _err("iata is required.")
+    try:
+        return _ok(preview_hub(ap))
+    except Exception as e:
+        return _err(str(e))
+
+
+def open_new_hub(body: dict) -> dict:
+    from engine.hubs import open_hub
+
+    ap = str(body.get("iata") or body.get("airport_iata") or "").strip().upper()
+    if not ap:
+        return _err("iata is required.")
+    try:
+        return _ok(open_hub(ap))
     except Exception as e:
         return _err(str(e))
 
