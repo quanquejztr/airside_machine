@@ -102,9 +102,10 @@ def seed_airports(conn):
             INSERT OR REPLACE INTO airports (
                 iata, icao, name, city, country, lat, lon, 
                 runway_length_ft, gate_count, timezone, score, category,
+                slot_level, runway_count,
                 landing_fee_override, gate_fee_override,
                 has_curfew, curfew_start, curfew_end
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row['iata'],
             row['icao'],
@@ -118,6 +119,8 @@ def seed_airports(conn):
             row['timezone'],
             score,
             category,
+            int(row.get('slot_level') or 1),
+            int(row.get('runway_count') or 0),
             None,  # landing_fee_override (not in CSV, use category default)
             None,  # gate_fee_override (not in CSV, use category default)
             None,  # has_curfew (use category default)

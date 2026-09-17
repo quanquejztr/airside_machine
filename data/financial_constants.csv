@@ -11,6 +11,7 @@ slot_grace_weeks,2
 slot_season_weeks,12
 slot_enforcement_weekly,0
 slot_auction_units,30
+slot_auction_units_min,100
 slot_min_price_per_unit,8000
 slot_price_step,1000
 mtt_minutes,30

@@ -188,37 +188,74 @@ def assert_aircraft_dispatchable(aircraft) -> None:
         )
 
 
+def _existing_block_label(row) -> str:
+    """Name an existing flight in a conflict message, so the player can see what is in the way."""
+    fn = str(row["flight_number"] or "").strip()
+    origin = str(row["origin_iata"] or "").strip().upper()
+    dest = str(row["dest_iata"] or "").strip().upper()
+    day = str(row["day_of_week"] or "").strip().upper()
+    leg = f"{origin}-{dest}" if origin and dest else ""
+    parts = [part for part in (fn, leg, day) if part]
+    return " ".join(parts) if parts else "an existing flight"
+
+
+def _conflict_pair_label(first, second) -> str:
+    return f"{first or 'the new flight'} vs {second or 'the new flight'}"
+
+
 def assert_tail_schedule_accepts_new_intervals(tail_number, game_week, new_intervals, mtt_hours):
     """
-    Block times (dep, arr) must not overlap existing SCHEDULED/IN_AIR flights and must leave
-    at least MTT between one flight's arrival and the next departure (same tail, same week).
+    Block times (dep, arr) must not overlap the tail's existing SCHEDULED/IN_AIR flights, and
+    must leave at least MTT between one flight's arrival and the next departure.
+
+    Keyed on the absolute game-hour window rather than on `game_week`, deliberately. A chain
+    anchored late in the week finishes in the next one, and each wrapped leg is stamped with
+    the week its own departure falls in (see `_spawn_one_detailed_chained_chain`). Filtering by
+    `game_week` hid those wrapped legs from this check, which is how one tail ended up flying
+    two chains at once across a week boundary. `game_week` is still accepted so every existing
+    call site keeps working, but it no longer restricts what the check can see.
     """
+    if not new_intervals:
+        return
+    window_start = min(float(dep) for dep, _arr in new_intervals)
+    window_end = max(float(arr) for _dep, arr in new_intervals)
+    pad = max(float(mtt_hours or 0.0), 0.0) + 1e-6
     rows = db.fetch_all(
         """
-        SELECT scheduled_dep_game_hour, scheduled_arr_game_hour
+        SELECT flight_number, origin_iata, dest_iata, day_of_week,
+               scheduled_dep_game_hour, scheduled_arr_game_hour
         FROM flight_segments
-        WHERE tail_number = ? AND game_week = ? AND status IN ('SCHEDULED', 'IN_AIR')
+        WHERE tail_number = ?
+          AND status IN ('SCHEDULED', 'IN_AIR')
+          AND scheduled_arr_game_hour >= ?
+          AND scheduled_dep_game_hour <= ?
         """,
-        (tail_number, game_week),
+        (tail_number, window_start - pad, window_end + pad),
     )
-    intervals = [
-        (float(r["scheduled_dep_game_hour"]), float(r["scheduled_arr_game_hour"]))
+    blocks = [
+        (
+            float(r["scheduled_dep_game_hour"]),
+            float(r["scheduled_arr_game_hour"]),
+            _existing_block_label(r),
+        )
         for r in rows
     ]
-    intervals.extend(new_intervals)
-    intervals.sort(key=lambda x: x[0])
-    for i in range(len(intervals) - 1):
-        d1, a1 = intervals[i]
-        d2, a2 = intervals[i + 1]
+    blocks.extend((float(dep), float(arr), None) for dep, arr in new_intervals)
+    blocks.sort(key=lambda x: x[0])
+    for i in range(len(blocks) - 1):
+        _d1, a1, label1 = blocks[i]
+        d2, _a2, label2 = blocks[i + 1]
         if d2 < a1 - 1e-6:
             raise ValueError(
-                "Schedule conflict: two flights overlap (next departure is before the previous flight lands)."
+                "Schedule conflict: two flights overlap (next departure is before the "
+                f"previous flight lands) — {_conflict_pair_label(label1, label2)}."
             )
         gap_h = d2 - a1
         if gap_h < mtt_hours - 1e-9:
             raise ValueError(
                 f"Turnaround rule: need at least {mtt_hours * 60:.0f} min between flights; "
-                f"only {(gap_h * 60):.0f} min after arrival at {a1:.2f}h before next departure at {d2:.2f}h."
+                f"only {(gap_h * 60):.0f} min after arrival at {a1:.2f}h before next departure "
+                f"at {d2:.2f}h — {_conflict_pair_label(label1, label2)}."
             )
 
 
@@ -350,6 +387,7 @@ def validate_position_timeline_for_new_legs(tail_number, game_week, new_legs_od)
                 float(r["scheduled_arr_game_hour"]),
                 str(rt["origin_iata"]).upper(),
                 str(rt["dest_iata"]).upper(),
+                False,  # already on the board
             )
         )
     for dep, arr, o, d in new_legs_od:
@@ -359,23 +397,39 @@ def validate_position_timeline_for_new_legs(tail_number, game_week, new_legs_od)
                 float(arr),
                 str(o).upper(),
                 str(d).upper(),
+                True,  # proposed now, and the only thing this call may refuse
             )
         )
     events.sort(key=lambda x: x[0])
     if not events:
         return
 
+    # The hint only makes sense when the request itself repeats one city pair across days.
+    # Attached unconditionally it misdescribed every other kind of positioning failure.
+    new_pairs = [(str(o).upper(), str(d).upper()) for _dep, _arr, o, d in new_legs_od]
+    repeats_a_pair = len(new_pairs) > len(set(new_pairs))
+
     pos = _initial_airport_before_first_event(
         tail_number, game_week, events[0][0], default_origin=events[0][2]
     )
-    for dep, arr, o, d in events:
+    for dep, _arr, o, d, is_new in events:
         if pos is not None and pos != o:
-            hint = ""
-            if len(events) > 1:
-                hint = (
-                    " For the same route on multiple days you need return legs in between "
-                    "(e.g. alternate ATL→LAX with LAX→ATL) so the aircraft returns to the departure city."
-                )
+            if not is_new:
+                # A leg already on the board is out of place. That is a pre-existing defect in
+                # this tail's timeline -- a chain that became invalid when a longer chain grew
+                # to wrap onto its day, say -- and it is not this request's fault. Refusing here
+                # made the aircraft permanently unschedulable: every new rotation, however
+                # sound, was rejected and blamed on a leg the player had not touched. The
+                # aircraft will fly that leg regardless, so take its destination as the new
+                # position and keep validating what was actually asked for.
+                pos = d
+                continue
+            hint = (
+                " For the same route on multiple days you need return legs in between "
+                "(e.g. alternate ATL→LAX with LAX→ATL) so the aircraft returns to the departure city."
+                if repeats_a_pair
+                else ""
+            )
             raise ValueError(
                 f"Positioning: at hour {dep:.2f} the aircraft is at {pos}, "
                 f"but this leg departs {o}→{d}.{hint}"
