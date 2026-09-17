@@ -79,9 +79,28 @@ def current_game_week() -> int:
 
 
 def is_auctioned_airport(iata: str) -> bool:
-    ap = db.fetch_one("SELECT score FROM airports WHERE iata = ?", (iata.strip().upper(),))
+    """Gates are sold at auction wherever the airport is slot-coordinated or facilitated.
+
+    Driven by `slot_level` (IATA levels 2 and 3), not by `score`. Score is a size number
+    and was being asked to answer a different question — whether capacity is scarce —
+    which it did badly: Boston at 87M annual passengers fell below the threshold while
+    far quieter airports sat above it. `score` still ranks airports for the AI and hub
+    picker; it no longer decides auctions.
+
+    Falls back to the old score rule only when slot_level is missing, so a save that has
+    not been reseeded yet behaves exactly as before.
+    """
+    ap = db.fetch_one(
+        "SELECT score, slot_level FROM airports WHERE iata = ?", (iata.strip().upper(),)
+    )
     if not ap:
         return False
+    try:
+        level = int(ap["slot_level"] or 0)
+    except (TypeError, ValueError, IndexError, KeyError):
+        level = 0
+    if level > 0:
+        return level >= 2
     return float(ap["score"] or 0) >= float(gate_score_threshold())
 
 
@@ -727,7 +746,11 @@ def ensure_weekly_airport_auctions(opens_week: int) -> int:
     units_available is computed from total_gate_units - active allocations.
     """
     ow = int(opens_week)
-    airports = db.fetch_all("SELECT iata FROM airports WHERE score >= ?", (gate_score_threshold(),))
+    airports = db.fetch_all(
+        "SELECT iata FROM airports WHERE COALESCE(slot_level, 0) >= 2"
+        "    OR (COALESCE(slot_level, 0) = 0 AND COALESCE(score, 0) >= ?)",
+        (gate_score_threshold(),),
+    )
     n = 0
     for r in airports:
         iata = str(r["iata"]).upper()

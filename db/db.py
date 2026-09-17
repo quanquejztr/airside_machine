@@ -421,6 +421,7 @@ def add_missing_airports_from_csv() -> int:
     cols = [
         "iata", "icao", "name", "city", "country", "lat", "lon",
         "runway_length_ft", "gate_count", "timezone", "score", "category",
+        "slot_level", "runway_count",
     ]
     placeholders = ",".join("?" * len(cols))
     added = 0
@@ -679,6 +680,103 @@ def _repair_us_airport_timezones() -> None:
         WHERE country = 'US' AND timezone = 'Pacific/Honolulu' AND lat > 50
         """
     )
+
+
+def _add_airport_slot_level() -> None:
+    """Add slot_level / runway_count, and backfill from the old score rule.
+
+    Existing saves have neither column. Backfilling slot_level from
+    `score >= gate_auction_score_threshold` keeps every save's gate auctions exactly as
+    they were until the airport table is reseeded from the rebuilt CSV, which is what
+    actually introduces the IATA-derived levels.
+    """
+    _add_column_if_missing("airports", "slot_level", "INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing("airports", "runway_count", "INTEGER NOT NULL DEFAULT 0")
+
+    # Backfill ONLY a table that has no levels at all. Once the airports CSV supplies
+    # them, they are deliberate — including the airports intentionally left at Level 1
+    # despite a high score — and inferring from `score` would silently promote 28 of them
+    # back to gate auctions, re-creating the exact conflation this column removes.
+    row = fetch_one("SELECT COUNT(*) AS n FROM airports WHERE COALESCE(slot_level, 0) >= 2")
+    if row and int(row["n"] or 0) > 0:
+        return
+
+    row = fetch_one(
+        "SELECT value FROM financial_constants WHERE key = 'gate_auction_score_threshold'"
+    )
+    try:
+        thr = float(row["value"]) if row else 1_080_000.0
+    except (TypeError, ValueError):
+        thr = 1_080_000.0
+    execute(
+        "UPDATE airports SET slot_level = 2 WHERE slot_level = 1 AND COALESCE(score, 0) >= ?",
+        (thr,),
+    )
+
+
+def _refresh_airport_reference_data() -> int:
+    """Update reference columns on airports that already exist in a save.
+
+    `add_missing_airports_from_csv` is insert-only, so a save created before the airport
+    rebuild keeps its old rows forever: wrong timezones, no runway counts, and a
+    `slot_level` inferred from the retired score rule rather than read from the data. The
+    visible symptom is that runway slots almost stop existing — every coordinated airport
+    that predates the rebuild is scored to level 2, the seeder only derives caps for
+    level 3, and the caps stay frozen at the old flat 26.
+
+    Only reference columns are touched. `gate_count`, `score`, fee overrides and curfews
+    are the player's or the save's, and are left exactly as they are. `category` is also
+    left alone deliberately: it drives landing and gate fees, and changing an airport's
+    tier mid-game would silently reprice routes already being flown.
+    """
+    from db.seed import load_csv
+
+    try:
+        rows = load_csv("airports.csv")
+    except Exception:
+        return 0
+    if not rows:
+        return 0
+    have = {str(r["iata"]) for r in fetch_all("SELECT iata FROM airports") if r["iata"]}
+    changed = 0
+    for r in rows:
+        iata = str(r.get("iata") or "").strip()
+        if not iata or iata not in have:
+            continue
+        try:
+            execute(
+                """
+                UPDATE airports
+                SET timezone = COALESCE(?, timezone),
+                    slot_level = ?,
+                    runway_count = ?,
+                    runway_length_ft = COALESCE(?, runway_length_ft)
+                WHERE iata = ?
+                """,
+                (
+                    (r.get("timezone") or None),
+                    int(r.get("slot_level") or 1),
+                    int(r.get("runway_count") or 0),
+                    int(r["runway_length_ft"]) if str(r.get("runway_length_ft") or "").strip().isdigit() else None,
+                    iata,
+                ),
+            )
+            changed += 1
+        except Exception:
+            continue
+
+    # Slot control follows the levels. Airports demoted below 3 keep any allocations they
+    # have, which simply stop being consulted — a relaxation, never a broken schedule.
+    try:
+        execute(
+            """
+            DELETE FROM slot_controlled_airports
+            WHERE iata IN (SELECT iata FROM airports WHERE COALESCE(slot_level, 0) < 3)
+            """
+        )
+    except Exception:
+        pass
+    return changed
 
 
 def _add_player_hubs_table() -> None:
@@ -1784,6 +1882,14 @@ def ensure_schema_migrations():
         pass
     try:
         _add_player_hubs_table()
+    except Exception:
+        pass
+    try:
+        _add_airport_slot_level()
+    except Exception:
+        pass
+    try:
+        _refresh_airport_reference_data()
     except Exception:
         pass
     try:

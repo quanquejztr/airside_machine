@@ -405,8 +405,9 @@ def _ensure_ai_hub_airports() -> None:
             """
             INSERT OR IGNORE INTO airports (
                 iata, icao, name, city, country, lat, lon,
-                runway_length_ft, gate_count, timezone, score, category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                runway_length_ft, gate_count, timezone, score, category,
+                slot_level, runway_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ap,
@@ -421,6 +422,10 @@ def _ensure_ai_hub_airports() -> None:
                 str(meta.get("timezone") or "UTC"),
                 int(meta.get("score") or 500000),
                 str(meta.get("category") or "large_airport"),
+                # Default to uncoordinated: a placeholder row should not invent gate
+                # auctions or runway slots at an airport nobody classified.
+                int(meta.get("slot_level") or 1),
+                int(meta.get("runway_count") or 0),
             ),
         )
 
@@ -947,7 +952,10 @@ def ai_generate_candidates(competitor_id: str) -> List[str]:
     spec = _spec_for(cid)
 
     # Filter airports by radius and strategy gates.
-    arows = db.fetch_all("SELECT iata, lat, lon, score, category, country FROM airports")
+    arows = db.fetch_all(
+        "SELECT iata, lat, lon, score, category, country,"
+        " COALESCE(slot_level, 0) AS slot_level FROM airports"
+    )
     scored_allowed: List[tuple[float, str]] = []
     allowed: List[str] = []
     for a in arows:
@@ -1017,11 +1025,25 @@ def ai_generate_candidates(competitor_id: str) -> List[str]:
     auc_cut = float(gate_score_threshold())
 
     def _needs_foreign_gate(pair_id: str) -> bool:
+        """Whether flying this pair means winning a stand somewhere new.
+
+        Reads `slot_level`, not `score`: whether gates are auctioned is a capacity
+        question and score answers a size one. Using the score cutoff here made the AI
+        plan around the wrong airports — Ulaanbaatar scores 1.8M but is uncoordinated
+        and has free gates, while plenty of genuinely auctioned airports score below the
+        cutoff. Falls back to the score rule only for a save with no levels yet.
+        """
         oa, ob = _route_pair_components(pair_id)
         for ap in (oa, ob):
             if ap == hub:
                 continue
-            if float((by_iata.get(ap) or {}).get("score") or 0) >= auc_cut:
+            meta = by_iata.get(ap) or {}
+            level = int(meta.get("slot_level") or 0)
+            if level > 0:
+                if level >= 2:
+                    return True
+                continue
+            if float(meta.get("score") or 0) >= auc_cut:
                 return True
         return False
 

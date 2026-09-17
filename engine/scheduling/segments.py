@@ -537,6 +537,35 @@ def _plan_detailed_chained_chain(tail_number, target_game_week, chain: dict):
     return planned, turn_by_route
 
 
+def _notify_spawn_skipped(tail: str, game_week: int, why: str) -> None:
+    """Surface a refused spawn to the player. Silence here is how a missing week goes unnoticed."""
+    try:
+        db.execute(
+            """
+            INSERT INTO player_notifications (notification_id, game_week, type, route_pair_id, body, read)
+            VALUES (?, ?, 'GATE_CAPACITY', NULL, ?, 0)
+            """,
+            (str(uuid.uuid4()), int(game_week), f"Schedule spawn skipped for {tail}: {why}"),
+        )
+    except Exception:
+        pass
+
+
+def _chained_leg_already_present(tail_number, target_game_week, planned_leg) -> bool:
+    """True when this exact leg was already spawned, which keeps the weekly spawn idempotent."""
+    leg_week = int(planned_leg.get("game_week") or target_game_week)
+    row = db.fetch_one(
+        """
+        SELECT 1 FROM flight_segments
+        WHERE tail_number = ? AND game_week = ? AND route_id = ?
+        AND ABS(scheduled_dep_game_hour - ?) < 0.001
+        AND status != 'CANCELLED'
+        """,
+        (tail_number, leg_week, planned_leg["route_id"], planned_leg["dep_abs"]),
+    )
+    return bool(row)
+
+
 def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict, *, skip_gate_assert: bool = False):
     """Insert segments for one chained block (used by weekly spawn)."""
     from engine.scheduling.shared import _assert_incremental_spawn_airport_limits, get_financial_constant
@@ -557,22 +586,32 @@ def _spawn_one_detailed_chained_chain(tail_number, target_game_week, chain: dict
         gate_segs = _gate_segments_from_planned(tail_number, planned, turn_by_route, default_turn)
         _assert_incremental_spawn_airport_limits(int(target_game_week), gate_segs)
 
-    for p in planned:
+    # Legs already on the board are not re-inserted, and must not be checked against
+    # themselves either, or an idempotent second spawn would report a false conflict.
+    fresh = [p for p in planned if not _chained_leg_already_present(tail_number, target_game_week, p)]
+    if not fresh:
+        return 0, tails_touched
+
+    # The weekly respawn used to check gates and slots but never whether the tail was
+    # physically free, so two chains on one aircraft could be double-booked and flown.
+    # Enforce the same overlap/turnaround rule the interactive planner uses. The floor is
+    # the smallest turn this chain already commits to, so a chain can never be rejected for
+    # turns the player has already accepted -- only for colliding with something else.
+    from engine.scheduling.rotation import assert_tail_schedule_accepts_new_intervals
+
+    chain_turns = [float(v) for v in turn_by_route.values() if v is not None]
+    mtt_floor_minutes = min([float(default_turn)] + chain_turns)
+    assert_tail_schedule_accepts_new_intervals(
+        tail_number,
+        int(target_game_week),
+        [(float(p["dep_abs"]), float(p["arr_abs"])) for p in fresh],
+        mtt_floor_minutes / 60.0,
+    )
+
+    for p in fresh:
         # A chain anchored late in the week finishes in the next one; tag each leg with
         # the week its own departure falls in, not the week the chain was spawned for.
         leg_week = int(p.get("game_week") or target_game_week)
-        dup = db.fetch_one(
-            """
-            SELECT 1 FROM flight_segments
-            WHERE tail_number = ? AND game_week = ? AND route_id = ?
-            AND ABS(scheduled_dep_game_hour - ?) < 0.001
-            AND status != 'CANCELLED'
-            """,
-            (tail_number, leg_week, p["route_id"], p["dep_abs"]),
-        )
-        if dup:
-            continue
-
         leg_turn = turn_by_route.get(str(p["route_id"]), default_turn)
 
         dep_time_str = hhmm_from_absolute_game_hour(p["dep_abs"])
@@ -646,9 +685,14 @@ def _spawn_detailed_chained_template_week(tail_number, target_game_week, raw_blo
     inserted = 0
     tails_touched = set()
     for chain in chains:
-        n, ts = _spawn_one_detailed_chained_chain(
-            tail_number, target_game_week, chain, skip_gate_assert=True
-        )
+        try:
+            n, ts = _spawn_one_detailed_chained_chain(
+                tail_number, target_game_week, chain, skip_gate_assert=True
+            )
+        except ValueError as e:
+            # One unflyable chain must not cost the tail its other, valid chains.
+            _notify_spawn_skipped(tail_number, target_game_week, str(e))
+            continue
         inserted += n
         tails_touched |= ts
 
@@ -683,18 +727,6 @@ def spawn_rotation_segments_for_week(target_game_week: int) -> dict:
     inserted_total = 0
     all_tails = set()
 
-    def _notify_spawn_skipped(tail: str, why: str) -> None:
-        try:
-            db.execute(
-                """
-                INSERT INTO player_notifications (notification_id, game_week, type, route_pair_id, body, read)
-                VALUES (?, ?, 'GATE_CAPACITY', NULL, ?, 0)
-                """,
-                (str(uuid.uuid4()), int(target_game_week), f"Schedule spawn skipped for {tail}: {why}"),
-            )
-        except Exception:
-            pass
-
     for row in rows:
         tail_number = row["tail_number"]
         try:
@@ -719,7 +751,7 @@ def spawn_rotation_segments_for_week(target_game_week: int) -> dict:
             else:
                 continue
         except Exception as e:
-            _notify_spawn_skipped(tail_number, str(e))
+            _notify_spawn_skipped(tail_number, target_game_week, str(e))
             continue
 
         inserted_total += n

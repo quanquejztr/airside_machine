@@ -1012,3 +1012,15 @@ table.sched-grid .overlap { color: #9a6208; }
 @media (prefers-reduced-motion: reduce) {
   .stand-alert { animation: none; }
 }
+
+/* Route list filter — the list runs to a hundred-plus rows, so scrolling to find one
+   pair was the slowest part of the window. */
+.rt-list-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+.rt-list-head label { font-weight: 600; white-space: nowrap; }
+.rt-list-head input[type="search"] { flex: 1 1 auto; min-width: 0; }
+.rt-list-head .muted { white-space: nowrap; font-size: 12px; }

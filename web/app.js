@@ -1169,6 +1169,11 @@ function openRoutes() {
       <button type="button" id="rt-open">Open route</button>
       <div id="rt-prev" class="muted"></div>
     </div>
+    <div class="rt-list-head">
+      <label for="rt-filter">Your routes</label>
+      <input id="rt-filter" type="search" placeholder="Filter by airport or pair — LHR, BOS-LHR" autocomplete="off" />
+      <span id="rt-count" class="muted"></span>
+    </div>
     <div id="rt-list"></div>`);
 
   const originInput = $("#rt-o", el);
@@ -1292,15 +1297,52 @@ function openRoutes() {
   originInput.addEventListener("input", scheduleSuggestions);
   originInput.addEventListener("change", () => { loadSuggestions().catch(() => {}); });
 
-  const showList = async () => {
-    const list = await api("/api/routes");
-    $("#rt-list", el).innerHTML = `<p class="muted">Your routes</p><table class="grid"><tbody>${
-      (list.routes || []).map((r) => `<tr><td>${escapeHtml(r.route_id)}</td><td>${Number(r.distance_nm || 0).toFixed(0)} nm</td><td><button type="button" data-route="${escapeHtml(r.route_id)}">Detail</button></td></tr>`).join("")
-    }</tbody></table>`;
+  // Cached so typing filters instantly instead of refetching on every keystroke.
+  let allRoutes = [];
+
+  const paintList = () => {
+    const q = String(($("#rt-filter", el) || {}).value || "").trim().toUpperCase();
+    // "BOS-LHR" matches that pair either way round; a bare code matches either end.
+    const parts = q.split(/[\s-]+/).filter(Boolean);
+    const shown = !parts.length ? allRoutes : allRoutes.filter((r) => {
+      const id = String(r.route_id || "").toUpperCase();
+      return parts.every((p) => id.includes(p));
+    });
+    const rows = shown.map((r) =>
+      `<tr><td>${escapeHtml(r.route_id)}</td><td>${Number(r.distance_nm || 0).toFixed(0)} nm</td>` +
+      `<td><button type="button" data-route="${escapeHtml(r.route_id)}">Detail</button></td></tr>`
+    ).join("");
+    $("#rt-list", el).innerHTML = shown.length
+      ? `<table class="grid"><tbody>${rows}</tbody></table>`
+      : `<p class="muted">No route matches “${escapeHtml(q)}”.</p>`;
+    const count = $("#rt-count", el);
+    if (count) {
+      count.textContent = parts.length
+        ? `${shown.length} of ${allRoutes.length}`
+        : `${allRoutes.length} route${allRoutes.length === 1 ? "" : "s"}`;
+    }
     el.querySelectorAll("[data-route]").forEach((btn) => {
       btn.onclick = () => openRouteDetail(btn.dataset.route);
     });
   };
+
+  const showList = async () => {
+    const list = await api("/api/routes");
+    allRoutes = list.routes || [];
+    paintList();
+  };
+
+  const filterInput = $("#rt-filter", el);
+  if (filterInput) {
+    filterInput.oninput = paintList;
+    // Enter on a single match opens it, so filtering to one route is a two-key action.
+    filterInput.onkeydown = (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const only = el.querySelectorAll("[data-route]");
+      if (only.length === 1) openRouteDetail(only[0].dataset.route);
+    };
+  }
   $("#rt-preview", el).onclick = () => { previewRoute().catch(() => {}); };
   $("#rt-open", el).onclick = async () => {
     try {
@@ -1770,6 +1812,11 @@ function openRouteDetail(preselect) {
   if (existing) existing.remove();
   const el = openWindow("routedetail", "Route detail", `
     <p class="muted" id="rd-week">Loading your routes…</p>
+    <div class="rt-list-head">
+      <label for="rd-filter">Find</label>
+      <input id="rd-filter" type="search" placeholder="Airport, city or pair — LHR, London, BOS-LHR" autocomplete="off" />
+      <span id="rd-count" class="muted"></span>
+    </div>
     <div id="rd-table"></div>
     <div id="rd-panel" class="rd-panel" hidden></div>
   `, { width: 820 });
@@ -1915,11 +1962,51 @@ function openRouteDetail(preselect) {
     });
   };
 
+  // This table carries city names as well as codes, so the filter can match either —
+  // "London" works here where the Open-route list only knows IATA codes.
+  const matchRoutes = (q) => {
+    const parts = String(q || "").trim().toUpperCase().split(/[\s-]+/).filter(Boolean);
+    if (!parts.length) return overview;
+    return overview.filter((r) => {
+      const hay = [
+        r.route_id, r.origin_iata, r.dest_iata, r.origin_city, r.dest_city,
+      ].map((x) => String(x || "").toUpperCase()).join(" ");
+      return parts.every((p) => hay.includes(p));
+    });
+  };
+
+  const applyFilter = () => {
+    const input = $("#rd-filter", el);
+    const q = input ? input.value : "";
+    const shown = matchRoutes(q);
+    const count = $("#rd-count", el);
+    if (count) {
+      count.textContent = String(q || "").trim()
+        ? `${shown.length} of ${overview.length}`
+        : `${overview.length} route${overview.length === 1 ? "" : "s"}`;
+    }
+    if (!shown.length && overview.length) {
+      $("#rd-table", el).innerHTML = `<p class="muted">No route matches “${escapeHtml(q)}”.</p>`;
+      return;
+    }
+    renderTable(shown);
+  };
+
   const loadTable = async () => {
     const data = await api("/api/routes/overview");
     overview = data.routes || [];
     $("#rd-week", el).textContent = `Week ${data.week || "—"} · ${overview.length} opened route${overview.length === 1 ? "" : "s"}`;
-    renderTable(overview);
+    applyFilter();
+    const input = $("#rd-filter", el);
+    if (input) {
+      input.oninput = applyFilter;
+      input.onkeydown = (e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        const only = el.querySelectorAll("[data-fares]");
+        if (only.length === 1) showFares(only[0].dataset.fares);
+      };
+    }
     if (preselect && overview.some((r) => r.route_id === preselect)) {
       await showFares(preselect);
     }

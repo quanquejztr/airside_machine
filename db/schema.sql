@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS airports (
     gate_count INTEGER NOT NULL,
     timezone TEXT NOT NULL,
     score INTEGER NOT NULL DEFAULT 0,
+    -- IATA slot coordination level: 3 = coordinated (gates + runway slots),
+    -- 2 = schedules facilitated (gates only), 1 = free. Replaces the old
+    -- "score >= threshold" rule, which conflated airport size with capacity scarcity.
+    slot_level INTEGER NOT NULL DEFAULT 1,
+    runway_count INTEGER NOT NULL DEFAULT 0,
     category TEXT NOT NULL,
     landing_fee_override REAL,
     gate_fee_override REAL,
@@ -195,7 +200,7 @@ CREATE TABLE IF NOT EXISTS player_routes (
 CREATE INDEX IF NOT EXISTS idx_player_routes_opened_week ON player_routes(opened_week);
 
 -- Phase 11 (revised): airport gate-use auctions (realistic scarcity at major hubs)
--- Airports with score >= 900000 are "auctioned airports".
+-- Airports with slot_level >= 2 are "auctioned airports" (gates sold at auction).
 -- Gate units represent how many gate-uses (flight endpoints) you may operate per week at that airport.
 
 CREATE TABLE IF NOT EXISTS airport_gate_allocations (

@@ -157,8 +157,9 @@ def _ensure_airport_row(iata: str) -> None:
         """
         INSERT OR IGNORE INTO airports (
             iata, icao, name, city, country, lat, lon,
-            runway_length_ft, gate_count, timezone, score, category
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            runway_length_ft, gate_count, timezone, score, category,
+            slot_level, runway_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ap,
@@ -173,13 +174,47 @@ def _ensure_airport_row(iata: str) -> None:
             meta["timezone"],
             int(meta["score"]),
             meta["category"],
+            # This path only fires for a save whose airport table predates the rebuild;
+            # these two are coordinated airports, so level 3 is correct for them.
+            int(meta.get("slot_level") or 3),
+            int(meta.get("runway_count") or 0),
         ),
     )
 
 
+MOVEMENTS_PER_RUNWAY_HOUR = 45
+
+
+def _slot_airports_from_levels() -> dict:
+    """IATA -> declared hourly cap for every level-3 airport in the airports table.
+
+    The list used to be a hardcoded dict of 14 codes with a flat cap of 26. It now comes
+    from `slot_level`, which is populated from the IATA coordination levels, and the cap
+    scales with runway count: a single-runway airport is genuinely constrained while a
+    six-runway one is not, which is the whole point of coordinating some airports and not
+    others.
+    """
+    try:
+        rows = db.fetch_all(
+            "SELECT iata, COALESCE(runway_count, 0) AS rwy FROM airports"
+            " WHERE COALESCE(slot_level, 0) >= 3"
+        )
+    except Exception:
+        rows = []
+    out = {}
+    for r in rows or []:
+        runways = max(1, int(r["rwy"] or 1))
+        out[str(r["iata"]).upper()] = runways * MOVEMENTS_PER_RUNWAY_HOUR
+    return out
+
+
 def seed_slot_controlled_airports() -> None:
     _ensure_slot_tables()
-    for iata, cap in STAGE1_SLOT_AIRPORTS.items():
+    derived = _slot_airports_from_levels()
+    # Before the airport table is reseeded there are no levels, so keep the original
+    # hardcoded set rather than silently controlling nothing.
+    source = derived or STAGE1_SLOT_AIRPORTS
+    for iata, cap in source.items():
         _ensure_airport_row(iata)
         if not db.fetch_one("SELECT 1 FROM airports WHERE iata = ?", (iata,)):
             continue
@@ -797,8 +832,30 @@ def slot_price_step() -> float:
     return float(_const_num("slot_price_step", 1000.0))
 
 
-def slot_auction_units() -> int:
-    return max(1, int(_const_num("slot_auction_units", 30.0)))
+def slot_auction_units(iata: str | None = None) -> int:
+    """Movement units offered in one weekly slot auction.
+
+    Sized to the airport rather than a single flat number. A weekly quota is measured in
+    movements, and the airport's own hourly cap already says how many it can physically
+    take: offering the same 30 everywhere made a six-runway airport as slot-starved as a
+    single-runway one, and 30 movements is only fifteen round trips a week, far too few
+    to build a network on.
+
+    Supply is a fraction of the declared weekly capacity (hourly cap x 168), floored at
+    `slot_auction_units_min` so even the tightest airport has a usable pool to bid for.
+    """
+    floor = max(1, int(_const_num("slot_auction_units_min", 100.0)))
+    if not iata:
+        return max(floor, int(_const_num("slot_auction_units", 30.0)))
+    row = db.fetch_one(
+        "SELECT COALESCE(runway_count, 0) AS r FROM airports WHERE iata = ?",
+        (str(iata).upper().strip(),),
+    )
+    runways = max(1, int((row["r"] if row else 1) or 1))
+    # One pool per runway. Sizing this off total weekly capacity instead (hourly cap x
+    # 168) produced 756-4,536 units per airport per week, which compounds as holdings
+    # carry forward and makes slots free within a couple of seasons.
+    return max(floor, runways * floor)
 
 
 # How far back to look for a previous allocation when materialising a missing week.
@@ -1076,10 +1133,10 @@ def ensure_weekly_slot_auctions(opens_week: int) -> int:
     ow = int(opens_week)
     seed_slot_controlled_airports()
     n = 0
-    units = slot_auction_units()
     floor = slot_min_price_per_unit()
     for r in db.fetch_all("SELECT iata FROM slot_controlled_airports ORDER BY iata"):
         iata = str(r["iata"])
+        units = slot_auction_units(iata)
         exists = db.fetch_one(
             """
             SELECT auction_id, units_available FROM slot_auctions

@@ -1368,18 +1368,28 @@ class TestPlayerHubStarters(unittest.TestCase):
             self.assertIsNone(slots)
 
     def test_slot_hourly_caps_raise_on_existing_rows(self):
+        """A stale low cap must be raised back to the derived value on re-seed.
+
+        The expected cap is no longer a hardcoded 26: it is runway count x 45, so LHR's
+        two runways give 90. Asserting against the derivation rather than a constant keeps
+        this test about the raise-on-reseed behaviour it is named for.
+        """
         from helpers import fresh_game
-        from engine.slots import STAGE1_SLOT_AIRPORTS, declared_hourly_cap, seed_slot_controlled_airports
+        from engine.slots import (MOVEMENTS_PER_RUNWAY_HOUR, declared_hourly_cap,
+                                  seed_slot_controlled_airports)
 
         with fresh_game(hub="ATL", name="Cap Test", callsign="CAP"):
             from db import db
 
+            row = db.fetch_one("SELECT COALESCE(runway_count, 0) AS r FROM airports WHERE iata = 'LHR'")
+            expected = max(1, int(row["r"] if row else 1)) * MOVEMENTS_PER_RUNWAY_HOUR
             db.execute(
                 "UPDATE slot_controlled_airports SET declared_hourly_cap = 3 WHERE iata = 'LHR'"
             )
             self.assertEqual(declared_hourly_cap("LHR"), 3)
             seed_slot_controlled_airports()
-            self.assertEqual(declared_hourly_cap("LHR"), int(STAGE1_SLOT_AIRPORTS["LHR"]))
+            self.assertEqual(declared_hourly_cap("LHR"), expected)
+            self.assertGreater(expected, 3, "the point is that a stale low cap is raised")
 
 
 # ---------------------------------------------------------------------------
@@ -4871,3 +4881,48 @@ class TestRoutePairOpening(unittest.TestCase):
             self.assertEqual(0.0, float(p["total_new_cost"]))
             pairs = {(x["origin"], x["dest"]) for x in p["opens"]}
             self.assertEqual({("SEA", "LAX")}, pairs, "only the missing leg is added, free")
+
+
+class TestSlotAuctionSupply(unittest.TestCase):
+    """Auction supply is sized to the airport, with a floor (DATA-02 follow-up).
+
+    A flat 30 units offered a six-runway airport exactly what a single-runway one got,
+    and 30 movements a week is only fifteen round trips — too few to build a network on.
+    """
+
+    def test_supply_scales_with_runways_and_respects_the_floor(self):
+        from engine.slots import slot_auction_units
+
+        with fresh_game() as g:
+            floor = int(g.db.get_financial_constant("slot_auction_units_min") or 100)
+            for iata in ("LHR", "AMS", "AKL"):
+                row = g.db.fetch_one(
+                    "SELECT COALESCE(runway_count, 0) AS r FROM airports WHERE iata = ?", (iata,))
+                if not row:
+                    continue
+                runways = max(1, int(row["r"] or 1))
+                self.assertEqual(max(floor, runways * floor), slot_auction_units(iata))
+                self.assertGreaterEqual(slot_auction_units(iata), floor)
+
+    def test_a_single_runway_airport_still_gets_the_minimum(self):
+        from engine.slots import slot_auction_units
+
+        with fresh_game() as g:
+            g.db.execute("UPDATE airports SET runway_count = 1 WHERE iata = 'LHR'")
+            floor = int(g.db.get_financial_constant("slot_auction_units_min") or 100)
+            self.assertEqual(floor, slot_auction_units("LHR"))
+
+    def test_weekly_auctions_use_the_per_airport_supply(self):
+        """The auction row must carry the airport's own figure, not one global number."""
+        from engine.slots import ensure_weekly_slot_auctions, slot_auction_units
+
+        with fresh_game() as g:
+            ensure_weekly_slot_auctions(2)
+            rows = g.db.fetch_all(
+                "SELECT airport_iata, units_available FROM slot_auctions WHERE opens_week = 2")
+            self.assertTrue(rows, "auctions should exist for slot-controlled airports")
+            for r in rows:
+                self.assertEqual(slot_auction_units(str(r["airport_iata"])),
+                                 int(r["units_available"]))
+            self.assertGreater(len({int(r["units_available"]) for r in rows}), 1,
+                               "different airports must not all offer the same supply")
