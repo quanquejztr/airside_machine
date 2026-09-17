@@ -418,6 +418,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/books":
             self._send_json(api.books_status())
             return
+        if path == "/api/hubs":
+            self._send_json(api.hubs_status())
+            return
+        if path == "/api/hubs/preview":
+            self._send_json(api.hub_open_preview(q.get("iata", "")))
+            return
         if path == "/api/gates/sale-quote":
             self._send_json(api.gate_sale_quote_api(q.get("iata", ""), q.get("units", "1")))
             return
@@ -456,6 +462,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/clock":
             ensure_runtime_clock()
             self._send_json(api.set_clock(body))
+            return
+        if path == "/api/hubs/open":
+            self._send_json(api.open_new_hub(body))
             return
         if path == "/api/gates/sell":
             self._send_json(api.sell_gate(body))

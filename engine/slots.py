@@ -720,7 +720,15 @@ def enforce_slot_utilization(settled_game_week: int) -> None:
             lose = int(math.ceil(shortfall * float(held)))
             lose = max(1, min(2, lose))
             # (4) never strip the last unit at the holder's own hub.
-            floor = 1 if _holder_home_hub(holder) == iata else 0
+            is_hub = _holder_home_hub(holder) == iata
+            if not is_hub and holder == "PLAYER":
+                try:
+                    from engine.hubs import is_player_hub
+
+                    is_hub = is_player_hub(iata)
+                except Exception:
+                    is_hub = False
+            floor = 1 if is_hub else 0
             new_held = max(floor, held - lose)
             if new_held != held:
                 below = 0

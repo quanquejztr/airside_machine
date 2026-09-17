@@ -681,6 +681,37 @@ def _repair_us_airport_timezones() -> None:
     )
 
 
+def _add_player_hubs_table() -> None:
+    """Hubs the player operates. The first one is also `airline.home_hub_iata`.
+
+    That column stays as the primary hub rather than being replaced, because a hundred
+    call sites read it and most of them genuinely want "the main base" — map centring,
+    news copy, the CLI panels. This table is what the rules consult when the question is
+    "is this airport one of mine".
+    """
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_hubs (
+            iata TEXT PRIMARY KEY,
+            opened_game_week INTEGER NOT NULL DEFAULT 1,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (iata) REFERENCES airports(iata)
+        )
+        """
+    )
+    row = fetch_one("SELECT home_hub_iata FROM airline WHERE id = 1")
+    if not row or not row["home_hub_iata"]:
+        return
+    hub = str(row["home_hub_iata"]).upper().strip()
+    execute(
+        "INSERT OR IGNORE INTO player_hubs (iata, opened_game_week, is_primary)"
+        " VALUES (?, 1, 1)",
+        (hub,),
+    )
+    # Whatever else exists, the airline's own column is the primary.
+    execute("UPDATE player_hubs SET is_primary = CASE WHEN iata = ? THEN 1 ELSE 0 END", (hub,))
+
+
 def _merge_duplicate_gate_allocations() -> None:
     """Collapse duplicate ACTIVE gate rows per (airport, holder), then forbid new ones.
 
@@ -1749,6 +1780,10 @@ def ensure_schema_migrations():
         pass
     try:
         _merge_duplicate_gate_allocations()
+    except Exception:
+        pass
+    try:
+        _add_player_hubs_table()
     except Exception:
         pass
     try:

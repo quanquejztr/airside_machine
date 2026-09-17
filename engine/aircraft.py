@@ -145,7 +145,7 @@ def get_fleet_aircraft(tail_number):
     return dict(aircraft) if aircraft else None
 
 
-def buy_aircraft(type_id, tail_number=None, cabin_seats=None):
+def buy_aircraft(type_id, tail_number=None, cabin_seats=None, delivery_iata=None):
     """
     Purchase an aircraft outright.
     
@@ -202,7 +202,7 @@ def buy_aircraft(type_id, tail_number=None, cabin_seats=None):
     """, (
         tail_number,
         type_id,
-        airline['home_hub_iata'],
+        _delivery_airport(airline, delivery_iata),
         _current_game_week(),
         float(purchase_price),
     ))
@@ -219,7 +219,7 @@ def buy_aircraft(type_id, tail_number=None, cabin_seats=None):
         'type_id': type_id,
         'ownership': 'OWNED',
         'status': 'IDLE',
-        'current_airport_iata': airline['home_hub_iata'],
+        'current_airport_iata': _delivery_airport(airline, delivery_iata),
         'purchase_price': purchase_price,
         'new_cash_balance': new_cash
     }
@@ -232,7 +232,7 @@ def buy_aircraft(type_id, tail_number=None, cabin_seats=None):
     return fleet_aircraft
 
 
-def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None):
+def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None, delivery_iata=None):
     """
     Lease an aircraft for a specified number of weeks.
     
@@ -297,7 +297,7 @@ def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None):
     """, (
         tail_number,
         type_id,
-        airline['home_hub_iata'],
+        _delivery_airport(airline, delivery_iata),
         weekly_cost,
         weeks,
         _current_game_week(),
@@ -317,7 +317,7 @@ def lease_aircraft(type_id, weeks, tail_number=None, cabin_seats=None):
         'type_id': type_id,
         'ownership': 'LEASED',
         'status': 'IDLE',
-        'current_airport_iata': airline['home_hub_iata'],
+        'current_airport_iata': _delivery_airport(airline, delivery_iata),
         'weekly_lease_cost': weekly_cost,
         'lease_weeks_remaining': weeks,
         'total_lease_cost': weekly_cost * weeks,
@@ -427,6 +427,43 @@ def _tail_has_active_flights(tail_number: str) -> int:
     return int(row["c"] or 0) if row else 0
 
 
+def _delivery_airport(airline, delivery_iata=None) -> str:
+    """Where a newly acquired aircraft appears.
+
+    Defaults to the primary hub, which is what a single-hub airline always got. With more
+    than one hub the player may name any of them, so a base can be built up without
+    ferrying every delivery across the network first.
+    """
+    primary = str((airline or {}).get("home_hub_iata") or "").upper()
+    want = str(delivery_iata or "").upper().strip()
+    if not want:
+        return primary
+    hubs = set(_hub_codes())
+    if want not in hubs:
+        raise ValueError(
+            f"{want} is not one of your hubs ({', '.join(sorted(hubs)) or primary}). "
+            "Aircraft are delivered to a hub."
+        )
+    return want
+
+
+def _hub_codes() -> list:
+    try:
+        from engine.hubs import hub_codes
+
+        return list(hub_codes())
+    except Exception:
+        al = get_airline() or {}
+        h = str(al.get("home_hub_iata") or "").upper()
+        return [h] if h else []
+
+
+def _at_any_hub(iata: str) -> bool:
+    """Any hub will do for fleet work — a secondary base is a base."""
+    code = str(iata or "").upper().strip()
+    return bool(code) and code in set(_hub_codes())
+
+
 def disposal_blockers(tail_number: str) -> list:
     """Why this aircraft cannot be disposed of right now (empty list = ready)."""
     tail_number = str(tail_number or "").strip().upper()
@@ -441,9 +478,11 @@ def disposal_blockers(tail_number: str) -> list:
         blockers.append(
             f"{tail_number} is AOG ({ac.get('aog_reason') or 'grounded'}). Repair it first."
         )
-    if str(ac.get("current_airport_iata") or "").upper() != hub:
+    where = str(ac.get("current_airport_iata") or "").upper()
+    if not _at_any_hub(where):
+        hubs = _hub_codes() or [hub]
         blockers.append(
-            f"{tail_number} is at {ac.get('current_airport_iata')}, not the hub {hub}."
+            f"{tail_number} is at {where or '?'}, not a hub ({', '.join(hubs)})."
         )
     n = _tail_has_active_flights(tail_number)
     if n:
@@ -500,12 +539,15 @@ def request_disposal(tail_number: str) -> dict:
     # Re-read the location: clearing the plan changes where the flight history says the
     # aircraft ends up, and the value captured before the clear is stale.
     where = reconcile_tail_location(tail_number) or str(ac.get("current_airport_iata") or "").upper()
-    if where != hub:
+    if not _at_any_hub(where):
+        # Position to the primary hub. Any hub would satisfy the sale, but picking one
+        # deterministically keeps the ferry predictable; the player can reposition first
+        # if they would rather hand the aircraft back somewhere else.
         try:
             ferry = schedule_ferry_to_hub(tail_number, hub)
         except Exception as e:
             raise ValueError(
-                f"{tail_number} is at {ac.get('current_airport_iata')} and could not be "
+                f"{tail_number} is at {where or '?'} and could not be "
                 f"positioned to {hub}: {e}"
             )
 

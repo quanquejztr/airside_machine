@@ -1122,10 +1122,18 @@ def reset_weekly_gate_counters_and_enforce(settled_game_week: int) -> None:
                     (holder,),
                 )
                 hub_iata = str(row_h["home_hub_iata"]).upper() if row_h and row_h["home_hub_iata"] else None
-            if hub_iata and airport_iata == hub_iata:
-                thr = float(thr_hub)
-            else:
-                thr = float(thr_nonhub)
+            is_hub_here = bool(hub_iata and airport_iata == hub_iata)
+            if holder == "PLAYER" and not is_hub_here:
+                # Secondary hubs count too, but only once they carry real traffic: a hub
+                # opened with two free stands and no routes would fail the 6% rule inside
+                # the grace period and lose the grant before it could be used.
+                try:
+                    from engine.hubs import hub_is_mature
+
+                    is_hub_here = hub_is_mature(airport_iata)
+                except Exception:
+                    is_hub_here = False
+            thr = float(thr_hub) if is_hub_here else float(thr_nonhub)
             if thr <= 0:
                 thr = float(thr_legacy)
 
@@ -1661,6 +1669,16 @@ def gate_sale_haircut() -> float:
     return _fc("gate_sale_haircut", 0.85)
 
 
+def _is_any_player_hub(iata: str) -> bool:
+    """True for the primary hub and every secondary one."""
+    try:
+        from engine.hubs import is_player_hub
+
+        return bool(is_player_hub(iata))
+    except Exception:
+        return str(iata).upper().strip() == _player_home_hub()
+
+
 def _player_home_hub() -> str:
     row = db.fetch_one("SELECT home_hub_iata FROM airline WHERE id = 1")
     return str(row["home_hub_iata"]).upper().strip() if row and row["home_hub_iata"] else ""
@@ -1725,9 +1743,8 @@ def gate_sale_blockers(iata: str, units: int = 1) -> List[str]:
         )
 
     if remaining <= 0:
-        hub = _player_home_hub()
-        if ap == hub:
-            out.append(f"{ap} is your home hub — you cannot sell your last stand there.")
+        if _is_any_player_hub(ap):
+            out.append(f"{ap} is one of your hubs — you cannot sell your last stand there.")
         busy = [w for w in _weeks_with_player_segments_at(ap)
                 if player_gate_peak_at_airport(ap, w) > 0]
         if busy:

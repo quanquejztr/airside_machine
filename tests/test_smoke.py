@@ -4232,7 +4232,8 @@ class TestGateSale(unittest.TestCase):
         with fresh_game() as g:
             self.AP = g.hub
             self._hold(g.db, 1)
-            self.assertTrue(any("home hub" in b for b in gate_sale_blockers(g.hub, 1)))
+            # Wording covers secondary hubs too since FEATURE-08.
+            self.assertTrue(any("hub" in b.lower() for b in gate_sale_blockers(g.hub, 1)))
 
     def test_not_yet_effective_stands_cannot_be_sold(self):
         from engine.gates import gate_sale_blockers
@@ -4692,3 +4693,181 @@ class TestShortfallClosesWhenFixed(unittest.TestCase):
         self.assertTrue(hasattr(H, "_on_day_roll"), "web server needs a daily handler")
         src = inspect.getsource(H._start_runtime_clock)
         self.assertIn("on_day=", src, "the daily hook must be passed to start_game_clock")
+
+
+class TestMultiHub(unittest.TestCase):
+    """Opening a second hub, earned by building the first (FEATURE-08)."""
+
+    def _routes_at(self, g, iata, n):
+        """Open n routes touching `iata` so it meets the hub requirement."""
+        pool = ["ORD", "DFW", "DEN", "SEA", "MIA", "PHX", "MSP", "DTW", "CLT", "SAN",
+                "LAS", "TPA", "MCO", "SLC", "PDX"]
+        made = 0
+        for dest in pool:
+            if made >= n or dest == iata:
+                continue
+            try:
+                g.open_route(iata, dest)
+                made += 1
+            except Exception:
+                continue
+        return made
+
+    def test_primary_hub_is_backfilled(self):
+        from engine.hubs import hub_codes, is_player_hub, primary_hub
+
+        with fresh_game() as g:
+            self.assertEqual([g.hub], hub_codes())
+            self.assertTrue(is_player_hub(g.hub))
+            self.assertEqual(g.hub, primary_hub())
+
+    def test_opening_is_blocked_until_the_first_hub_is_built(self):
+        from engine.hubs import hub_open_blockers, open_hub
+
+        with fresh_game() as g:
+            blockers = hub_open_blockers("ORD")
+            self.assertTrue(blockers, "a brand-new airline must not open a second hub")
+            self.assertIn("route", blockers[0].lower())
+            with self.assertRaises(ValueError):
+                open_hub("ORD")
+
+    def test_opening_grants_the_same_starter_capacity(self):
+        from engine.gates import _allocated_gates, is_auctioned_airport
+        from engine.hubs import hub_codes, open_hub
+        from engine.setup import PLAYER_STARTER_HUB_GATES
+
+        with fresh_game() as g:
+            self._routes_at(g, g.hub, 10)
+            before = _allocated_gates("ORD", "PLAYER")
+            out = open_hub("ORD")
+            self.assertIn("ORD", hub_codes())
+            if is_auctioned_airport("ORD"):
+                self.assertEqual(PLAYER_STARTER_HUB_GATES, out["granted"]["gates"])
+                self.assertEqual(before + PLAYER_STARTER_HUB_GATES,
+                                 _allocated_gates("ORD", "PLAYER"))
+
+    def test_every_hub_must_be_built_before_the_next(self):
+        """Not just the most recent — an older hub cannot be left to wither."""
+        from engine.hubs import hub_open_blockers, open_hub
+
+        with fresh_game() as g:
+            self._routes_at(g, g.hub, 10)
+            open_hub("ORD")
+            blockers = hub_open_blockers("DFW")
+            self.assertTrue(blockers, "ORD has too few routes to allow a third hub")
+            self.assertIn("ORD", blockers[0])
+
+    def test_a_young_hub_is_judged_at_the_non_hub_threshold(self):
+        """Otherwise the free stands are clawed back before the hub can be built."""
+        from engine.hubs import hub_is_mature, open_hub
+
+        with fresh_game() as g:
+            self._routes_at(g, g.hub, 10)
+            open_hub("ORD")
+            self.assertFalse(hub_is_mature("ORD"), "a new hub has no routes yet")
+            self._routes_at(g, "ORD", 10)
+            self.assertTrue(hub_is_mature("ORD"), "it matures once the routes exist")
+
+    def test_last_stand_protection_covers_secondary_hubs(self):
+        from engine.gates import _allocated_gates, gate_sale_blockers
+        from engine.hubs import open_hub
+
+        with fresh_game() as g:
+            self._routes_at(g, g.hub, 10)
+            open_hub("ORD")
+            held = _allocated_gates("ORD", "PLAYER")
+            if held <= 0:
+                self.skipTest("ORD granted no stands in this save")
+            blockers = gate_sale_blockers("ORD", held)
+            self.assertTrue(any("hub" in b.lower() for b in blockers),
+                            "a secondary hub keeps its last stand too")
+
+    def test_fleet_work_is_allowed_at_any_hub(self):
+        from engine import aircraft
+        from engine.hubs import open_hub
+
+        with fresh_game() as g:
+            self._routes_at(g, g.hub, 10)
+            open_hub("ORD")
+            tail = g.lease()
+            g.db.execute("DELETE FROM flight_segments WHERE tail_number = ?", (tail,))
+            g.db.execute("UPDATE fleet SET current_airport_iata='ORD' WHERE tail_number = ?", (tail,))
+            self.assertEqual([], aircraft.disposal_blockers(tail),
+                             "a secondary hub is a base, not an outstation")
+
+    def test_delivery_can_name_a_hub_and_refuses_anything_else(self):
+        from engine import aircraft
+        from engine.hubs import open_hub
+
+        with fresh_game() as g:
+            self._routes_at(g, g.hub, 10)
+            open_hub("ORD")
+            ac = aircraft.lease_aircraft("B738", 52, delivery_iata="ORD")
+            self.assertEqual("ORD", str(g.db.fetch_one(
+                "SELECT current_airport_iata a FROM fleet WHERE tail_number = ?",
+                (ac["tail_number"],))["a"]).upper())
+            with self.assertRaises(ValueError):
+                aircraft.lease_aircraft("B738", 52, delivery_iata="LAX")
+
+    def test_slots_are_seeded_from_the_week_the_hub_opens(self):
+        """Seeding week 1 onward would leave a mid-game hub with nothing usable now."""
+        from engine.hubs import open_hub
+        from engine.slots import is_slot_controlled, slots_held
+
+        with fresh_game() as g:
+            g.db.execute("UPDATE game_state SET game_week = 6 WHERE id = 1")
+            self._routes_at(g, g.hub, 10)
+            open_hub("JFK")
+            if not is_slot_controlled("JFK"):
+                self.skipTest("JFK is not slot-controlled in this save")
+            self.assertGreater(slots_held("JFK", "PLAYER", 6), 0,
+                               "the hub must have slots in the week it opened")
+
+
+class TestRoutePairOpening(unittest.TestCase):
+    """Both directions always open for one fee, and every hub counts (FEATURE-09)."""
+
+    def _preview(self, g, o, d):
+        from engine import routes
+        return routes.preview_route_opening(o, d, hub_iata=g.hub)
+
+    def test_off_hub_pair_opens_both_directions_for_one_fee(self):
+        """A one-way route is nearly unusable: the aircraft has to get back."""
+        with fresh_game() as g:
+            p = self._preview(g, "LAX", "SEA")
+            pairs = {(x["origin"], x["dest"]) for x in p["opens"]}
+            self.assertIn(("LAX", "SEA"), pairs)
+            self.assertIn(("SEA", "LAX"), pairs, "the return leg must open too")
+            charged = [x for x in p["opens"] if x["charge_acquisition"]]
+            self.assertEqual(1, len(charged), "exactly one acquisition fee for the pair")
+
+    def test_hub_pair_is_unchanged(self):
+        with fresh_game() as g:
+            p = self._preview(g, g.hub, "ORD")
+            self.assertTrue(p["hub_involved"])
+            charged = [x for x in p["opens"] if x["charge_acquisition"]]
+            self.assertEqual(1, len(charged))
+            self.assertEqual(2, len(p["opens"]), "both directions")
+
+    def test_a_secondary_hub_counts_as_a_hub(self):
+        """Regression: only `home_hub_iata` was checked, so a second hub was invisible."""
+        from engine.hubs import open_hub
+
+        with fresh_game() as g:
+            for dest in ("ORD", "DFW", "DEN", "SEA", "MIA", "PHX", "MSP", "DTW", "CLT", "SAN"):
+                try:
+                    g.open_route(g.hub, dest)
+                except Exception:
+                    pass
+            open_hub("SFO")
+            p = self._preview(g, "SFO", "LAX")
+            self.assertTrue(p["hub_involved"],
+                            "a route touching a secondary hub is a hub pair")
+
+    def test_existing_one_direction_adds_the_return_free(self):
+        with fresh_game() as g:
+            g.open_route("LAX", "SEA")
+            p = self._preview(g, "LAX", "SEA")
+            self.assertEqual(0.0, float(p["total_new_cost"]))
+            pairs = {(x["origin"], x["dest"]) for x in p["opens"]}
+            self.assertEqual({("SEA", "LAX")}, pairs, "only the missing leg is added, free")

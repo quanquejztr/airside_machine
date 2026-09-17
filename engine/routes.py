@@ -187,11 +187,13 @@ def preview_route_opening(origin_iata, dest_iata, hub_iata=None):
     Plan which route rows to add and the cash required.
 
     Rules:
-    - If the airline home hub touches this city pair (hub is origin or destination), missing
-      legs are opened as a pair: **one** acquisition fee (for the user-requested direction’s
-      formula) covers both directions; any second leg is free at acquisition time.
-    - If neither airport is the hub, only the requested origin→destination leg is opened,
-      at normal acquisition cost.
+    - Missing legs are always opened as a **pair**: one acquisition fee (for the requested
+      direction's formula) covers both directions, and any second leg is free.
+    - This used to apply only when the airline's hub touched the pair; every other pair
+      opened one-way. A one-way route is close to unusable — position validation requires
+      the aircraft to get back — so the player had to buy the return leg separately every
+      time, and the hub's "advantage" was really just an absence of that tax. Hubs keep
+      the advantages that matter: connecting-traffic capture, starter capacity and basing.
 
     Returns:
         dict with mode, hub_involved, total_new_cost, opens (list of dicts with origin, dest,
@@ -225,25 +227,21 @@ def preview_route_opening(origin_iata, dest_iata, hub_iata=None):
     player_fwd = player_route_exists(origin_iata, dest_iata)
     player_rev = player_route_exists(dest_iata, origin_iata)
 
+    # Reported for display only now that pairing is universal. Checked against *every*
+    # hub, not just the primary: since a second hub can be opened, "your hub is on this
+    # pair" has to mean any of them.
     hub_involved = bool(hub_u) and (origin_iata == hub_u or dest_iata == hub_u)
+    if not hub_involved:
+        try:
+            from engine.hubs import is_player_hub
+
+            hub_involved = bool(is_player_hub(origin_iata) or is_player_hub(dest_iata))
+        except Exception:
+            pass
     opens = []
 
-    if not hub_involved:
-        if player_fwd:
-            total_new = 0.0
-            mode = "single"
-        else:
-            total_new = cost_reference
-            mode = "single"
-            opens.append(
-                {
-                    "origin": origin_iata,
-                    "dest": dest_iata,
-                    "charge_acquisition": True,
-                }
-            )
-    else:
-        mode = "hub_pair"
+    if True:
+        mode = "hub_pair" if hub_involved else "pair"
         if player_fwd and player_rev:
             total_new = 0.0
         elif not player_fwd and not player_rev:

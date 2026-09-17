@@ -32,13 +32,18 @@ def airline_exists():
     return airline is not None
 
 
-def grant_player_hub_starter_capacity(home_hub_iata: str) -> dict:
+def grant_player_hub_starter_capacity(home_hub_iata: str, *, from_game_week: int = 1) -> dict:
     """
     Give the new player free hub capacity so week-1 ops are possible.
 
     - 2 gate stands if the hub is an auctioned airport
     - 12 weekly runway movements if the hub is slot-controlled (seeded across
       the same horizon AI uses for slot bootstrap)
+
+    `from_game_week` is where the grant starts. A hub opened mid-game needs its stands
+    effective now and its slots seeded from the current week forward; seeding week 1
+    onward would write allocations for weeks already settled and leave the player with
+    nothing usable in the week they actually opened it.
     """
     hub = str(home_hub_iata or "").upper().strip()
     out = {"hub": hub, "gates": 0, "slots": 0, "slot_weeks": 0}
@@ -49,7 +54,10 @@ def grant_player_hub_starter_capacity(home_hub_iata: str) -> dict:
         from engine.gates import _upsert_allocation, is_auctioned_airport
 
         if is_auctioned_airport(hub):
-            _upsert_allocation(hub, "PLAYER", PLAYER_STARTER_HUB_GATES, effective_week=1)
+            _upsert_allocation(
+                hub, "PLAYER", PLAYER_STARTER_HUB_GATES,
+                effective_week=max(1, int(from_game_week)),
+            )
             out["gates"] = PLAYER_STARTER_HUB_GATES
     except Exception:
         pass
@@ -68,7 +76,8 @@ def grant_player_hub_starter_capacity(home_hub_iata: str) -> dict:
                 weeks = max(1, int(float(db.get_financial_constant("ai_slot_seed_weeks") or 24)))
             except Exception:
                 weeks = 24
-            for w in range(1, weeks + 1):
+            start = max(1, int(from_game_week))
+            for w in range(start, start + weeks):
                 ensure_min_slots_held(hub, "PLAYER", w, PLAYER_STARTER_HUB_SLOTS)
             out["slots"] = PLAYER_STARTER_HUB_SLOTS
             out["slot_weeks"] = weeks
